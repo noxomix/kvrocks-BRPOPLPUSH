@@ -48,5 +48,5 @@ version.h
 compactdb
 testdb
 
-build
+# build  # auskommentiert für Dockerfile.local
 cmake-build-*
