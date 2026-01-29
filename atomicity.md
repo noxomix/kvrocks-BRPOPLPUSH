@@ -200,6 +200,56 @@ auto lua_batch = std::make_unique<WriteBatchWithIndex>();
 - Commands müssen wissen, ob sie in Lua laufen
 - Saubere Trennung von MULTI/EXEC
 
+## EVAL ist auch exclusive (by default!)
+
+```cpp
+// src/commands/cmd_script.cc:128-134
+uint64_t GenerateEvalFlags(..., const Config &config) {
+  if (!config.lua_strict_key_accessing) {  // Default: false!
+    return flags | kCmdExclusive;
+  }
+  return flags;
+}
+```
+
+**Mit Default-Config blockiert EVAL bereits ALLE Worker!**
+
+Config `lua_strict_key_accessing=true` → EVAL wird parallel (aber immer noch N fsyncs).
+
+## exclusive ≠ Batching
+
+| Konzept | Was es tut | Kontrolliert durch |
+|---------|-----------|-------------------|
+| `exclusive` Flag | Blockiert andere Worker | `kCmdExclusive` |
+| `is_txn_mode_` | Batcht Writes | `BeginTxn()`/`CommitTxn()` |
+
+**Diese sind UNABHÄNGIG!** EVAL mit exclusive=true schreibt trotzdem sofort pro redis.call().
+
+## Alle exclusive Commands
+
+### Müssen global bleiben
+
+| Command | Grund |
+|---------|-------|
+| FLUSHDB/FLUSHALL | Löscht alle Keys |
+| SHUTDOWN | Stoppt Server |
+| SLAVEOF/REPLICAOF | Ändert Replication |
+| RDB | Lädt Daten |
+| DEBUG | Debug-Operationen |
+| FLUSHMEMTABLE | RocksDB Memtable |
+| FLUSHBLOCKCACHE | RocksDB Cache |
+| FT.CREATE/DROP | Search Index |
+| SCRIPT FLUSH | Globaler Script-Cache |
+| FUNCTION | Globaler Function-State |
+| CLUSTER (manche) | Cluster-Topology |
+
+### Könnten per-Worker/Connection werden
+
+| Command | Blocker | Lösung | Aufwand |
+|---------|---------|--------|---------|
+| **EXEC** | Globales `txn_write_batch_` | Per-Connection Batch | ~200-300 Zeilen |
+| **EVAL** | `lua_strict_key_accessing=false` | Config ändern ODER Batching | Config: 0 / Batching: ~300-400 Zeilen |
+
 ## Zusammenfassung
 
 | Frage | Antwort |
@@ -209,6 +259,8 @@ auto lua_batch = std::make_unique<WriteBatchWithIndex>();
 | Lua crash-sicher? | **Nein**, partial writes möglich |
 | MULTI/EXEC crash-sicher? | **Ja**, atomar |
 | Warum EXEC global lockt? | Nur 1 globaler `txn_write_batch_` |
-| Lua + Batching möglich? | Ja, aber erfordert Code-Änderungen |
-| Einfachste Lösung? | Lua exclusive machen (aber langsam) |
+| EVAL auch exclusive? | **Ja**, wenn `lua_strict_key_accessing=false` (default) |
+| exclusive = Batching? | **Nein**, unabhängige Konzepte |
+| Lua + Batching möglich? | Ja, erfordert Code-Änderungen |
+| Einfachste Parallelität? | `lua_strict_key_accessing=true` (aber N fsyncs) |
 | Beste Lösung? | Per-Connection Batches (mehr Aufwand) |
