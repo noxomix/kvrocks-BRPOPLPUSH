@@ -1809,38 +1809,38 @@ Status Server::ScriptSet(const std::string &sha, const std::string &body) const 
   return storage->WriteToPropagateCF(ctx, func_name, body);
 }
 
-Status Server::FunctionGetCode(const std::string &lib, std::string *code) const {
-  std::string func_name = engine::kLuaLibCodePrefix + lib;
+Status Server::FunctionGetCode(const rocksdb::Slice &ns, const std::string &lib, std::string *code) const {
+  std::string key = engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, lib);
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
   engine::Context ctx(storage);
-  auto s = storage->Get(ctx, ctx.GetReadOptions(), cf, func_name, code);
+  auto s = storage->Get(ctx, ctx.GetReadOptions(), cf, key, code);
   if (!s.ok()) {
     return {s.IsNotFound() ? Status::NotFound : Status::NotOK, s.ToString()};
   }
   return Status::OK();
 }
 
-Status Server::FunctionGetLib(const std::string &func, std::string *lib) const {
-  std::string func_name = engine::kLuaFuncLibPrefix + func;
+Status Server::FunctionGetLib(const rocksdb::Slice &ns, const std::string &func, std::string *lib) const {
+  std::string key = engine::ComposeFunctionKey(engine::kLuaFuncLibPrefix, ns, func);
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
   engine::Context ctx(storage);
-  auto s = storage->Get(ctx, ctx.GetReadOptions(), cf, func_name, lib);
+  auto s = storage->Get(ctx, ctx.GetReadOptions(), cf, key, lib);
   if (!s.ok()) {
     return {s.IsNotFound() ? Status::NotFound : Status::NotOK, s.ToString()};
   }
   return Status::OK();
 }
 
-Status Server::FunctionSetCode(const std::string &lib, const std::string &code) const {
-  std::string func_name = engine::kLuaLibCodePrefix + lib;
+Status Server::FunctionSetCode(const rocksdb::Slice &ns, const std::string &lib, const std::string &code) const {
+  std::string key = engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, lib);
   engine::Context ctx(storage);
-  return storage->WriteToPropagateCF(ctx, func_name, code);
+  return storage->WriteToPropagateCF(ctx, key, code);
 }
 
-Status Server::FunctionSetLib(const std::string &func, const std::string &lib) const {
-  std::string func_name = engine::kLuaFuncLibPrefix + func;
+Status Server::FunctionSetLib(const rocksdb::Slice &ns, const std::string &func, const std::string &lib) const {
+  std::string key = engine::ComposeFunctionKey(engine::kLuaFuncLibPrefix, ns, func);
   engine::Context ctx(storage);
-  return storage->WriteToPropagateCF(ctx, func_name, lib);
+  return storage->WriteToPropagateCF(ctx, key, lib);
 }
 
 void Server::ScriptReset() {

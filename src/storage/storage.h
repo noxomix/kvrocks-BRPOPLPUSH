@@ -84,6 +84,16 @@ constexpr const char *kLuaFuncSHAPrefix = "lua_f_";
 constexpr const char *kLuaFuncLibPrefix = "lua_func_lib_";
 constexpr const char *kLuaLibCodePrefix = "lua_lib_code_";
 
+// Compose a namespace-aware key for Lua functions/libraries
+// Format: <prefix><1-byte ns_len><namespace><name>
+inline std::string ComposeFunctionKey(const std::string &prefix, const rocksdb::Slice &ns, const std::string &name) {
+  std::string key = prefix;
+  key.push_back(static_cast<char>(ns.size()));
+  key.append(ns.data(), ns.size());
+  key.append(name);
+  return key;
+}
+
 struct CompressionOption {
   rocksdb::CompressionType type;
   const std::string name;

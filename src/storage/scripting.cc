@@ -236,8 +236,16 @@ int RedisRegisterFunction(lua_State *lua) {
   std::string libname = lua_tostring(lua, -1);
   lua_pop(lua, 1);
 
-  // set this function to global
+  // Get namespace from connection context for namespace-aware function registration
+  auto *script_run_ctx = GetFromRegistry<ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  CHECK(script_run_ctx != nullptr);
+  const std::string &ns = script_run_ctx->conn->GetNamespace();
+
+  // set this function to global with namespace prefix
   std::string name = lua_tostring(lua, 1);
+  std::string ns_prefixed_name = ns + "_" + name;
+  std::string ns_prefixed_libname = ns + "_" + libname;
+
   if (argc == 3) {
     auto flags = ExtractFlagsFromRegisterFunction(lua);
     if (!flags) {
@@ -245,17 +253,18 @@ int RedisRegisterFunction(lua_State *lua) {
       return lua_error(lua);
     }
     lua_pushinteger(lua, static_cast<lua_Integer>(flags.GetValue()));
-    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + name).c_str());
+    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_name).c_str());
   }
-  lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + name).c_str());
+  lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + ns_prefixed_name).c_str());
 
-  // set this function name to REDIS_FUNCTION_LIBRARIES[libname]
+  // set this function name to REDIS_FUNCTION_LIBRARIES[ns_libname]
+  // Note: we store original function name (without ns prefix) in the array for display purposes
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 1);
     lua_newtable(lua);
   }
-  lua_getfield(lua, -1, libname.c_str());
+  lua_getfield(lua, -1, ns_prefixed_libname.c_str());
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 1);
     lua_newtable(lua);
@@ -263,7 +272,7 @@ int RedisRegisterFunction(lua_State *lua) {
   size_t len = lua_objlen(lua, -1);
   lua_pushstring(lua, name.c_str());
   lua_rawseti(lua, -2, static_cast<int>(len) + 1);
-  lua_setfield(lua, -2, libname.c_str());
+  lua_setfield(lua, -2, ns_prefixed_libname.c_str());
   lua_setglobal(lua, REDIS_FUNCTION_LIBRARIES);
 
   // check if it needs to store
@@ -272,11 +281,8 @@ int RedisRegisterFunction(lua_State *lua) {
     return 0;
   }
 
-  // store the map from function name to library name
-  auto *script_run_ctx = GetFromRegistry<ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
-  CHECK(script_run_ctx != nullptr);
-
-  auto s = script_run_ctx->conn->GetServer()->FunctionSetLib(name, libname);
+  // store the map from function name to library name (namespace-aware)
+  auto s = script_run_ctx->conn->GetServer()->FunctionSetLib(ns, name, libname);
   if (!s) {
     lua_pushstring(lua, "redis.register_function() failed to store informantion.");
     return lua_error(lua);
@@ -350,20 +356,22 @@ Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::st
     return {Status::NotOK, "Please register some function in FUNCTION LOAD"};
   }
 
-  return need_to_store ? srv->FunctionSetCode(libname, script) : Status::OK();
+  return need_to_store ? srv->FunctionSetCode(conn->GetNamespace(), libname, script) : Status::OK();
 }
 
 bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std::string &libname,
                         bool need_check_storage) {
   auto srv = conn->GetServer();
   auto lua = conn->Owner()->Lua();
+  const std::string &ns = conn->GetNamespace();
+  std::string ns_prefixed_libname = ns + "_" + libname;
 
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
 
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 1);
   } else {
-    lua_getfield(lua, -1, libname.c_str());
+    lua_getfield(lua, -1, ns_prefixed_libname.c_str());
     if (lua_objlen(lua, -1) == 0) {
       lua_pop(lua, 2);
     } else {
@@ -377,7 +385,7 @@ bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std
   }
 
   std::string code;
-  auto s = srv->FunctionGetCode(libname, &code);
+  auto s = srv->FunctionGetCode(ns, libname, &code);
   if (!s) return false;
 
   std::string lib_name;
@@ -392,31 +400,33 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
                     bool read_only) {
   auto srv = conn->GetServer();
   auto lua = conn->Owner()->Lua();
+  const std::string &ns = conn->GetNamespace();
+  std::string ns_prefixed_name = ns + "_" + name;
 
   lua_getglobal(lua, "__redis__err__handler");
 
-  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + name).c_str());
+  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + ns_prefixed_name).c_str());
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 1);
 
     std::string libname;
-    auto s = srv->FunctionGetLib(name, &libname);
+    auto s = srv->FunctionGetLib(ns, name, &libname);
     if (!s) return s.Prefixed("No such function name found in storage");
 
     std::string libcode;
-    s = srv->FunctionGetCode(libname, &libcode);
+    s = srv->FunctionGetCode(ns, libname, &libcode);
     if (!s) return s;
     s = FunctionLoad(conn, ctx, libcode, false, false, &libname);
     if (!s) return s;
 
-    lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + name).c_str());
+    lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + ns_prefixed_name).c_str());
   }
 
   ScriptRunCtx script_run_ctx;
   script_run_ctx.conn = conn;
   script_run_ctx.ctx = ctx;
   script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
-  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + name).c_str());
+  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_name).c_str());
   if (!lua_isnil(lua, -1)) {
     // It should be ensured that the conversion is successful
     auto function_flags = lua_tointeger(lua, -1);
@@ -462,7 +472,8 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
 // list all library names and their code (enabled via `with_code`)
 Status FunctionList(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &libname,
                     bool with_code, std::string *output) {
-  std::string start_key = engine::kLuaLibCodePrefix + libname;
+  const std::string &ns = conn->GetNamespace();
+  std::string start_key = engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, libname);
   std::string end_key = start_key;
   end_key.back()++;
 
@@ -473,9 +484,11 @@ Status FunctionList(Server *srv, const redis::Connection *conn, engine::Context 
   auto *cf = srv->storage->GetCFHandle(ColumnFamilyID::Propagate);
   auto iter = util::UniqueIterator(ctx, read_options, cf);
   std::vector<std::pair<std::string, std::string>> result;
+  // Skip prefix + 1 byte ns_len + namespace to get the library name
+  size_t prefix_len = strlen(engine::kLuaLibCodePrefix) + 1 + ns.size();
   for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
     Slice lib = iter->key();
-    lib.remove_prefix(strlen(engine::kLuaLibCodePrefix));
+    lib.remove_prefix(prefix_len);
     result.emplace_back(lib.ToString(), iter->value().ToString());
   }
 
@@ -501,7 +514,8 @@ Status FunctionList(Server *srv, const redis::Connection *conn, engine::Context 
 // list all function names and their corresponding library names
 Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &funcname,
                         std::string *output) {
-  std::string start_key = engine::kLuaFuncLibPrefix + funcname;
+  const std::string &ns = conn->GetNamespace();
+  std::string start_key = engine::ComposeFunctionKey(engine::kLuaFuncLibPrefix, ns, funcname);
   std::string end_key = start_key;
   end_key.back()++;
 
@@ -512,9 +526,11 @@ Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Cont
   auto *cf = srv->storage->GetCFHandle(ColumnFamilyID::Propagate);
   auto iter = util::UniqueIterator(ctx, read_options, cf);
   std::vector<std::pair<std::string, std::string>> result;
+  // Skip prefix + 1 byte ns_len + namespace to get the function name
+  size_t prefix_len = strlen(engine::kLuaFuncLibPrefix) + 1 + ns.size();
   for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
     Slice func = iter->key();
-    func.remove_prefix(strlen(engine::kLuaLibCodePrefix));
+    func.remove_prefix(prefix_len);
     result.emplace_back(func.ToString(), iter->value().ToString());
   }
 
@@ -540,6 +556,8 @@ Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Cont
 // i.e. it will output nothing if the library is only in storage but not loaded
 Status FunctionListLib(redis::Connection *conn, const std::string &libname, std::string *output) {
   auto lua = conn->Owner()->Lua();
+  const std::string &ns = conn->GetNamespace();
+  std::string ns_prefixed_libname = ns + "_" + libname;
 
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
   if (lua_isnil(lua, -1)) {
@@ -547,7 +565,7 @@ Status FunctionListLib(redis::Connection *conn, const std::string &libname, std:
     lua_newtable(lua);
   }
 
-  lua_getfield(lua, -1, libname.c_str());
+  lua_getfield(lua, -1, ns_prefixed_libname.c_str());
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 2);
 
@@ -577,6 +595,8 @@ Status FunctionListLib(redis::Connection *conn, const std::string &libname, std:
 
 Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::string &name) {
   auto lua = conn->Owner()->Lua();
+  const std::string &ns = conn->GetNamespace();
+  std::string ns_prefixed_libname = ns + "_" + name;
 
   // load the library into this lua state
   if (!FunctionIsLibExist(conn, &ctx, name, true)) {
@@ -589,7 +609,7 @@ Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::
     return {Status::NotOK, "the library does not exist in lua environment"};
   }
 
-  lua_getfield(lua, -1, name.c_str());
+  lua_getfield(lua, -1, ns_prefixed_libname.c_str());
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 2);
     return {Status::NotOK, "the library does not exist in lua environment"};
@@ -601,13 +621,16 @@ Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::
   for (size_t i = 1; i <= lua_objlen(lua, -1); ++i) {
     lua_rawgeti(lua, -1, static_cast<int>(i));
     std::string func = lua_tostring(lua, -1);
-    auto _ = storage->Delete(ctx, rocksdb::WriteOptions(), cf, engine::kLuaFuncLibPrefix + func);
+    // Delete namespace-aware function entry
+    auto _ = storage->Delete(ctx, rocksdb::WriteOptions(), cf,
+                             engine::ComposeFunctionKey(engine::kLuaFuncLibPrefix, ns, func));
     lua_pop(lua, 1);
   }
 
   lua_pop(lua, 2);
 
-  auto s = storage->Delete(ctx, rocksdb::WriteOptions(), cf, engine::kLuaLibCodePrefix + name);
+  auto s = storage->Delete(ctx, rocksdb::WriteOptions(), cf,
+                           engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, name));
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
   // reset all lua context from all workers
