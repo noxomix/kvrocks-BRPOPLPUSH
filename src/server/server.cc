@@ -1755,16 +1755,18 @@ void Server::SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint
   slow_log_.PushEntry(std::move(entry));
 }
 
-std::string Server::GetClientsStr() {
+std::string Server::GetClientsStr(redis::Connection *self) {
   std::string clients;
   for (const auto &t : worker_threads_) {
-    clients.append(t->GetWorker()->GetClientsStr());
+    clients.append(t->GetWorker()->GetClientsStr(self));
   }
 
-  std::shared_lock<std::shared_mutex> guard(slave_threads_mu_);
-
-  for (const auto &st : slave_threads_) {
-    clients.append(st->GetConn()->ToString());
+  // Slave connections are only visible to admin
+  if (self->IsAdmin()) {
+    std::shared_lock<std::shared_mutex> guard(slave_threads_mu_);
+    for (const auto &st : slave_threads_) {
+      clients.append(st->GetConn()->ToString());
+    }
   }
 
   return clients;
@@ -1781,8 +1783,8 @@ void Server::KillClient(int64_t *killed, const std::string &addr, uint64_t id, u
     *killed += killed_in_worker;
   }
 
-  // Slave clients
-  {
+  // Slave clients (only admin can kill these)
+  if (conn->IsAdmin()) {
     std::unique_lock<std::shared_mutex> guard(slave_threads_mu_);
     for (const auto &st : slave_threads_) {
       if ((type & kTypeSlave) ||
@@ -1794,8 +1796,8 @@ void Server::KillClient(int64_t *killed, const std::string &addr, uint64_t id, u
     }
   }
 
-  // Master client
-  if (IsSlave() &&
+  // Master client (only admin can kill this)
+  if (conn->IsAdmin() && IsSlave() &&
       (type & kTypeMaster || (!addr.empty() && addr == master_host_ + ":" + std::to_string(master_port_)))) {
     // Stop replication thread and start a new one to replicate
     if (auto s = AddMaster(master_host_, master_port_, true); !s.IsOK()) {
@@ -1890,10 +1892,14 @@ void Server::ScriptReset() {
   script_reset_generation_.fetch_add(1);
 }
 
-void Server::ScriptResetNamespace(const std::string &ns) {
+void Server::ScriptResetNamespace(const std::string &ns, Worker *exclude) {
   // Mark namespace for reset on all workers - they will reset lazily
+  // Exclude the current worker if specified (it already did the operation)
   for (auto &wt : worker_threads_) {
-    wt->GetWorker()->MarkNamespaceForReset(ns);
+    auto *worker = wt->GetWorker();
+    if (worker != exclude) {
+      worker->MarkNamespaceForReset(ns);
+    }
   }
 }
 

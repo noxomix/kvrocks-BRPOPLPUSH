@@ -521,16 +521,19 @@ end)
 		require.NoError(t, client2.Del(ctx, "fcall_counter").Err())
 	})
 
-	t.Run("FUNCTION FLUSH waits for running FCALL in same namespace", func(t *testing.T) {
-		// This test verifies that FUNCTION FLUSH (exclusive lock) waits for
-		// running FCALL (shared lock) to complete before executing.
+	t.Run("FCALL already running completes even if FLUSH is called", func(t *testing.T) {
+		// This test verifies that an FCALL that has already started will complete
+		// its execution even if FUNCTION FLUSH is called while it's running.
+		//
+		// With async reset, FLUSH doesn't block - it just sets a reset flag.
+		// But an FCALL that's already past the entry check will continue to completion.
 		//
 		// Strategy:
 		// 1. Load a function that signals "I'm running" by setting a key, then does slow work
 		// 2. Start FCALL in goroutine
 		// 3. Wait until the "running" signal appears (proves FCALL actually started)
-		// 4. Start FLUSH (should block until FCALL completes due to locking)
-		// 5. Verify FCALL completed its work before FLUSH deleted the function
+		// 4. Call FLUSH (with async reset, this returns immediately)
+		// 5. Verify FCALL completed its work (the function was still available during execution)
 
 		// Function that: sets "running" flag, does slow work, sets "completed" flag
 		slowLib := `#!lua name=slowlib
@@ -601,4 +604,232 @@ redis.register_function("slow", slow)
 	// Cleanup namespaces
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "fcall_ns1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "fcall_ns2").Err())
+}
+
+// TestAsyncResetBehavior tests the async/lazy reset mechanism for Lua states.
+// With async reset, FUNCTION FLUSH doesn't directly reset other workers' Lua states.
+// Instead, it sets a flag, and each worker resets its own state lazily when it
+// next attempts to execute Lua code for that namespace.
+func TestAsyncResetBehavior(t *testing.T) {
+	password := "pwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin client
+	adminRdb := srv.NewClientWithOption(&redis.Options{Password: password})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "async_ns1", "atoken1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "async_ns2", "atoken2").Err())
+
+	// Create clients
+	client1 := srv.NewClientWithOption(&redis.Options{Password: "atoken1"})
+	client2 := srv.NewClientWithOption(&redis.Options{Password: "atoken2"})
+	defer func() { require.NoError(t, client1.Close()) }()
+	defer func() { require.NoError(t, client2.Close()) }()
+
+	t.Run("FCALL after FLUSH reloads function from storage", func(t *testing.T) {
+		// This tests the lazy reload behavior:
+		// 1. Load a function
+		// 2. Call it (loads into Lua state)
+		// 3. FLUSH (marks for reset, doesn't actually reset yet)
+		// 4. LOAD the function again (stores in storage)
+		// 5. FCALL should work (triggers reset, then reloads from storage)
+
+		lib := `#!lua name=reloadlib
+redis.register_function("reloadfunc", function() return "reloaded" end)
+`
+		// Load and verify it works
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+		result := client1.Do(ctx, "FCALL", "reloadfunc", 0)
+		require.NoError(t, result.Err())
+		require.Equal(t, "reloaded", result.Val())
+
+		// FLUSH (marks for reset)
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "FLUSH").Err())
+
+		// Load the function again
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+
+		// FCALL should work - it reloads from storage after the reset
+		result = client1.Do(ctx, "FCALL", "reloadfunc", 0)
+		require.NoError(t, result.Err())
+		require.Equal(t, "reloaded", result.Val())
+
+		// Cleanup
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "DELETE", "reloadlib").Err())
+	})
+
+	t.Run("Rapid FLUSH LOAD cycles work correctly", func(t *testing.T) {
+		// Test that rapid FLUSH/LOAD cycles don't cause issues.
+		// This tests the race condition handling where:
+		// - FLUSH sets reset flag
+		// - LOAD stores function and loads into Lua
+		// - Next FCALL might see reset flag and reload from storage
+
+		lib := `#!lua name=rapidlib
+redis.register_function("rapidfunc", function() return "rapid" end)
+`
+		// Do 10 rapid cycles
+		for i := 0; i < 10; i++ {
+			require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+			require.NoError(t, client1.Do(ctx, "FUNCTION", "FLUSH").Err())
+		}
+
+		// Final load
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+
+		// Should work - function is in storage and will be loaded
+		result := client1.Do(ctx, "FCALL", "rapidfunc", 0)
+		require.NoError(t, result.Err())
+		require.Equal(t, "rapid", result.Val())
+
+		// Cleanup
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "DELETE", "rapidlib").Err())
+	})
+
+	t.Run("Multiple connections same namespace see reset", func(t *testing.T) {
+		// Test that when FLUSH is called from one connection,
+		// another connection to the same namespace also sees the reset.
+		// This verifies the async reset propagates across workers.
+
+		// Create a second client for the same namespace
+		client1b := srv.NewClientWithOption(&redis.Options{Password: "atoken1"})
+		defer func() { require.NoError(t, client1b.Close()) }()
+
+		lib := `#!lua name=multiconnlib
+redis.register_function("multiconnfunc", function() return "multiconn" end)
+`
+		// Load from client1
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+
+		// Verify both connections can call it
+		require.Equal(t, "multiconn", client1.Do(ctx, "FCALL", "multiconnfunc", 0).Val())
+		require.Equal(t, "multiconn", client1b.Do(ctx, "FCALL", "multiconnfunc", 0).Val())
+
+		// FLUSH from client1
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "FLUSH").Err())
+
+		// Both connections should see the function as gone
+		util.ErrorRegexp(t, client1.Do(ctx, "FCALL", "multiconnfunc", 0).Err(), ".*No such function.*")
+		util.ErrorRegexp(t, client1b.Do(ctx, "FCALL", "multiconnfunc", 0).Err(), ".*No such function.*")
+	})
+
+	t.Run("FLUSH in one namespace does not trigger reset in another", func(t *testing.T) {
+		// Verify that async reset flags are per-namespace.
+		// FLUSH in ns1 should not affect ns2's Lua state at all.
+
+		lib1 := `#!lua name=isolib
+redis.register_function("isofunc", function() return "ns1" end)
+`
+		lib2 := `#!lua name=isolib
+redis.register_function("isofunc", function() return "ns2" end)
+`
+		// Load in both namespaces
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib1).Err())
+		require.NoError(t, client2.Do(ctx, "FUNCTION", "LOAD", lib2).Err())
+
+		// Verify both work
+		require.Equal(t, "ns1", client1.Do(ctx, "FCALL", "isofunc", 0).Val())
+		require.Equal(t, "ns2", client2.Do(ctx, "FCALL", "isofunc", 0).Val())
+
+		// FLUSH ns1 many times (simulating spam)
+		for i := 0; i < 20; i++ {
+			require.NoError(t, client1.Do(ctx, "FUNCTION", "FLUSH").Err())
+		}
+
+		// ns1 should be empty
+		util.ErrorRegexp(t, client1.Do(ctx, "FCALL", "isofunc", 0).Err(), ".*No such function.*")
+
+		// ns2 should still work perfectly (no reset was triggered)
+		require.Equal(t, "ns2", client2.Do(ctx, "FCALL", "isofunc", 0).Val())
+
+		// Cleanup
+		require.NoError(t, client2.Do(ctx, "FUNCTION", "DELETE", "isolib").Err())
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "async_ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "async_ns2").Err())
+}
+
+// TestGlobalScriptFlush tests that global SCRIPT FLUSH (as opposed to namespace
+// FUNCTION FLUSH) correctly resets all namespaces using the generation counter.
+func TestGlobalScriptFlush(t *testing.T) {
+	password := "pwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin client
+	adminRdb := srv.NewClientWithOption(&redis.Options{Password: password})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "script_ns1", "stoken1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "script_ns2", "stoken2").Err())
+
+	// Create clients
+	client1 := srv.NewClientWithOption(&redis.Options{Password: "stoken1"})
+	client2 := srv.NewClientWithOption(&redis.Options{Password: "stoken2"})
+	defer func() { require.NoError(t, client1.Close()) }()
+	defer func() { require.NoError(t, client2.Close()) }()
+
+	t.Run("Global SCRIPT FLUSH resets all namespaces", func(t *testing.T) {
+		// Load EVAL scripts in both namespaces
+		script := "return 'hello'"
+
+		// EVAL creates a cached script in the Lua state
+		result1 := client1.Do(ctx, "EVAL", script, 0)
+		require.NoError(t, result1.Err())
+		require.Equal(t, "hello", result1.Val())
+
+		result2 := client2.Do(ctx, "EVAL", script, 0)
+		require.NoError(t, result2.Err())
+		require.Equal(t, "hello", result2.Val())
+
+		// Global SCRIPT FLUSH from admin (affects ALL namespaces)
+		require.NoError(t, adminRdb.Do(ctx, "SCRIPT", "FLUSH").Err())
+
+		// Both namespaces should still be able to EVAL (scripts are re-created)
+		// This verifies the reset happened but doesn't break functionality
+		result1 = client1.Do(ctx, "EVAL", script, 0)
+		require.NoError(t, result1.Err())
+		require.Equal(t, "hello", result1.Val())
+
+		result2 = client2.Do(ctx, "EVAL", script, 0)
+		require.NoError(t, result2.Err())
+		require.Equal(t, "hello", result2.Val())
+	})
+
+	t.Run("SCRIPT FLUSH clears EVALSHA cache", func(t *testing.T) {
+		// Load a script with SCRIPT LOAD
+		script := "return 'cached'"
+		sha := adminRdb.Do(ctx, "SCRIPT", "LOAD", script).Val().(string)
+		require.NotEmpty(t, sha)
+
+		// EVALSHA should work
+		result := adminRdb.Do(ctx, "EVALSHA", sha, 0)
+		require.NoError(t, result.Err())
+		require.Equal(t, "cached", result.Val())
+
+		// SCRIPT FLUSH - clears from storage AND Lua
+		require.NoError(t, adminRdb.Do(ctx, "SCRIPT", "FLUSH").Err())
+
+		// EVALSHA should FAIL - script is gone from storage and Lua
+		result = adminRdb.Do(ctx, "EVALSHA", sha, 0)
+		util.ErrorRegexp(t, result.Err(), ".*NOSCRIPT.*")
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "script_ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "script_ns2").Err())
 }

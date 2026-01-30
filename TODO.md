@@ -1,43 +1,86 @@
 # Namespace-Isolation: Offene Probleme
 
-## Echte Probleme
+## Erledigt
 
-- [x] **WATCH nicht namespace-aware** (HOCH) - **GEFIXT**
-  - Datei: `src/server/server.h:455`, `src/server/server.cc:2097-2174`
-  - Problem: watched_key_map_ speichert Keys ohne Namespace-Prefix
-  - Lösung: Keys werden jetzt mit `MakeWatchedKey(ns, key)` namespace-prefixed gespeichert
-
-- [ ] **FUNCTION FLUSH Segfault** (KRITISCH) - ROOT CAUSE GEFUNDEN
-  - Test: `TestFunctionFlushParallelIsolation` in `tests/gocase/unit/scripting/function_namespace_test.go`
-  - Problem: Server crasht sporadisch mit Segfault bei parallelen FUNCTION FLUSH
-  - **ROOT CAUSE:** `ScriptResetNamespace()` in `src/server/server.cc:1894-1898`
-    - Worker 1 ruft `LuaResetNamespace()` auf Lua-States von Worker 2, 3, 4... auf
-    - Lua-States sind NICHT thread-safe!
-    - Wenn ein anderer Worker gerade Lua ausführt → Use-After-Free / Segfault
-  - **Lösung:** `WorkExclusivityGuard` verwenden (wie bei `ScriptFlush`)
-  - Nicht durch WATCH-Änderung verursacht
-
-- [ ] **Globale Commands nutzen NS-Locks** (MEDIUM)
-  - Datei: `src/server/redis_connection.cc:458-464`
-  - Problem: CONFIG SET, SHUTDOWN, CLUSTER-Ops etc. sollten global locken
-  - Lösung: kCmdGlobalExclusive Flag einführen
-  - Betroffene Commands: SHUTDOWN, DEBUG, RDB, SST, SLAVEOF, etc.
+- [x] ~~ns_locks_ Pointer-Invalidation~~ - KEIN PROBLEM (C++ Standard garantiert Stabilität)
+- [x] ~~Storage::Write() TOCTOU~~ - WorkExclusivityGuard schützt
+- [x] ~~WATCH nicht namespace-aware~~ - GEFIXT mit `MakeWatchedKey(ns, key)`
+- [x] ~~FLUSHDB/FLUSHALL~~ - FLUSHDB löscht nur eigenen NS, FLUSHALL nur Admin
+- [x] ~~FUNCTION FLUSH Segfault~~ - GEFIXT mit Async Reset (siehe unten)
 
 ---
 
-## Kein Problem (verifiziert)
+## Gefixt: FUNCTION FLUSH Segfault
 
-- [x] ~~**ns_locks_ Pointer-Invalidation**~~ - **KEIN PROBLEM**
-  - C++ Standard garantiert: Pointer/Referenzen auf `unordered_map` Elemente bleiben bei Insert/Rehash gültig
-  - Nur Iteratoren werden invalidiert, aber wir verwenden Pointer (`&it->second`)
-  - Elemente werden nie gelöscht (`ns_locks_.erase()` existiert nicht)
-  - Quelle: https://en.cppreference.com/w/cpp/container/unordered_map/insert
+**Problem:** `ScriptResetNamespace()` griff auf Lua-States anderer Worker zu → Use-After-Free/Segfault
 
-- [x] ~~Storage::Write() TOCTOU~~ - EXEC hält WorkExclusivityGuard(ns) während gesamter Transaktion
+**Lösung:** Async Reset (Lazy Reset)
+- Jeder Worker resettet nur seinen **eigenen** Lua-State
+- `FUNCTION FLUSH` setzt nur ein Flag pro Worker
+- Vor jeder Lua-Operation prüft Worker das Flag und resettet sich selbst
+- Kein Cross-Thread Zugriff mehr → Thread-safe
+- Perfekte Tenant-Isolation (Tenant A kann B nicht blockieren)
 
-- [x] ~~GetWriteBatchBase Observer-Pointer~~ - Gleicher Grund (Lock-Hierarchie schützt)
+**Bug gefunden:** Self-Reset bei `FUNCTION LOAD REPLACE`
+- `ScriptResetNamespace()` setzte Flag für ALLE Worker inkl. aktuellem
+- Bei `FUNCTION LOAD REPLACE`: Delete → Load → nächste Lua-Op sieht eigenes Flag → Reset → Library weg!
+- **Fix:** `ScriptResetNamespace(ns, Worker* exclude)` - aktueller Worker wird ausgeschlossen
+- Aktueller Worker ruft `LuaResetNamespace(ns)` synchron auf, andere werden asynchron markiert
 
-- [x] ~~Parallele NS-Transaktionen~~ - Jeder NS hat eigene isolierte Lock-Säule
+**Geänderte Dateien:**
+- `src/server/server.h` - `script_reset_generation_` (Generation Counter)
+- `src/server/server.cc` - `ScriptReset()`, `ScriptResetNamespace()`
+- `src/server/worker.h` - `ns_reset_mutex_`, `namespaces_to_reset_`, `last_script_reset_generation_`
+- `src/server/worker.cc` - `MarkNamespaceForReset()`, `CheckAndResetIfNeeded()`
+- `src/storage/scripting.cc` - `CheckAndResetIfNeeded()` vor allen Lua-Einstiegspunkten
+- `src/commands/cmd_script.cc` - `CheckAndResetIfNeeded()` vor SCRIPT LOAD
 
-- [x] ~~FLUSHDB/FLUSHALL~~ - FLUSHDB löscht nur eigenen Namespace, FLUSHALL löscht alles (nur Admin)
+**Tests:** `tests/gocase/unit/scripting/function_namespace_test.go`
 
+**Hinweis:** Gelegentlich schlägt `TestFullSyncReplication` fehl (Timeout bei WaitForOffsetSync).
+Unklar ob durch diese Änderungen verursacht oder vorher existierendes Flaky-Test-Problem.
+Der Test ist timing-sensitiv und hängt nicht von Lua/Scripting ab.
+
+---
+
+## Offen: Command-Klassifizierung für Tenant-Isolation
+
+### Prinzip
+**Global = Beeinflusst etwas außerhalb des eigenen Namespace**
+
+### 1. Admin-only (nicht tenant-aware möglich)
+Technisch nicht isolierbar - müssen Admin-only bleiben:
+
+**kCmdAdmin fehlt - hinzufügen:**
+- [ ] COMPACT - RocksDB-global
+- [ ] FLUSHMEMTABLE - RocksDB-global
+- [ ] FLUSHBLOCKCACHE - RocksDB-global
+- [ ] DEBUG - Kann Server crashen
+
+**kCmdAdmin bereits vorhanden:**
+- [x] CONFIG SET, SHUTDOWN, BGSAVE/RDB/SST
+- [x] SLAVEOF/REPLICAOF, CLUSTER *, FLUSHALL
+
+### 2. Tenant-aware machen (sinnvoll)
+
+- [ ] CLIENT LIST - Nur eigene Connections zeigen (Niedrig)
+- [ ] CLIENT KILL - Nur eigene Connections killen (Niedrig)
+- [ ] SLOWLOG - Nur eigene Queries zeigen (Mittel)
+- [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
+- [ ] INFO keyspace - Prüfen ob schon namespace-aware
+- [ ] DBSIZE - Prüfen ob schon namespace-aware
+
+### 3. Bereits korrekt (tenant-lokal)
+- Alle Daten-Commands (GET, SET, HGET, ZADD, etc.)
+- KEYS, SCAN, FLUSHDB
+- MULTI/EXEC/WATCH
+
+---
+
+## Implementierungs-Reihenfolge
+
+1. [ ] Quick Win: `kCmdAdmin` für COMPACT, DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
+2. [ ] Prüfen: DBSIZE, INFO - schon namespace-aware?
+3. [ ] CLIENT LIST/KILL tenant-aware
+4. [ ] SLOWLOG tenant-aware
+5. [ ] MONITOR tenant-aware

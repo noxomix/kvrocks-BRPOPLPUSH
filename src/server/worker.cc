@@ -510,12 +510,16 @@ void Worker::FeedMonitorConns(redis::Connection *conn, const std::string &respon
   }
 }
 
-std::string Worker::GetClientsStr() {
+std::string Worker::GetClientsStr(redis::Connection *self) {
   std::unique_lock<std::mutex> lock(conns_mu_);
 
   std::string output;
   for (const auto &iter : conns_) {
     redis::Connection *conn = iter.second;
+    // Non-admin users can only see connections in their own namespace
+    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+      continue;
+    }
     output.append(conn->ToString());
   }
 
@@ -529,6 +533,11 @@ void Worker::KillClient(redis::Connection *self, uint64_t id, const std::string 
   for (const auto &iter : conns_) {
     redis::Connection *conn = iter.second;
     if (skipme && self == conn) continue;
+
+    // Non-admin users can only kill connections in their own namespace
+    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+      continue;
+    }
 
     // no need to kill the client again if the kCloseAfterReply flag is set
     if (conn->IsFlagEnabled(redis::Connection::kCloseAfterReply)) {

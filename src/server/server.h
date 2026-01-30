@@ -302,7 +302,7 @@ class Server {
   int DecrMonitorClientNum();
   int IncrBlockedClientNum();
   int DecrBlockedClientNum();
-  std::string GetClientsStr();
+  std::string GetClientsStr(redis::Connection *self);
   uint64_t GetClientID();
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,
                   redis::Connection *conn);
@@ -311,7 +311,7 @@ class Server {
   Status ScriptGet(const std::string &sha, std::string *body) const;
   Status ScriptSet(const std::string &sha, const std::string &body) const;
   void ScriptReset();
-  void ScriptResetNamespace(const std::string &ns);
+  void ScriptResetNamespace(const std::string &ns, Worker *exclude = nullptr);
   Status ScriptFlush();
   uint64_t GetScriptResetGeneration() const { return script_reset_generation_.load(); }
 
