@@ -1,9 +1,28 @@
 # Namespace-Isolation: Offene Probleme
 
-Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im wortcase 10.000 connecitons oaralle. 
+Konstitution: {
+Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im wortcase 10.000 connecitons oaralle.
 Worker sind naütlrich nicht für bestimmte tenant reserviert. Es ist wichtig dies zu verstehen, weil so manche arten von locks oder datenstrutkturen entpsechend auf diesen demand
 angepasst werden müssen das wir später kein bottleneck haben.
 
+
+In KVrocks ist ein ADMIN automatisch nur der defualt namespace (__namespace/_namespace). Bei tenant aware functions ist es wichtig abzuwägen,
+ob im ADMIN fall global aggiert werden soll zB Flush scripts alle namespace scripts flusht oder nur im eignene tenant. Das haben wir bislang nicht zuverlässig
+gemacht aber es ist nicht an allen stellen schlim, lediglich sollte es bedacht und überlegt werden.
+
+Auf einem Worker können viele Tenant connections laufen. Aber nur eine davon ist quasi "active" also quasi eine eventloop (soweit ich das richtig verstand hab).
+Wenn wir irgendwelche commands haben die daten von mehrere workern direkt aquirieren müssen zB statistiken über einen tenant (namespace) dann dürfen andere worker
+nicht so lange blockieren, sonst könnte ein namespace andere namespaces absichlich verlangsamen (noisy oder evil neighbor).
+
+WICHTIG - ns_ Default-Initialisierung:
+Die Connection::ns_ Variable MUSS leer ("") bleiben bis AUTH erfolgt ist!
+Der Auth-Flow in ExecuteCommands() prüft `if (GetNamespace().empty())` um zu entscheiden ob AUTH nötig ist.
+Wenn ns_ einen Default-Wert wie kDefaultNamespace hat, wird dieser Check übersprungen und:
+- BecomeAdmin() wird nie aufgerufen wenn kein requirepass gesetzt ist
+- Alle Admin-Commands (CLUSTER, CONFIG, etc.) schlagen fehl mit "admin permission required"
+Für per-Namespace Stats: Prüfe `!GetNamespace().empty()` BEVOR Stats getrackt werden.
+Bytes/Commands VOR AUTH werden nur global gezählt (korrekt, da Namespace noch unbekannt).
+}
 
 ## Erledigt
 

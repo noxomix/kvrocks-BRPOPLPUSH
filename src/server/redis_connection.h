@@ -196,7 +196,7 @@ class Connection : public EvbufCallbackBase<Connection> {
  private:
   uint64_t id_ = 0;
   std::atomic<int> flags_ = 0;
-  std::string ns_;
+  std::string ns_;  // Empty before AUTH, set via SetNamespace() after successful auth
   std::string name_;
   std::string ip_;
   std::string announce_ip_;

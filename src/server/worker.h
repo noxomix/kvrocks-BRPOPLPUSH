@@ -33,11 +33,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "config/config.h"
+#include "stats/stats.h"
 #include "event_util.h"
 #include "redis_connection.h"
 
@@ -91,6 +93,12 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::map<int, redis::Connection *> GetConnections() const { return conns_; }
   Server *srv;
 
+  // Per-namespace stats (with per-worker mutex for thread-safety)
+  void IncrCallsForNamespace(const std::string &ns);
+  void IncrInboundBytesForNamespace(const std::string &ns, uint64_t bytes);
+  void IncrOutboundBytesForNamespace(const std::string &ns, uint64_t bytes);
+  std::unordered_map<std::string, NamespaceStatsSnapshot> GetNamespaceStatsSnapshot() const;
+
  private:
   Status listenFD(int fd, uint32_t expected_port, int backlog);
   Status listenTCP(const std::string &host, uint32_t port, int backlog);
@@ -116,6 +124,10 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::mutex ns_reset_mutex_;
   std::unordered_set<std::string> namespaces_to_reset_;
   uint64_t last_script_reset_generation_{0};
+
+  // Per-namespace stats for tenant isolation
+  mutable std::mutex ns_stats_mu_;
+  std::unordered_map<std::string, NamespaceStats> ns_stats_;
 };
 
 class WorkerThread {

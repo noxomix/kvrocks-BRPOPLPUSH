@@ -47,7 +47,7 @@
 namespace redis {
 
 Connection::Connection(bufferevent *bev, Worker *owner)
-    : need_free_bev_(true), bev_(bev), req_(owner->srv), owner_(owner), srv_(owner->srv) {
+    : need_free_bev_(true), bev_(bev), req_(owner->srv, this), owner_(owner), srv_(owner->srv) {
   int64_t now = util::GetTimeStamp();
   create_time_ = now;
   last_interaction_ = now;
@@ -141,6 +141,9 @@ void Connection::Reply(const std::string &msg) {
   }
 
   owner_->srv->stats.IncrOutboundBytes(msg.size());
+  if (!GetNamespace().empty()) {
+    owner_->IncrOutboundBytesForNamespace(GetNamespace(), msg.size());
+  }
   if (in_exec_) {
     queued_replies_.push_back(msg);
   } else {
@@ -364,6 +367,9 @@ Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_n
                                   const std::vector<std::string> &cmd_tokens, Commander *current_cmd,
                                   std::string *reply) {
   srv_->stats.IncrCalls(cmd_name);
+  if (!GetNamespace().empty()) {
+    owner_->IncrCallsForNamespace(GetNamespace());
+  }
 
   auto start = std::chrono::high_resolution_clock::now();
   bool is_profiling = IsProfilingEnabled(cmd_name);

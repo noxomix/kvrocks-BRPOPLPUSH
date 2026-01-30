@@ -41,7 +41,10 @@ class Connection;
 
 class Request {
  public:
-  explicit Request(Server *srv) : srv_(srv) {}
+  // Constructor for replication (no connection - uses global stats only)
+  explicit Request(Server *srv) : srv_(srv), conn_(nullptr) {}
+  // Constructor for normal connections (enables per-namespace stats)
+  Request(Server *srv, Connection *conn) : srv_(srv), conn_(conn) {}
   ~Request() = default;
 
   // Not copyable
@@ -64,6 +67,7 @@ class Request {
   std::deque<CommandTokens> commands_;
 
   Server *srv_;
+  Connection *conn_ = nullptr;  // May be nullptr for replication
 };
 
 }  // namespace redis

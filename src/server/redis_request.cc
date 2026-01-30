@@ -33,6 +33,7 @@
 #include "redis_connection.h"
 #include "redis_reply.h"
 #include "server.h"
+#include "worker.h"
 
 namespace redis {
 
@@ -64,6 +65,9 @@ Status Request::Tokenize(evbuffer *input) {
 
         pipeline_size++;
         srv_->stats.IncrInboundBytes(line.length);
+        if (conn_ && conn_->Owner() && !conn_->GetNamespace().empty()) {
+          conn_->Owner()->IncrInboundBytesForNamespace(conn_->GetNamespace(), line.length);
+        }
         if (line[0] == '*') {
           auto parse_result = ParseInt<int64_t>(std::string(line.get() + 1, line.length - 1), 10);
           if (!parse_result) {
@@ -102,6 +106,9 @@ Status Request::Tokenize(evbuffer *input) {
         if (!line || line.length <= 0) return Status::OK();
 
         srv_->stats.IncrInboundBytes(line.length);
+        if (conn_ && conn_->Owner() && !conn_->GetNamespace().empty()) {
+          conn_->Owner()->IncrInboundBytesForNamespace(conn_->GetNamespace(), line.length);
+        }
         if (line[0] != '$') {
           return {Status::NotOK, "Protocol error: expected '$'"};
         }
@@ -126,6 +133,9 @@ Status Request::Tokenize(evbuffer *input) {
         tokens_.emplace_back(data, bulk_len_);
         evbuffer_drain(input, bulk_len_ + 2);
         srv_->stats.IncrInboundBytes(bulk_len_ + 2);
+        if (conn_ && conn_->Owner() && !conn_->GetNamespace().empty()) {
+          conn_->Owner()->IncrInboundBytesForNamespace(conn_->GetNamespace(), bulk_len_ + 2);
+        }
         --multi_bulk_len_;
         if (multi_bulk_len_ == 0) {
           state_ = ArrayLen;

@@ -1360,13 +1360,38 @@ int64_t Server::GetLastBgsaveTime() {
   return last_bgsave_timestamp_secs_ == -1 ? start_time_secs_ : last_bgsave_timestamp_secs_;
 }
 
-Server::InfoEntries Server::GetStatsInfo() {
+NamespaceStatsSnapshot Server::AggregateNamespaceStats(const std::string &ns) {
+  NamespaceStatsSnapshot result;
+  for (const auto &t : worker_threads_) {
+    auto worker_stats = t->GetWorker()->GetNamespaceStatsSnapshot();
+    auto it = worker_stats.find(ns);
+    if (it != worker_stats.end()) {
+      result.total_calls += it->second.total_calls;
+      result.in_bytes += it->second.in_bytes;
+      result.out_bytes += it->second.out_bytes;
+    }
+  }
+  return result;
+}
+
+Server::InfoEntries Server::GetStatsInfo(const std::string &ns, bool is_admin) {
   Server::InfoEntries entries;
   entries.emplace_back("total_connections_received", total_clients_.load());
-  entries.emplace_back("total_commands_processed", stats.total_calls.load());
+
+  if (is_admin) {
+    // Admin: global stats
+    entries.emplace_back("total_commands_processed", stats.total_calls.load());
+    entries.emplace_back("total_net_input_bytes", stats.in_bytes.load());
+    entries.emplace_back("total_net_output_bytes", stats.out_bytes.load());
+  } else {
+    // Tenant: namespace-specific stats
+    auto ns_stats = AggregateNamespaceStats(ns);
+    entries.emplace_back("total_commands_processed", ns_stats.total_calls);
+    entries.emplace_back("total_net_input_bytes", ns_stats.in_bytes);
+    entries.emplace_back("total_net_output_bytes", ns_stats.out_bytes);
+  }
+
   entries.emplace_back("instantaneous_ops_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_COMMAND));
-  entries.emplace_back("total_net_input_bytes", stats.in_bytes.load());
-  entries.emplace_back("total_net_output_bytes", stats.out_bytes.load());
   entries.emplace_back("instantaneous_input_kbps",
                        static_cast<float>(stats.GetInstantaneousMetric(STATS_METRIC_NET_INPUT) / 1024));
   entries.emplace_back("instantaneous_output_kbps",
@@ -1499,13 +1524,18 @@ Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
 // this section can't be shown when loading(i.e. !is_loading_).
 std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::string> &sections) {
   std::string ns = conn->GetNamespace();
+  bool is_admin = conn->IsAdmin();
   std::vector<std::pair<std::string, std::function<InfoEntries(Server *)>>> info_funcs = {
       {"Server", &Server::GetServerInfo},
       {"Clients", [conn](Server *srv) { return srv->GetClientsInfo(conn); }},
-      {"Memory", &Server::GetMemoryInfo},   {"Persistence", &Server::GetPersistenceInfo},
-      {"Stats", &Server::GetStatsInfo},     {"Replication", &Server::GetReplicationInfo},
-      {"CPU", &Server::GetCpuInfo},         {"CommandStats", &Server::GetCommandsStatsInfo},
-      {"Cluster", &Server::GetClusterInfo}, {"Keyspace", [&ns](Server *srv) { return srv->GetKeyspaceInfo(ns); }},
+      {"Memory", &Server::GetMemoryInfo},
+      {"Persistence", &Server::GetPersistenceInfo},
+      {"Stats", [&ns, is_admin](Server *srv) { return srv->GetStatsInfo(ns, is_admin); }},
+      {"Replication", &Server::GetReplicationInfo},
+      {"CPU", &Server::GetCpuInfo},
+      {"CommandStats", &Server::GetCommandsStatsInfo},
+      {"Cluster", &Server::GetClusterInfo},
+      {"Keyspace", [&ns](Server *srv) { return srv->GetKeyspaceInfo(ns); }},
       {"RocksDB", &Server::GetRocksDBInfo},
   };
 
