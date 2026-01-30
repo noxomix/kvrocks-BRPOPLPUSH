@@ -124,16 +124,13 @@ func TestClientListKillNamespaceIsolation(t *testing.T) {
 		killed := result.Val().(int64)
 		require.Equal(t, int64(1), killed, "ns1 should be able to kill its own namespace connection")
 
-		// CLIENT KILL is async - connection closes after next I/O
-		// Send commands until we get an error (connection closed)
-		var err error
+		// CLIENT KILL is async - go-redis will auto-reconnect
+		// Verify by checking that client ID changed (reconnected = new ID)
 		for i := 0; i < 10; i++ {
-			err = ns1Rdb2.Ping(ctx).Err()
-			if err != nil {
-				break
-			}
+			ns1Rdb2.Ping(ctx) // Trigger reconnect
 		}
-		require.Error(t, err, "ns1Rdb2 should be disconnected after CLIENT KILL")
+		newId := ns1Rdb2.ClientID(ctx).Val()
+		require.NotEqual(t, ns1Rdb2Id, newId, "Client ID should change after kill (reconnected)")
 
 		ns1Rdb2.Close()
 	})
@@ -155,16 +152,13 @@ func TestClientListKillNamespaceIsolation(t *testing.T) {
 		killed := result.Val().(int64)
 		require.Equal(t, int64(1), killed, "Admin should be able to kill any connection")
 
-		// CLIENT KILL is async - connection closes after next I/O
-		// Send commands until we get an error (connection closed)
-		var err error
+		// CLIENT KILL is async - go-redis will auto-reconnect
+		// Verify by checking that client ID changed (reconnected = new ID)
 		for i := 0; i < 10; i++ {
-			err = ns1RdbToKill.Ping(ctx).Err()
-			if err != nil {
-				break
-			}
+			ns1RdbToKill.Ping(ctx) // Trigger reconnect
 		}
-		require.Error(t, err, "Connection should be disconnected after CLIENT KILL")
+		newId := ns1RdbToKill.ClientID(ctx).Val()
+		require.NotEqual(t, clientId, newId, "Client ID should change after kill (reconnected)")
 
 		ns1RdbToKill.Close()
 	})
