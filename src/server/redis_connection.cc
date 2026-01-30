@@ -607,7 +607,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
 
-    srv_->UpdateWatchedKeysFromArgs(cmd_tokens, *attributes);
+    srv_->UpdateWatchedKeysFromArgs(GetNamespace(), cmd_tokens, *attributes);
 
     if (!reply.empty()) Reply(reply);
     reply.clear();

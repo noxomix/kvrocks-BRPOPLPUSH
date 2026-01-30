@@ -342,8 +342,9 @@ class Server {
   std::unique_ptr<SlotMigrator> slot_migrator;
   std::unique_ptr<SlotImport> slot_import;
 
-  void UpdateWatchedKeysFromArgs(const std::vector<std::string> &args, const redis::CommandAttributes &attr);
-  void UpdateWatchedKeysManually(const std::vector<std::string> &keys);
+  void UpdateWatchedKeysFromArgs(const std::string &ns, const std::vector<std::string> &args,
+                                  const redis::CommandAttributes &attr);
+  void UpdateWatchedKeysManually(const std::string &ns, const std::vector<std::string> &keys);
   void WatchKey(redis::Connection *conn, const std::vector<std::string> &keys);
   static bool IsWatchedKeysModified(redis::Connection *conn);
   void ResetWatchedKeys(redis::Connection *conn);
@@ -364,7 +365,8 @@ class Server {
   void cron();
   void recordInstantaneousMetrics();
   static void updateCachedTime();
-  void updateWatchedKeysFromRange(const std::vector<std::string> &args, const redis::CommandKeyRange &range);
+  void updateWatchedKeysFromRange(const std::string &ns, const std::vector<std::string> &args,
+                                   const redis::CommandKeyRange &range);
   void updateAllWatchedKeys();
   void increaseWorkerThreads(size_t delta);
   void decreaseWorkerThreads(size_t delta);

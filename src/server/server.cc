@@ -2094,12 +2094,25 @@ Status ServerLogData::Decode(const rocksdb::Slice &blob) {
   return {Status::NotOK};
 }
 
-void Server::updateWatchedKeysFromRange(const std::vector<std::string> &args, const redis::CommandKeyRange &range) {
+// Creates a namespace-prefixed key for watched_key_map_ to ensure namespace isolation.
+// Format: ns_length (1 byte) + ns + key - similar to ComposeNamespaceKey but without slot_id.
+static std::string MakeWatchedKey(const std::string &ns, const std::string &key) {
+  std::string result;
+  result.reserve(1 + ns.size() + key.size());
+  result.push_back(static_cast<char>(ns.size()));
+  result.append(ns);
+  result.append(key);
+  return result;
+}
+
+void Server::updateWatchedKeysFromRange(const std::string &ns, const std::vector<std::string> &args,
+                                        const redis::CommandKeyRange &range) {
   std::shared_lock lock(watched_key_mutex_);
 
   for (size_t i = range.first_key; range.last_key > 0 ? i <= size_t(range.last_key) : i <= args.size() + range.last_key;
        i += range.key_step) {
-    if (auto iter = watched_key_map_.find(args[i]); iter != watched_key_map_.end()) {
+    auto watched_key = MakeWatchedKey(ns, args[i]);
+    if (auto iter = watched_key_map_.find(watched_key); iter != watched_key_map_.end()) {
       for (auto *conn : iter->second) {
         conn->watched_keys_modified = true;
       }
@@ -2117,19 +2130,21 @@ void Server::updateAllWatchedKeys() {
   }
 }
 
-void Server::UpdateWatchedKeysFromArgs(const std::vector<std::string> &args, const redis::CommandAttributes &attr) {
+void Server::UpdateWatchedKeysFromArgs(const std::string &ns, const std::vector<std::string> &args,
+                                        const redis::CommandAttributes &attr) {
   if ((attr.GenerateFlags(args, *GetConfig()) & redis::kCmdWrite) && watched_key_size_ > 0) {
-    attr.ForEachKeyRange([this](const std::vector<std::string> &args,
-                                redis::CommandKeyRange range) { updateWatchedKeysFromRange(args, range); },
+    attr.ForEachKeyRange([this, &ns](const std::vector<std::string> &args,
+                                     redis::CommandKeyRange range) { updateWatchedKeysFromRange(ns, args, range); },
                          args, [this](const std::vector<std::string> &) { updateAllWatchedKeys(); });
   }
 }
 
-void Server::UpdateWatchedKeysManually(const std::vector<std::string> &keys) {
+void Server::UpdateWatchedKeysManually(const std::string &ns, const std::vector<std::string> &keys) {
   std::shared_lock lock(watched_key_mutex_);
 
   for (const auto &key : keys) {
-    if (auto iter = watched_key_map_.find(key); iter != watched_key_map_.end()) {
+    auto watched_key = MakeWatchedKey(ns, key);
+    if (auto iter = watched_key_map_.find(watched_key); iter != watched_key_map_.end()) {
       for (auto *conn : iter->second) {
         conn->watched_keys_modified = true;
       }
@@ -2140,14 +2155,16 @@ void Server::UpdateWatchedKeysManually(const std::vector<std::string> &keys) {
 void Server::WatchKey(redis::Connection *conn, const std::vector<std::string> &keys) {
   std::unique_lock lock(watched_key_mutex_);
 
+  const auto &ns = conn->GetNamespace();
   for (const auto &key : keys) {
-    if (auto iter = watched_key_map_.find(key); iter != watched_key_map_.end()) {
+    auto watched_key = MakeWatchedKey(ns, key);
+    if (auto iter = watched_key_map_.find(watched_key); iter != watched_key_map_.end()) {
       iter->second.emplace(conn);
     } else {
-      watched_key_map_.emplace(key, std::set<redis::Connection *>{conn});
+      watched_key_map_.emplace(watched_key, std::set<redis::Connection *>{conn});
     }
 
-    conn->watched_keys.insert(key);
+    conn->watched_keys.insert(watched_key);
   }
 
   watched_key_size_ = watched_key_map_.size();

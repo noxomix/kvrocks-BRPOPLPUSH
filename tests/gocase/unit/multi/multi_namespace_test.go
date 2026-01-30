@@ -169,6 +169,73 @@ func TestMultiNamespaceIsolation(t *testing.T) {
 		require.Equal(t, "committed_b", clientB.Get(ctx, "discard_key").Val())
 	})
 
+	t.Run("WATCH is namespace-isolated: modification in other namespace does not trigger", func(t *testing.T) {
+		// Setup: Both namespaces have a key with the same name
+		require.NoError(t, clientA.Set(ctx, "watch_key", "value_a", 0).Err())
+		require.NoError(t, clientB.Set(ctx, "watch_key", "value_b", 0).Err())
+
+		// Client A watches "watch_key" in ns_a
+		require.NoError(t, clientA.Do(ctx, "WATCH", "watch_key").Err())
+
+		// Client B modifies "watch_key" in ns_b (different namespace!)
+		require.NoError(t, clientB.Set(ctx, "watch_key", "modified_b", 0).Err())
+
+		// Client A's EXEC should SUCCEED because the modification was in a different namespace
+		require.NoError(t, clientA.Do(ctx, "MULTI").Err())
+		require.NoError(t, clientA.Do(ctx, "SET", "watch_key", "new_value_a").Err())
+		result := clientA.Do(ctx, "EXEC").Val()
+		require.NotNil(t, result, "EXEC should succeed - modification was in different namespace")
+
+		// Verify the values
+		require.Equal(t, "new_value_a", clientA.Get(ctx, "watch_key").Val())
+		require.Equal(t, "modified_b", clientB.Get(ctx, "watch_key").Val())
+	})
+
+	t.Run("WATCH within same namespace still triggers on modification", func(t *testing.T) {
+		// Create a second client in ns_a
+		clientA2 := srv.NewClientWithOption(&redis.Options{Password: "token_a"})
+		defer func() { require.NoError(t, clientA2.Close()) }()
+
+		// Setup
+		require.NoError(t, clientA.Set(ctx, "watch_same_ns", "initial", 0).Err())
+
+		// Client A watches "watch_same_ns"
+		require.NoError(t, clientA.Do(ctx, "WATCH", "watch_same_ns").Err())
+
+		// Client A2 (same namespace!) modifies the key
+		require.NoError(t, clientA2.Set(ctx, "watch_same_ns", "modified_by_a2", 0).Err())
+
+		// Client A's EXEC should FAIL because the modification was in the same namespace
+		require.NoError(t, clientA.Do(ctx, "MULTI").Err())
+		require.NoError(t, clientA.Do(ctx, "SET", "watch_same_ns", "should_not_happen").Err())
+		result := clientA.Do(ctx, "EXEC").Val()
+		require.Nil(t, result, "EXEC should fail - modification was in same namespace")
+
+		// Value should be what A2 set, not what A tried to set
+		require.Equal(t, "modified_by_a2", clientA.Get(ctx, "watch_same_ns").Val())
+	})
+
+	t.Run("WATCH multiple keys with cross-namespace modifications", func(t *testing.T) {
+		// Setup
+		require.NoError(t, clientA.Set(ctx, "key1", "a1", 0).Err())
+		require.NoError(t, clientA.Set(ctx, "key2", "a2", 0).Err())
+		require.NoError(t, clientB.Set(ctx, "key1", "b1", 0).Err())
+		require.NoError(t, clientB.Set(ctx, "key2", "b2", 0).Err())
+
+		// Client A watches both keys
+		require.NoError(t, clientA.Do(ctx, "WATCH", "key1", "key2").Err())
+
+		// Client B modifies both keys in ns_b (should not affect A)
+		require.NoError(t, clientB.Set(ctx, "key1", "b1_modified", 0).Err())
+		require.NoError(t, clientB.Set(ctx, "key2", "b2_modified", 0).Err())
+
+		// Client A's EXEC should succeed
+		require.NoError(t, clientA.Do(ctx, "MULTI").Err())
+		require.NoError(t, clientA.Do(ctx, "SET", "key1", "a1_new").Err())
+		result := clientA.Do(ctx, "EXEC").Val()
+		require.NotNil(t, result, "EXEC should succeed - modifications were in different namespace")
+	})
+
 	// Cleanup
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns_a").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns_b").Err())
