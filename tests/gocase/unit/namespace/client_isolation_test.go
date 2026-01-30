@@ -1,0 +1,175 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package namespace
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/apache/kvrocks/tests/gocase/util"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
+)
+
+func TestClientListKillNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Verify connections are working
+	require.NoError(t, ns1Rdb.Ping(ctx).Err())
+	require.NoError(t, ns2Rdb.Ping(ctx).Err())
+
+	t.Run("CLIENT LIST only shows own namespace connections", func(t *testing.T) {
+		// ns1 sees only its own connection
+		result := ns1Rdb.ClientList(ctx)
+		require.NoError(t, result.Err())
+		clients := result.Val()
+
+		// Should see exactly 1 connection (itself)
+		lines := strings.Split(strings.TrimSpace(clients), "\n")
+		require.Equal(t, 1, len(lines), "ns1 should see only 1 connection (itself)")
+
+		// ns2 sees only its own connection
+		result = ns2Rdb.ClientList(ctx)
+		require.NoError(t, result.Err())
+		clients = result.Val()
+
+		lines = strings.Split(strings.TrimSpace(clients), "\n")
+		require.Equal(t, 1, len(lines), "ns2 should see only 1 connection (itself)")
+	})
+
+	t.Run("Admin sees all namespace connections", func(t *testing.T) {
+		result := adminRdb.ClientList(ctx)
+		require.NoError(t, result.Err())
+		clients := result.Val()
+
+		// Admin should see at least 3 connections (admin + ns1 + ns2)
+		lines := strings.Split(strings.TrimSpace(clients), "\n")
+		require.GreaterOrEqual(t, len(lines), 3, "Admin should see at least 3 connections")
+	})
+
+	t.Run("CLIENT KILL cannot kill other namespace connections", func(t *testing.T) {
+		// Get ns2's client ID
+		ns2Id := ns2Rdb.ClientID(ctx).Val()
+		require.NotZero(t, ns2Id)
+
+		// ns1 tries to kill ns2 by ID - should fail (0 killed)
+		result := ns1Rdb.Do(ctx, "CLIENT", "KILL", "ID", ns2Id)
+		require.NoError(t, result.Err())
+		killed := result.Val().(int64)
+		require.Equal(t, int64(0), killed, "ns1 should not be able to kill ns2's connection")
+
+		// Verify ns2 is still connected
+		require.NoError(t, ns2Rdb.Ping(ctx).Err())
+	})
+
+	t.Run("CLIENT KILL can kill own namespace connection", func(t *testing.T) {
+		// Create a second ns1 connection
+		ns1Rdb2 := srv.NewClientWithOption(&redis.Options{
+			Password: "token1",
+		})
+		require.NoError(t, ns1Rdb2.Ping(ctx).Err())
+
+		// Get ns1Rdb2's client ID
+		ns1Rdb2Id := ns1Rdb2.ClientID(ctx).Val()
+		require.NotZero(t, ns1Rdb2Id)
+
+		// ns1 kills ns1Rdb2 by ID - should succeed
+		result := ns1Rdb.Do(ctx, "CLIENT", "KILL", "ID", ns1Rdb2Id)
+		require.NoError(t, result.Err())
+		killed := result.Val().(int64)
+		require.Equal(t, int64(1), killed, "ns1 should be able to kill its own namespace connection")
+
+		// CLIENT KILL is async - connection closes after next I/O
+		// Send commands until we get an error (connection closed)
+		var err error
+		for i := 0; i < 10; i++ {
+			err = ns1Rdb2.Ping(ctx).Err()
+			if err != nil {
+				break
+			}
+		}
+		require.Error(t, err, "ns1Rdb2 should be disconnected after CLIENT KILL")
+
+		ns1Rdb2.Close()
+	})
+
+	t.Run("Admin can kill any namespace connection", func(t *testing.T) {
+		// Create a new ns1 connection for this test
+		ns1RdbToKill := srv.NewClientWithOption(&redis.Options{
+			Password: "token1",
+		})
+		require.NoError(t, ns1RdbToKill.Ping(ctx).Err())
+
+		// Get the client ID
+		clientId := ns1RdbToKill.ClientID(ctx).Val()
+		require.NotZero(t, clientId)
+
+		// Admin kills ns1 connection by ID
+		result := adminRdb.Do(ctx, "CLIENT", "KILL", "ID", clientId)
+		require.NoError(t, result.Err())
+		killed := result.Val().(int64)
+		require.Equal(t, int64(1), killed, "Admin should be able to kill any connection")
+
+		// CLIENT KILL is async - connection closes after next I/O
+		// Send commands until we get an error (connection closed)
+		var err error
+		for i := 0; i < 10; i++ {
+			err = ns1RdbToKill.Ping(ctx).Err()
+			if err != nil {
+				break
+			}
+		}
+		require.Error(t, err, "Connection should be disconnected after CLIENT KILL")
+
+		ns1RdbToKill.Close()
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}
