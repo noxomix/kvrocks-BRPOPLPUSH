@@ -70,8 +70,9 @@ struct DBScanInfo {
 struct ConnContext {
   Worker *owner;
   int fd;
+  std::string ns;
 
-  ConnContext(Worker *w, int fd) : owner(w), fd(fd) {}
+  ConnContext(Worker *w, int fd, std::string ns) : owner(w), fd(fd), ns(std::move(ns)) {}
 
   bool operator<(const ConnContext &c) const {
     if (owner == c.owner) {
@@ -267,7 +268,8 @@ class Server {
   };
   using InfoEntries = std::vector<InfoEntry>;
 
-  InfoEntries GetStatsInfo();
+  InfoEntries GetStatsInfo(const std::string &ns, bool is_admin);
+  NamespaceStatsSnapshot AggregateNamespaceStats(const std::string &ns);
   InfoEntries GetServerInfo();
   InfoEntries GetMemoryInfo();
   InfoEntries GetRocksDBInfo();
@@ -302,6 +304,7 @@ class Server {
   int DecrMonitorClientNum();
   int IncrBlockedClientNum();
   int DecrBlockedClientNum();
+  int GetBlockedClientsCount(redis::Connection *self);
   std::string GetClientsStr(redis::Connection *self);
   uint64_t GetClientID();
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,

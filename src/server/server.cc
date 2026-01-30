@@ -480,7 +480,7 @@ int Server::PublishMessage(const std::string &channel, const std::string &msg) {
 void Server::SubscribeChannel(const std::string &channel, redis::Connection *conn) {
   std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD());
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
   if (auto iter = pubsub_channels_.find(channel); iter == pubsub_channels_.end()) {
     pubsub_channels_.emplace(channel, std::list<ConnContext>{conn_ctx});
   } else {
@@ -533,7 +533,7 @@ void Server::ListChannelSubscribeNum(const std::vector<std::string> &channels,
 void Server::PSubscribeChannel(const std::string &pattern, redis::Connection *conn) {
   std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD());
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
   if (auto iter = pubsub_patterns_.find(pattern); iter == pubsub_patterns_.end()) {
     pubsub_patterns_.emplace(pattern, std::list<ConnContext>{conn_ctx});
   } else {
@@ -564,7 +564,7 @@ void Server::SSubscribeChannel(const std::string &channel, redis::Connection *co
   assert((config_->cluster_enabled && slot < HASH_SLOTS_SIZE) || slot == 0);
   std::lock_guard<std::mutex> guard(pubsub_shard_channels_mu_);
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD());
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
   if (auto iter = pubsub_shard_channels_[slot].find(channel); iter == pubsub_shard_channels_[slot].end()) {
     pubsub_shard_channels_[slot].emplace(channel, std::list<ConnContext>{conn_ctx});
   } else {
@@ -621,7 +621,7 @@ void Server::ListSChannelSubscribeNum(const std::vector<std::string> &channels,
 void Server::BlockOnKey(const std::string &key, redis::Connection *conn) {
   std::lock_guard<std::mutex> guard(blocking_keys_mu_);
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD());
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
 
   if (auto iter = blocking_keys_.find(key); iter == blocking_keys_.end()) {
     blocking_keys_.emplace(key, std::list<ConnContext>{conn_ctx});
@@ -858,6 +858,46 @@ int Server::DecrMonitorClientNum() { return monitor_clients_.fetch_sub(1, std::m
 int Server::IncrBlockedClientNum() { return blocked_clients_.fetch_add(1, std::memory_order_relaxed); }
 
 int Server::DecrBlockedClientNum() { return blocked_clients_.fetch_sub(1, std::memory_order_relaxed); }
+
+int Server::GetBlockedClientsCount(redis::Connection *self) {
+  // Admin sees global counter (O(1))
+  if (self->IsAdmin()) {
+    return blocked_clients_.load(std::memory_order_relaxed);
+  }
+
+  const std::string &ns = self->GetNamespace();
+  int count = 0;
+
+  // 1. blocking_keys_ (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP)
+  {
+    std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+    for (const auto &[key, contexts] : blocking_keys_) {
+      for (const auto &ctx : contexts) {
+        if (ctx.ns == ns) count++;
+      }
+    }
+  }
+
+  // 2. blocked_stream_consumers_ (XREAD BLOCK)
+  {
+    std::lock_guard<std::mutex> guard(blocked_stream_consumers_mu_);
+    for (const auto &[key, consumers] : blocked_stream_consumers_) {
+      for (const auto &consumer : consumers) {
+        if (consumer->ns == ns) count++;
+      }
+    }
+  }
+
+  // 3. wait_contexts_ (WAIT)
+  {
+    std::shared_lock<std::shared_mutex> guard(wait_contexts_mu_);
+    for (const auto &[seq, ctx] : wait_contexts_) {
+      if (ctx.conn->GetNamespace() == ns) count++;
+    }
+  }
+
+  return count;
+}
 
 std::shared_lock<std::shared_mutex> Server::WorkConcurrencyGuard() {
   return std::shared_lock(works_concurrency_rw_lock_);
@@ -1224,8 +1264,7 @@ Server::InfoEntries Server::GetClientsInfo(redis::Connection *self) {
 
   entries.emplace_back("connected_clients", connected);
   entries.emplace_back("monitor_clients", monitor);
-  // blocked_clients remains global (tracked via wait contexts, not per-connection)
-  entries.emplace_back("blocked_clients", blocked_clients_.load());
+  entries.emplace_back("blocked_clients", GetBlockedClientsCount(self));
   return entries;
 }
 

@@ -98,6 +98,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void IncrInboundBytesForNamespace(const std::string &ns, uint64_t bytes);
   void IncrOutboundBytesForNamespace(const std::string &ns, uint64_t bytes);
   std::unordered_map<std::string, NamespaceStatsSnapshot> GetNamespaceStatsSnapshot() const;
+  NamespaceStatsSnapshot GetNamespaceStats(const std::string &ns) const;
 
  private:
   Status listenFD(int fd, uint32_t expected_port, int backlog);

@@ -27,6 +27,13 @@ und wird nur global gezählt. Das ist korrekt und kein Bug.
 LEARNING - Aggregation optimieren:
 Bei Cross-Worker Aggregation (z.B. INFO stats) nicht alle Daten von allen Workern holen und dann filtern.
 Stattdessen: Gezielt nur die benötigten Daten anfragen (z.B. `GetNamespaceStats(ns)` statt `GetAllStats()`).
+
+KONZEPT - Blocking vs. Locking:
+- **Blocking** (`blocked_clients`): Connection WARTET auf externes Event (BLPOP wartet auf Daten, XREAD BLOCK, WAIT).
+  Connection ist pausiert, verarbeitet keine Commands bis Event eintritt oder Timeout.
+- **Locking** (MULTI/EXEC): Connection ist AKTIV, Commands werden gequeued. Bei EXEC kurzer Lock für Atomizität.
+  Connection antwortet sofort auf jeden Command ("QUEUED"), ist nie "blocked".
+`blocked_clients` zählt nur schlafende Connections, nicht Transaktionen.
 }
 
 ## Erledigt
@@ -122,6 +129,11 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 - [x] CLIENT KILL - Nur eigene Connections killen ✅ GEFIXT
 - [x] SLOWLOG - Nur eigene Queries zeigen ✅ GEFIXT
 - [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
+- [ ] PUB/SUB - Namespace-Isolation (Mittel-Hoch)
+  - SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE - Nur Messages aus eigenem NS empfangen
+  - PUBLISH - Nur an Subscriber im eigenen NS senden
+  - PUBSUB CHANNELS/NUMSUB/NUMPAT - Nur eigene NS-Daten zeigen
+  - ConnContext hat bereits `ns` Feld (Batch 1.5), Filtering fehlt noch
 - [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
   - [x] `used_percent` - GEFIXT (`GetTotalSize(ns)`)
 - [x] INFO clients - `connected_clients`, `monitor_clients` ✅ per-NS, `blocked_clients` noch global (Batch 1.5)
@@ -150,11 +162,11 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
    - [x] `connected_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
    - [x] `monitor_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
 
-   **Batch 1.5 - blocked_clients (Mittel, verschoben):**
-   - [ ] `blocked_clients` - Aktuell global, später tenant-aware
-   > Blocked = Connection wartet auf BLPOP/BRPOP/XREAD BLOCK etc.
-   > Wird über Server-weite Wait-Contexts getrackt, nicht per-Connection-Flag.
-   > Tenant-aware = BlockingKey-Struktur um Namespace erweitern.
+   **Batch 1.5 - blocked_clients (Mittel):** 🔄 IN PROGRESS
+   - [x] `ConnContext` um `ns` Feld erweitert
+   - [x] `GetBlockedClientsCount(self)` implementiert - iteriert blocking_keys_, blocked_stream_consumers_, wait_contexts_
+   - [ ] Tests schreiben und verifizieren
+   > Admin: globaler Counter O(1), Tenant: On-demand Zählung mit Namespace-Filter
 
    **Batch 2 - Per-Worker Sharded Namespace Stats (Mittel):** ✅ ERLEDIGT
    - [x] `total_commands_processed` - Per-Worker ns_stats_ Map
@@ -171,3 +183,8 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 
    **Batch 4 - Aufwendig (Hoch):**
    - [ ] `cmdstat_*` - Per-Connection Command-Map + Aggregation
+
+//für mich selber, claude bitte hier erst ignorieren: {
+    eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
+    so könnte es sein, dass  es nur wenn nch kein namespace gestzt istder ns im Conn obj gespeichert/gestzt wird. Das dringend noch prüfen.
+}

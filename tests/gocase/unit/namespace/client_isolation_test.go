@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/redis/go-redis/v9"
@@ -296,6 +297,136 @@ func TestInfoNamespaceIsolation(t *testing.T) {
 		info := ns2Rdb.Info(ctx, "clients").Val()
 		connectedClients := parseInfoValue(info, "connected_clients")
 		require.Equal(t, "1", connectedClients, "ns2 should still see 1 connection")
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}
+
+func TestBlockedClientsNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Helper to parse INFO output
+	parseInfoValue := func(info, key string) string {
+		for _, line := range strings.Split(info, "\r\n") {
+			if strings.HasPrefix(line, key+":") {
+				return strings.TrimPrefix(line, key+":")
+			}
+		}
+		return ""
+	}
+
+	t.Run("BLPOP blocking shows in own namespace only", func(t *testing.T) {
+		// Create a separate connection for BLPOP (will block)
+		ns1BlockingRdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token1",
+		})
+		defer ns1BlockingRdb.Close()
+
+		// Start BLPOP in background (will block for 3 seconds)
+		done := make(chan struct{})
+		go func() {
+			ns1BlockingRdb.BLPop(ctx, 3*time.Second, "nonexistent_key_for_block_test")
+			close(done)
+		}()
+
+		// Give BLPOP time to start blocking
+		time.Sleep(200 * time.Millisecond)
+
+		// ns1 should see 1 blocked client
+		info := ns1Rdb.Info(ctx, "clients").Val()
+		blockedClients := parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "ns1 should see 1 blocked client")
+
+		// ns2 should see 0 blocked clients
+		info = ns2Rdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "0", blockedClients, "ns2 should see 0 blocked clients")
+
+		// Admin should see 1 blocked client (global)
+		info = adminRdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "Admin should see 1 blocked client (global)")
+
+		// Wait for BLPOP to timeout
+		<-done
+	})
+
+	t.Run("Multiple blocked clients in different namespaces", func(t *testing.T) {
+		// Create blocking connections for both namespaces
+		ns1BlockingRdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token1",
+		})
+		defer ns1BlockingRdb.Close()
+
+		ns2BlockingRdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token2",
+		})
+		defer ns2BlockingRdb.Close()
+
+		// Start BLPOP in both namespaces
+		done1 := make(chan struct{})
+		done2 := make(chan struct{})
+
+		go func() {
+			ns1BlockingRdb.BLPop(ctx, 3*time.Second, "ns1_block_key")
+			close(done1)
+		}()
+
+		go func() {
+			ns2BlockingRdb.BLPop(ctx, 3*time.Second, "ns2_block_key")
+			close(done2)
+		}()
+
+		// Give both BLPOP time to start blocking
+		time.Sleep(200 * time.Millisecond)
+
+		// ns1 should see 1 blocked client (only its own)
+		info := ns1Rdb.Info(ctx, "clients").Val()
+		blockedClients := parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "ns1 should see 1 blocked client")
+
+		// ns2 should see 1 blocked client (only its own)
+		info = ns2Rdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "ns2 should see 1 blocked client")
+
+		// Admin should see 2 blocked clients (global total)
+		info = adminRdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "2", blockedClients, "Admin should see 2 blocked clients (global)")
+
+		// Wait for both to timeout
+		<-done1
+		<-done2
 	})
 
 	// Cleanup namespaces
