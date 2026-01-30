@@ -21,8 +21,12 @@ package scripting
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -177,7 +181,7 @@ redis.register_function("func3", function() return "lib3" end)
 		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "DELETE", "nslib").Err())
 	})
 
-	t.Run("FUNCTION FLUSH deletes all namespaces", func(t *testing.T) {
+	t.Run("FUNCTION FLUSH only affects own namespace", func(t *testing.T) {
 		// Both namespaces load libraries
 		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "LOAD", luaNsLib("ns1")).Err())
 		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "LOAD", luaNsLib("ns2")).Err())
@@ -186,17 +190,27 @@ redis.register_function("func3", function() return "lib3" end)
 		require.Equal(t, "ns1", ns1Rdb.Do(ctx, "FCALL", "identify", 0).Val())
 		require.Equal(t, "ns2", ns2Rdb.Do(ctx, "FCALL", "identify", 0).Val())
 
-		// Admin: FUNCTION FLUSH (should delete ALL)
-		require.NoError(t, adminRdb.Do(ctx, "FUNCTION", "FLUSH").Err())
+		// ns1: FUNCTION FLUSH (should ONLY delete ns1's functions)
+		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "FLUSH").Err())
 
-		// Both namespaces should have empty function lists
+		// ns1 should have empty function list
 		result := ns1Rdb.Do(ctx, "FUNCTION", "LIST")
 		require.NoError(t, result.Err())
 		require.Equal(t, 0, len(result.Val().([]interface{})))
 
+		// ns1 FCALL should fail
+		util.ErrorRegexp(t, ns1Rdb.Do(ctx, "FCALL", "identify", 0).Err(), ".*No such function.*")
+
+		// ns2 should STILL have its functions (key test for namespace isolation!)
 		result = ns2Rdb.Do(ctx, "FUNCTION", "LIST")
 		require.NoError(t, result.Err())
-		require.Equal(t, 0, len(result.Val().([]interface{})))
+		require.Equal(t, 1, len(result.Val().([]interface{})))
+
+		// ns2 FCALL should still work!
+		require.Equal(t, "ns2", ns2Rdb.Do(ctx, "FCALL", "identify", 0).Val())
+
+		// Cleanup
+		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "DELETE", "nslib").Err())
 	})
 
 	t.Run("Functions persist after restart per namespace", func(t *testing.T) {
@@ -262,4 +276,329 @@ redis.register_function("func3", function() return "lib3" end)
 		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "DELETE", "nslib").Err())
 		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "DELETE", "nslib").Err())
 	})
+
+	t.Run("FUNCTION FLUSH with multiple libraries only affects own namespace", func(t *testing.T) {
+		// ns1: Load multiple libraries
+		lib1 := `#!lua name=multilib1
+redis.register_function("multi1", function() return "lib1" end)
+`
+		lib2 := `#!lua name=multilib2
+redis.register_function("multi2", function() return "lib2" end)
+`
+		lib3 := `#!lua name=multilib3
+redis.register_function("multi3", function() return "lib3" end)
+`
+		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "LOAD", lib1).Err())
+		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "LOAD", lib2).Err())
+		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "LOAD", lib3).Err())
+
+		// ns2: Load one library
+		lib4 := `#!lua name=multilib4
+redis.register_function("multi4", function() return "lib4" end)
+`
+		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "LOAD", lib4).Err())
+
+		// Verify all work
+		require.Equal(t, "lib1", ns1Rdb.Do(ctx, "FCALL", "multi1", 0).Val())
+		require.Equal(t, "lib2", ns1Rdb.Do(ctx, "FCALL", "multi2", 0).Val())
+		require.Equal(t, "lib3", ns1Rdb.Do(ctx, "FCALL", "multi3", 0).Val())
+		require.Equal(t, "lib4", ns2Rdb.Do(ctx, "FCALL", "multi4", 0).Val())
+
+		// ns1: FUNCTION FLUSH
+		require.NoError(t, ns1Rdb.Do(ctx, "FUNCTION", "FLUSH").Err())
+
+		// ns1: All 3 libs should be gone
+		result := ns1Rdb.Do(ctx, "FUNCTION", "LIST")
+		require.NoError(t, result.Err())
+		require.Equal(t, 0, len(result.Val().([]interface{})))
+
+		util.ErrorRegexp(t, ns1Rdb.Do(ctx, "FCALL", "multi1", 0).Err(), ".*No such function.*")
+		util.ErrorRegexp(t, ns1Rdb.Do(ctx, "FCALL", "multi2", 0).Err(), ".*No such function.*")
+		util.ErrorRegexp(t, ns1Rdb.Do(ctx, "FCALL", "multi3", 0).Err(), ".*No such function.*")
+
+		// ns2: lib4 should still work!
+		require.Equal(t, "lib4", ns2Rdb.Do(ctx, "FCALL", "multi4", 0).Val())
+
+		// Cleanup
+		require.NoError(t, ns2Rdb.Do(ctx, "FUNCTION", "DELETE", "multilib4").Err())
+	})
+}
+
+// TestFunctionFlushParallelIsolation tests that FUNCTION FLUSH in different namespaces
+// can run truly parallel without blocking each other.
+func TestFunctionFlushParallelIsolation(t *testing.T) {
+	password := "pwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin client
+	adminRdb := srv.NewClientWithOption(&redis.Options{Password: password})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create 4 namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "parallel_ns1", "ptoken1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "parallel_ns2", "ptoken2").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "parallel_ns3", "ptoken3").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "parallel_ns4", "ptoken4").Err())
+
+	// Create clients
+	client1 := srv.NewClientWithOption(&redis.Options{Password: "ptoken1"})
+	client2 := srv.NewClientWithOption(&redis.Options{Password: "ptoken2"})
+	client3 := srv.NewClientWithOption(&redis.Options{Password: "ptoken3"})
+	client4 := srv.NewClientWithOption(&redis.Options{Password: "ptoken4"})
+	defer func() { require.NoError(t, client1.Close()) }()
+	defer func() { require.NoError(t, client2.Close()) }()
+	defer func() { require.NoError(t, client3.Close()) }()
+	defer func() { require.NoError(t, client4.Close()) }()
+
+	t.Run("Parallel FUNCTION FLUSH in different namespaces", func(t *testing.T) {
+		// This test verifies that FUNCTION FLUSH in different namespaces can run
+		// truly parallel without blocking each other (they use different namespace locks).
+		//
+		// We test this by:
+		// 1. Loading libraries in all 4 namespaces
+		// 2. Triggering FUNCTION FLUSH in all 4 namespaces simultaneously
+		// 3. Verifying all complete successfully (no deadlock)
+		// 4. Verifying each namespace is empty afterward
+
+		// Load libraries in all namespaces
+		for i, client := range []*redis.Client{client1, client2, client3, client4} {
+			for j := 0; j < 5; j++ {
+				lib := fmt.Sprintf(`#!lua name=plib%d_%d
+redis.register_function("pfunc%d_%d", function() return %d end)
+`, i, j, i, j, i*10+j)
+				require.NoError(t, client.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+			}
+		}
+
+		// Verify all loaded
+		for _, client := range []*redis.Client{client1, client2, client3, client4} {
+			result := client.Do(ctx, "FUNCTION", "LIST")
+			require.NoError(t, result.Err())
+			require.Equal(t, 5, len(result.Val().([]interface{})))
+		}
+
+		var wg sync.WaitGroup
+		startBarrier := make(chan struct{})
+		errors := make(chan error, 4)
+
+		// Launch parallel FUNCTION FLUSH - all wait at barrier then execute together
+		for _, client := range []*redis.Client{client1, client2, client3, client4} {
+			wg.Add(1)
+			go func(c *redis.Client) {
+				defer wg.Done()
+				<-startBarrier
+				if err := c.Do(ctx, "FUNCTION", "FLUSH").Err(); err != nil {
+					errors <- err
+				}
+			}(client)
+		}
+
+		// Trigger all at once
+		close(startBarrier)
+		wg.Wait()
+		close(errors)
+
+		// Check no errors - all FLUSH operations should succeed
+		for err := range errors {
+			require.NoError(t, err)
+		}
+
+		// All namespaces should be empty - each FLUSH only affected its own namespace
+		for _, client := range []*redis.Client{client1, client2, client3, client4} {
+			result := client.Do(ctx, "FUNCTION", "LIST")
+			require.NoError(t, result.Err())
+			require.Equal(t, 0, len(result.Val().([]interface{})))
+		}
+
+		// Note: We don't assert on timing because FUNCTION FLUSH is very fast.
+		// The main value of this test is verifying:
+		// - No deadlock when 4 namespaces flush simultaneously
+		// - All operations succeed
+		// - Each namespace is properly isolated (empty after its own flush)
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "parallel_ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "parallel_ns2").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "parallel_ns3").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "parallel_ns4").Err())
+}
+
+// TestFunctionFlushWhileFCALLRunning tests that FUNCTION FLUSH blocks FCALL in the same
+// namespace but does not affect FCALL in other namespaces.
+func TestFunctionFlushWhileFCALLRunning(t *testing.T) {
+	password := "pwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin client
+	adminRdb := srv.NewClientWithOption(&redis.Options{Password: password})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "fcall_ns1", "ftoken1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "fcall_ns2", "ftoken2").Err())
+
+	// Create clients
+	client1 := srv.NewClientWithOption(&redis.Options{Password: "ftoken1"})
+	client2 := srv.NewClientWithOption(&redis.Options{Password: "ftoken2"})
+	defer func() { require.NoError(t, client1.Close()) }()
+	defer func() { require.NoError(t, client2.Close()) }()
+
+	t.Run("FCALL in other namespace continues during FUNCTION FLUSH", func(t *testing.T) {
+		// Load library in both namespaces
+		lib := `#!lua name=fcalllib
+redis.register_function("counter", function(keys, args)
+    local current = redis.call("INCR", keys[1])
+    return current
+end)
+`
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+		require.NoError(t, client2.Do(ctx, "FUNCTION", "LOAD", lib).Err())
+
+		// Initialize counters (each namespace has its own key)
+		require.NoError(t, client1.Set(ctx, "fcall_counter", "0", 0).Err())
+		require.NoError(t, client2.Set(ctx, "fcall_counter", "0", 0).Err())
+
+		var wg sync.WaitGroup
+		var ns2CallCount atomic.Int64
+		stopNs2 := make(chan struct{})
+
+		// ns2: Run FCALL in a loop
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopNs2:
+					return
+				default:
+					result := client2.Do(ctx, "FCALL", "counter", 1, "fcall_counter")
+					if result.Err() == nil {
+						ns2CallCount.Add(1)
+					}
+				}
+			}
+		}()
+
+		// Let ns2 run some calls
+		time.Sleep(50 * time.Millisecond)
+		callsBefore := ns2CallCount.Load()
+
+		// ns1: FUNCTION FLUSH (should NOT affect ns2)
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "FLUSH").Err())
+
+		// Let ns2 run more calls after ns1 flushed
+		time.Sleep(50 * time.Millisecond)
+		callsAfter := ns2CallCount.Load()
+
+		// Stop ns2 worker
+		close(stopNs2)
+		wg.Wait()
+
+		// ns2 should have continued running FCALL during and after ns1's FLUSH
+		require.Greater(t, callsAfter, callsBefore, "ns2 FCALL should continue during ns1 FUNCTION FLUSH")
+
+		// ns1: FCALL should fail (flushed)
+		util.ErrorRegexp(t, client1.Do(ctx, "FCALL", "counter", 1, "fcall_counter").Err(), ".*No such function.*")
+
+		// ns2: FCALL should still work
+		result := client2.Do(ctx, "FCALL", "counter", 1, "fcall_counter")
+		require.NoError(t, result.Err())
+
+		// Cleanup
+		require.NoError(t, client2.Do(ctx, "FUNCTION", "DELETE", "fcalllib").Err())
+		require.NoError(t, client1.Del(ctx, "fcall_counter").Err())
+		require.NoError(t, client2.Del(ctx, "fcall_counter").Err())
+	})
+
+	t.Run("FUNCTION FLUSH waits for running FCALL in same namespace", func(t *testing.T) {
+		// This test verifies that FUNCTION FLUSH (exclusive lock) waits for
+		// running FCALL (shared lock) to complete before executing.
+		//
+		// Strategy:
+		// 1. Load a function that signals "I'm running" by setting a key, then does slow work
+		// 2. Start FCALL in goroutine
+		// 3. Wait until the "running" signal appears (proves FCALL actually started)
+		// 4. Start FLUSH (should block until FCALL completes due to locking)
+		// 5. Verify FCALL completed its work before FLUSH deleted the function
+
+		// Function that: sets "running" flag, does slow work, sets "completed" flag
+		slowLib := `#!lua name=slowlib
+local function slow(keys, args)
+    -- Signal that we're running
+    redis.call("SET", "slow_running", "1")
+
+    -- Do slow work (enough iterations to take measurable time)
+    local sum = 0
+    for i = 1, 5000000 do
+        sum = sum + i
+    end
+
+    -- Signal completion with the result
+    redis.call("SET", "slow_completed", tostring(sum))
+    return sum
+end
+redis.register_function("slow", slow)
+`
+		require.NoError(t, client1.Do(ctx, "FUNCTION", "LOAD", slowLib).Err())
+
+		// Clean any leftover keys
+		client1.Del(ctx, "slow_running", "slow_completed")
+
+		var wg sync.WaitGroup
+		var fcallErr error
+
+		// Start FCALL in background
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := client1.Do(ctx, "FCALL", "slow", 0)
+			fcallErr = result.Err()
+		}()
+
+		// Wait until FCALL is actually running (not just queued)
+		// Poll for the "running" signal with timeout
+		runningDetected := false
+		for i := 0; i < 100; i++ { // Max 1 second
+			val, err := client1.Get(ctx, "slow_running").Result()
+			if err == nil && val == "1" {
+				runningDetected = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		require.True(t, runningDetected, "FCALL should have started and set running flag")
+
+		// Now start FLUSH - it should wait for FCALL to complete
+		// (because FCALL holds shared_lock, FLUSH needs exclusive_lock)
+		flushErr := client1.Do(ctx, "FUNCTION", "FLUSH").Err()
+		require.NoError(t, flushErr)
+
+		// Wait for FCALL goroutine to finish
+		wg.Wait()
+		require.NoError(t, fcallErr)
+
+		// Key test: "slow_completed" should exist, proving FCALL finished its work
+		// before FLUSH deleted the function (if FLUSH ran first, FCALL would fail mid-execution)
+		val, err := client1.Get(ctx, "slow_completed").Result()
+		require.NoError(t, err, "slow_completed key should exist - FCALL should have completed before FLUSH")
+		require.NotEmpty(t, val)
+
+		// Cleanup
+		client1.Del(ctx, "slow_running", "slow_completed")
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "fcall_ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "fcall_ns2").Err())
 }
