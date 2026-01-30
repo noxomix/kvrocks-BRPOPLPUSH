@@ -249,7 +249,7 @@ class CommandInfo : public Commander {
     for (size_t i = 1; i < args_.size(); ++i) {
       sections.push_back(args_[i]);
     }
-    auto info = srv->GetInfo(conn->GetNamespace(), sections);
+    auto info = srv->GetInfo(conn, sections);
     *output = conn->VerbatimString("txt", info);
     return Status::OK();
   }

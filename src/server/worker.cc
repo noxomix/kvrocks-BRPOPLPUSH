@@ -558,6 +558,26 @@ void Worker::KillClient(redis::Connection *self, uint64_t id, const std::string 
   }
 }
 
+ClientCounts Worker::GetClientCounts(redis::Connection *self) {
+  std::lock_guard<std::mutex> guard(conns_mu_);
+  ClientCounts counts;
+  for (const auto &[fd, conn] : conns_) {
+    // Non-admin only sees own namespace
+    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+      continue;
+    }
+    counts.connected++;
+  }
+  // Monitor connections
+  for (const auto &[fd, conn] : monitor_conns_) {
+    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+      continue;
+    }
+    counts.monitor++;
+  }
+  return counts;
+}
+
 void Worker::LuaReset() {
   auto lua = lua_.exchange(lua::CreateState());
   lua::DestroyState(lua);

@@ -1,5 +1,10 @@
 # Namespace-Isolation: Offene Probleme
 
+Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im wortcase 10.000 connecitons oaralle. 
+Worker sind naütlrich nicht für bestimmte tenant reserviert. Es ist wichtig dies zu verstehen, weil so manche arten von locks oder datenstrutkturen entpsechend auf diesen demand
+angepasst werden müssen das wir später kein bottleneck haben.
+
+
 ## Erledigt
 
 - [x] ~~ns_locks_ Pointer-Invalidation~~ - KEIN PROBLEM (C++ Standard garantiert Stabilität)
@@ -94,7 +99,8 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 - [x] SLOWLOG - Nur eigene Queries zeigen ✅ GEFIXT
 - [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
 - [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
-  - [ ] `used_percent` nutzt `GetTotalSize()` ohne NS → zeigt globale DB-Größe statt Tenant-Größe
+  - [x] `used_percent` - GEFIXT (`GetTotalSize(ns)`)
+- [x] INFO clients - `connected_clients`, `monitor_clients` ✅ per-NS, `blocked_clients` noch global (Batch 1.5)
 - [x] DBSIZE - ✅ Bereits namespace-aware
 
 ### 3. Bereits korrekt (tenant-lokal)
@@ -115,11 +121,16 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
    - **Ansatz:** Per-Connection Stats → bei INFO aggregieren (kein Hot-Path Impact)
    - **Bleiben global:** Server, CPU, Persistence, Replication, RocksDB, Cluster
 
-   **Batch 1 - Quick Wins (Trivial/Niedrig):**
-   - [ ] `used_percent` - 1 Zeile fix (`server.cc:1468`: `GetTotalSize(ns)`)
-   - [ ] `connected_clients` - On-demand zählen
-   - [ ] `blocked_clients` - On-demand zählen
-   - [ ] `monitor_clients` - On-demand zählen
+   **Batch 1 - Quick Wins (Trivial/Niedrig):** ✅ ERLEDIGT
+   - [x] `used_percent` - `GetTotalSize(ns)` statt `GetTotalSize()`
+   - [x] `connected_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
+   - [x] `monitor_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
+
+   **Batch 1.5 - blocked_clients (Mittel, verschoben):**
+   - [ ] `blocked_clients` - Aktuell global, später tenant-aware
+   > Blocked = Connection wartet auf BLPOP/BRPOP/XREAD BLOCK etc.
+   > Wird über Server-weite Wait-Contexts getrackt, nicht per-Connection-Flag.
+   > Tenant-aware = BlockingKey-Struktur um Namespace erweitern.
 
    **Batch 2 - Per-Connection Counter (Mittel):**
    - [ ] `total_commands_processed` - Counter zu Connection

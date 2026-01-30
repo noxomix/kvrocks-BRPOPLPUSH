@@ -21,6 +21,7 @@ package namespace
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -161,6 +162,140 @@ func TestClientListKillNamespaceIsolation(t *testing.T) {
 		require.NotEqual(t, clientId, newId, "Client ID should change after kill (reconnected)")
 
 		ns1RdbToKill.Close()
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}
+
+func TestInfoNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Create additional ns1 connections to verify counting
+	ns1Rdb2 := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb2.Close()) }()
+
+	ns1Rdb3 := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb3.Close()) }()
+
+	// Verify all connections are working
+	require.NoError(t, ns1Rdb.Ping(ctx).Err())
+	require.NoError(t, ns1Rdb2.Ping(ctx).Err())
+	require.NoError(t, ns1Rdb3.Ping(ctx).Err())
+	require.NoError(t, ns2Rdb.Ping(ctx).Err())
+
+	// Helper to parse INFO output
+	parseInfoValue := func(info, key string) string {
+		for _, line := range strings.Split(info, "\r\n") {
+			if strings.HasPrefix(line, key+":") {
+				return strings.TrimPrefix(line, key+":")
+			}
+		}
+		return ""
+	}
+
+	t.Run("INFO clients shows only own namespace connections for tenant", func(t *testing.T) {
+		// ns1 should see 3 connections (ns1Rdb, ns1Rdb2, ns1Rdb3)
+		info := ns1Rdb.Info(ctx, "clients").Val()
+		connectedClients := parseInfoValue(info, "connected_clients")
+		require.Equal(t, "3", connectedClients, "ns1 should see 3 connections in its namespace")
+
+		// ns2 should see only 1 connection (itself)
+		info = ns2Rdb.Info(ctx, "clients").Val()
+		connectedClients = parseInfoValue(info, "connected_clients")
+		require.Equal(t, "1", connectedClients, "ns2 should see 1 connection in its namespace")
+	})
+
+	t.Run("Admin sees all connections in INFO clients", func(t *testing.T) {
+		info := adminRdb.Info(ctx, "clients").Val()
+		connectedClients := parseInfoValue(info, "connected_clients")
+
+		// Admin should see at least 5 connections (admin + 3*ns1 + 1*ns2)
+		count, err := strconv.Atoi(connectedClients)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, count, 5, "Admin should see at least 5 connections")
+	})
+
+	t.Run("INFO keyspace works for tenants", func(t *testing.T) {
+		// Write some data to ns1
+		require.NoError(t, ns1Rdb.Set(ctx, "testkey1", "value1", 0).Err())
+		require.NoError(t, ns1Rdb.Set(ctx, "testkey2", "value2", 0).Err())
+
+		// Write some data to ns2
+		require.NoError(t, ns2Rdb.Set(ctx, "testkey1", "value1", 0).Err())
+
+		// Each namespace should see its own keyspace info
+		info := ns1Rdb.Info(ctx, "keyspace").Val()
+		require.Contains(t, info, "db0:", "ns1 should see keyspace info")
+
+		info = ns2Rdb.Info(ctx, "keyspace").Val()
+		require.Contains(t, info, "db0:", "ns2 should see keyspace info")
+
+		// Admin should also see keyspace info
+		info = adminRdb.Info(ctx, "keyspace").Val()
+		require.Contains(t, info, "db0:", "Admin should see keyspace info")
+	})
+
+	t.Run("No side effects when admin calls INFO", func(t *testing.T) {
+		// Admin calling INFO should not affect tenant connections
+		adminRdb.Info(ctx, "clients")
+		adminRdb.Info(ctx, "keyspace")
+		adminRdb.Info(ctx, "all")
+
+		// All tenant connections should still work
+		require.NoError(t, ns1Rdb.Ping(ctx).Err())
+		require.NoError(t, ns1Rdb2.Ping(ctx).Err())
+		require.NoError(t, ns1Rdb3.Ping(ctx).Err())
+		require.NoError(t, ns2Rdb.Ping(ctx).Err())
+
+		// Tenant INFO should still work correctly
+		info := ns1Rdb.Info(ctx, "clients").Val()
+		connectedClients := parseInfoValue(info, "connected_clients")
+		require.Equal(t, "3", connectedClients, "ns1 should still see 3 connections")
+	})
+
+	t.Run("No side effects when tenant calls INFO", func(t *testing.T) {
+		// Tenant calling INFO should not affect other tenants
+		ns1Rdb.Info(ctx, "clients")
+		ns1Rdb.Info(ctx, "keyspace")
+
+		// Other tenant should still work and see correct counts
+		require.NoError(t, ns2Rdb.Ping(ctx).Err())
+		info := ns2Rdb.Info(ctx, "clients").Val()
+		connectedClients := parseInfoValue(info, "connected_clients")
+		require.Equal(t, "1", connectedClients, "ns2 should still see 1 connection")
 	})
 
 	// Cleanup namespaces

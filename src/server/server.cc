@@ -1210,11 +1210,21 @@ Server::InfoEntries Server::GetServerInfo() {
   return entries;
 }
 
-Server::InfoEntries Server::GetClientsInfo() {
+Server::InfoEntries Server::GetClientsInfo(redis::Connection *self) {
   InfoEntries entries;
   entries.emplace_back("maxclients", config_->maxclients);
-  entries.emplace_back("connected_clients", connected_clients_.load());
-  entries.emplace_back("monitor_clients", monitor_clients_.load());
+
+  // Count clients per namespace (admin sees all, tenants see only their own)
+  int connected = 0, monitor = 0;
+  for (const auto &t : worker_threads_) {
+    auto counts = t->GetWorker()->GetClientCounts(self);
+    connected += counts.connected;
+    monitor += counts.monitor;
+  }
+
+  entries.emplace_back("connected_clients", connected);
+  entries.emplace_back("monitor_clients", monitor);
+  // blocked_clients remains global (tracked via wait contexts, not per-connection)
   entries.emplace_back("blocked_clients", blocked_clients_.load());
   return entries;
 }
@@ -1465,7 +1475,7 @@ Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
   entries.emplace_back("sequence", storage->GetDB()->GetLatestSequenceNumber());
   entries.emplace_back("used_db_size", storage->GetTotalSize(ns));
   entries.emplace_back("max_db_size", config_->max_db_size * GiB);
-  double used_percent = config_->max_db_size ? static_cast<double>(storage->GetTotalSize() * 100) /
+  double used_percent = config_->max_db_size ? static_cast<double>(storage->GetTotalSize(ns) * 100) /
                                                    static_cast<double>(config_->max_db_size * GiB)
                                              : 0;
   entries.emplace_back("used_percent", fmt::format("{}%", used_percent));
@@ -1487,9 +1497,11 @@ Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
 // DB is closed and the pointer is invalid. Server may crash if we access DB during loading.
 // If you add new fields which access DB into INFO command output, make sure
 // this section can't be shown when loading(i.e. !is_loading_).
-std::string Server::GetInfo(const std::string &ns, const std::vector<std::string> &sections) {
+std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::string> &sections) {
+  std::string ns = conn->GetNamespace();
   std::vector<std::pair<std::string, std::function<InfoEntries(Server *)>>> info_funcs = {
-      {"Server", &Server::GetServerInfo},   {"Clients", &Server::GetClientsInfo},
+      {"Server", &Server::GetServerInfo},
+      {"Clients", [conn](Server *srv) { return srv->GetClientsInfo(conn); }},
       {"Memory", &Server::GetMemoryInfo},   {"Persistence", &Server::GetPersistenceInfo},
       {"Stats", &Server::GetStatsInfo},     {"Replication", &Server::GetReplicationInfo},
       {"CPU", &Server::GetCpuInfo},         {"CommandStats", &Server::GetCommandsStatsInfo},

@@ -271,7 +271,7 @@ class Server {
   InfoEntries GetServerInfo();
   InfoEntries GetMemoryInfo();
   InfoEntries GetRocksDBInfo();
-  InfoEntries GetClientsInfo();
+  InfoEntries GetClientsInfo(redis::Connection *self);
   InfoEntries GetReplicationInfo();
   InfoEntries GetCommandsStatsInfo();
   InfoEntries GetClusterInfo();
@@ -279,7 +279,7 @@ class Server {
   InfoEntries GetCpuInfo();
   InfoEntries GetKeyspaceInfo(const std::string &ns);
 
-  std::string GetInfo(const std::string &ns, const std::vector<std::string> &sections);
+  std::string GetInfo(redis::Connection *conn, const std::vector<std::string> &sections);
   std::string GetRocksDBStatsJson() const;
   ReplState GetReplicationState();
 

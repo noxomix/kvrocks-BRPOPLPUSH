@@ -43,6 +43,11 @@
 
 class Server;
 
+struct ClientCounts {
+  int connected = 0;
+  int monitor = 0;
+};
+
 class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
  public:
   Worker(Server *srv, Config *config);
@@ -69,6 +74,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::string GetClientsStr(redis::Connection *self);
   void KillClient(redis::Connection *self, uint64_t id, const std::string &addr, uint64_t type, bool skipme,
                   int64_t *killed);
+  ClientCounts GetClientCounts(redis::Connection *self);
   void KickoutIdleClients(int timeout);
 
   Status ListenUnixSocket(const std::string &path, int perm, int backlog);
