@@ -621,9 +621,18 @@ rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &o
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
   rocksdb::Status s;
-  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    s = txn_write_batch_->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
-  } else if (ctx.batch && ctx.txn_context_enabled) {
+  // Check namespace-specific transaction for read-your-own-writes
+  if (!ctx.ns.empty()) {
+    std::shared_lock lock(ns_txn_mutex_);
+    auto it = ns_txn_states_.find(ctx.ns);
+    if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire) &&
+        it->second.batch && it->second.batch->GetWriteBatch()->Count() > 0) {
+      s = it->second.batch->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
+      recordKeyspaceStat(column_family, s);
+      return s;
+    }
+  }
+  if (ctx.batch && ctx.txn_context_enabled) {
     s = ctx.batch->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
   } else {
     s = db_->Get(options, column_family, key, value);
@@ -646,9 +655,18 @@ rocksdb::Status Storage::Get(engine::Context &ctx, const rocksdb::ReadOptions &o
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
   rocksdb::Status s;
-  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    s = txn_write_batch_->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
-  } else if (ctx.txn_context_enabled && ctx.batch) {
+  // Check namespace-specific transaction for read-your-own-writes
+  if (!ctx.ns.empty()) {
+    std::shared_lock lock(ns_txn_mutex_);
+    auto it = ns_txn_states_.find(ctx.ns);
+    if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire) &&
+        it->second.batch && it->second.batch->GetWriteBatch()->Count() > 0) {
+      s = it->second.batch->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
+      recordKeyspaceStat(column_family, s);
+      return s;
+    }
+  }
+  if (ctx.txn_context_enabled && ctx.batch) {
     s = ctx.batch->GetFromBatchAndDB(db_.get(), options, column_family, key, value);
   } else {
     s = db_->Get(options, column_family, key, value);
@@ -679,9 +697,16 @@ rocksdb::Iterator *Storage::NewIterator(engine::Context &ctx, const rocksdb::Rea
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
   auto iter = db_->NewIterator(options, column_family);
-  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    return txn_write_batch_->NewIteratorWithBase(column_family, iter, &options);
-  } else if (ctx.txn_context_enabled && ctx.batch && ctx.batch->GetWriteBatch()->Count() > 0) {
+  // Check namespace-specific transaction for read-your-own-writes
+  if (!ctx.ns.empty()) {
+    std::shared_lock lock(ns_txn_mutex_);
+    auto it = ns_txn_states_.find(ctx.ns);
+    if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire) &&
+        it->second.batch && it->second.batch->GetWriteBatch()->Count() > 0) {
+      return it->second.batch->NewIteratorWithBase(column_family, iter, &options);
+    }
+  }
+  if (ctx.txn_context_enabled && ctx.batch && ctx.batch->GetWriteBatch()->Count() > 0) {
     return ctx.batch->NewIteratorWithBase(column_family, iter, &options);
   }
   return iter;
@@ -694,10 +719,21 @@ void Storage::MultiGet(engine::Context &ctx, const rocksdb::ReadOptions &options
     CHECK(options.snapshot != nullptr);
     CHECK(ctx.GetSnapshot()->GetSequenceNumber() == options.snapshot->GetSequenceNumber());
   }
-  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
-    txn_write_batch_->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses,
-                                             false);
-  } else if (ctx.txn_context_enabled && ctx.batch) {
+  // Check namespace-specific transaction for read-your-own-writes
+  if (!ctx.ns.empty()) {
+    std::shared_lock lock(ns_txn_mutex_);
+    auto it = ns_txn_states_.find(ctx.ns);
+    if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire) &&
+        it->second.batch && it->second.batch->GetWriteBatch()->Count() > 0) {
+      it->second.batch->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses,
+                                               false);
+      for (size_t i = 0; i < num_keys; i++) {
+        recordKeyspaceStat(column_family, statuses[i]);
+      }
+      return;
+    }
+  }
+  if (ctx.txn_context_enabled && ctx.batch) {
     ctx.batch->MultiGetFromBatchAndDB(db_.get(), options, column_family, num_keys, keys, values, statuses, false);
   } else {
     db_->MultiGet(options, column_family, num_keys, keys, values, statuses, false);
@@ -710,9 +746,14 @@ void Storage::MultiGet(engine::Context &ctx, const rocksdb::ReadOptions &options
 
 rocksdb::Status Storage::Write(engine::Context &ctx, const rocksdb::WriteOptions &options,
                                rocksdb::WriteBatch *updates) {
-  if (is_txn_mode_) {
-    // The batch won't be flushed until the transaction was committed or rollback
-    return rocksdb::Status::OK();
+  // Check if this namespace has an active transaction
+  if (!ctx.ns.empty()) {
+    std::shared_lock lock(ns_txn_mutex_);
+    auto it = ns_txn_states_.find(ctx.ns);
+    if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire)) {
+      // The batch won't be flushed until the transaction was committed or rollback
+      return rocksdb::Status::OK();
+    }
   }
   return writeToDB(ctx, options, updates);
 }
@@ -746,7 +787,7 @@ rocksdb::Status Storage::writeToDB(engine::Context &ctx, const rocksdb::WriteOpt
 
 rocksdb::Status Storage::Delete(engine::Context &ctx, const rocksdb::WriteOptions &options,
                                 rocksdb::ColumnFamilyHandle *cf_handle, const rocksdb::Slice &key) {
-  auto batch = GetWriteBatchBase();
+  auto batch = GetWriteBatchBase(ctx.ns);
   auto s = batch->Delete(cf_handle, key);
   if (!s.ok()) {
     return s;
@@ -756,7 +797,7 @@ rocksdb::Status Storage::Delete(engine::Context &ctx, const rocksdb::WriteOption
 
 rocksdb::Status Storage::DeleteRange(engine::Context &ctx, const rocksdb::WriteOptions &options,
                                      rocksdb::ColumnFamilyHandle *cf_handle, Slice begin, Slice end) {
-  auto batch = GetWriteBatchBase();
+  auto batch = GetWriteBatchBase(ctx.ns);
   auto s = batch->DeleteRange(cf_handle, begin, end);
   if (!s.ok()) {
     return s;
@@ -773,7 +814,7 @@ rocksdb::Status Storage::FlushScripts(engine::Context &ctx, const rocksdb::Write
                                       rocksdb::ColumnFamilyHandle *cf_handle) {
   std::string begin_key = kLuaFuncSHAPrefix, end_key = util::StringNext(kLuaFuncSHAPrefix);
 
-  auto batch = GetWriteBatchBase();
+  auto batch = GetWriteBatchBase(ctx.ns);
   auto s = batch->DeleteRange(cf_handle, begin_key, end_key);
   if (!s.ok()) {
     return s;
@@ -978,39 +1019,58 @@ void Storage::SetIORateLimit(int64_t max_io_mb) {
 
 rocksdb::DB *Storage::GetDB() { return db_.get(); }
 
-Status Storage::BeginTxn() {
-  if (is_txn_mode_) {
-    return Status{Status::NotOK, "cannot begin a new transaction while already in transaction mode"};
+Status Storage::BeginTxn(const std::string &ns) {
+  std::unique_lock lock(ns_txn_mutex_);
+  auto &state = ns_txn_states_[ns];
+  if (state.is_active.load(std::memory_order_acquire)) {
+    return Status{Status::NotOK, "cannot begin a new transaction while already in transaction mode for namespace"};
   }
-  // The EXEC command is exclusive and shouldn't have multi transaction at the same time,
-  // so it's fine to reset the global write batch without any lock.
-  is_txn_mode_ = true;
+  state.is_active.store(true, std::memory_order_release);
   // Set overwrite_key to false to avoid overwriting the existing key in case
   // like downstream would parse the replication log etc.
-  txn_write_batch_ = std::make_unique<rocksdb::WriteBatchWithIndex>(
+  state.batch = std::make_unique<rocksdb::WriteBatchWithIndex>(
       /*backup_index_comparator=*/rocksdb::BytewiseComparator(),
       /*reserved_bytes=*/0, /*overwrite_key=*/false, /*max_bytes=*/GetWriteBatchMaxBytes());
   return Status::OK();
 }
 
-Status Storage::CommitTxn() {
-  if (!is_txn_mode_) {
-    return Status{Status::NotOK, "cannot commit while not in transaction mode"};
+Status Storage::CommitTxn(const std::string &ns) {
+  std::unique_lock lock(ns_txn_mutex_);
+  auto it = ns_txn_states_.find(ns);
+  if (it == ns_txn_states_.end() || !it->second.is_active.load(std::memory_order_acquire)) {
+    return Status{Status::NotOK, "cannot commit while not in transaction mode for namespace"};
   }
-  engine::Context ctx(this);
-  auto s = writeToDB(ctx, default_write_opts_, txn_write_batch_->GetWriteBatch());
+  engine::Context ctx(this, ns);
+  auto s = writeToDB(ctx, default_write_opts_, it->second.batch->GetWriteBatch());
 
-  is_txn_mode_ = false;
-  txn_write_batch_ = nullptr;
+  it->second.is_active.store(false, std::memory_order_release);
+  it->second.batch = nullptr;
   if (s.ok()) {
     return Status::OK();
   }
   return {Status::NotOK, s.ToString()};
 }
 
-ObserverOrUniquePtr<rocksdb::WriteBatchBase> Storage::GetWriteBatchBase() {
-  if (is_txn_mode_) {
-    return ObserverOrUniquePtr<rocksdb::WriteBatchBase>(txn_write_batch_.get(), ObserverOrUnique::Observer);
+void Storage::DiscardTxn(const std::string &ns) {
+  std::unique_lock lock(ns_txn_mutex_);
+  auto it = ns_txn_states_.find(ns);
+  if (it != ns_txn_states_.end()) {
+    it->second.is_active.store(false, std::memory_order_release);
+    it->second.batch = nullptr;
+  }
+}
+
+bool Storage::IsNamespaceTxnActive(const std::string &ns) const {
+  std::shared_lock lock(ns_txn_mutex_);
+  auto it = ns_txn_states_.find(ns);
+  return it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire);
+}
+
+ObserverOrUniquePtr<rocksdb::WriteBatchBase> Storage::GetWriteBatchBase(const std::string &ns) {
+  std::shared_lock lock(ns_txn_mutex_);
+  auto it = ns_txn_states_.find(ns);
+  if (it != ns_txn_states_.end() && it->second.is_active.load(std::memory_order_acquire)) {
+    return ObserverOrUniquePtr<rocksdb::WriteBatchBase>(it->second.batch.get(), ObserverOrUnique::Observer);
   }
   return ObserverOrUniquePtr<rocksdb::WriteBatchBase>(
       new rocksdb::WriteBatch(0 /*reserved_bytes*/, GetWriteBatchMaxBytes()), ObserverOrUnique::Unique);
@@ -1020,7 +1080,7 @@ Status Storage::WriteToPropagateCF(engine::Context &ctx, const std::string &key,
   if (config_->IsSlave()) {
     return {Status::NotOK, "cannot write to propagate column family in slave mode"};
   }
-  auto batch = GetWriteBatchBase();
+  auto batch = GetWriteBatchBase(ctx.ns);
   auto cf = GetCFHandle(ColumnFamilyID::Propagate);
   auto s = batch->Put(cf, key, value);
   s = Write(ctx, default_write_opts_, batch->GetWriteBatch());

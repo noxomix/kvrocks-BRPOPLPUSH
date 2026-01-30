@@ -78,16 +78,17 @@ class CommandExec : public Commander {
     }
 
     auto storage = srv->storage;
+    const std::string &ns = conn->GetNamespace();
     // Execute multi-exec commands
     conn->SetInExec();
-    auto s = storage->BeginTxn();
+    auto s = storage->BeginTxn(ns);
     if (s.IsOK()) {
       conn->ExecuteCommands(conn->GetMultiExecCommands());
       // In Redis, errors happening after EXEC instead are not handled in a special way:
       // all the other commands will be executed even if some command fails during
       // the transaction.
       // So, if conn->IsMultiError(), the transaction should still be committed.
-      s = storage->CommitTxn();
+      s = storage->CommitTxn(ns);
     }
 
     conn->ResetMultiExec();

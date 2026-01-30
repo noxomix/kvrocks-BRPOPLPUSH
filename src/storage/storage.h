@@ -35,6 +35,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -319,9 +320,13 @@ class Storage {
   const DBStats *GetDBStats() const { return db_stats_.get(); }
   void RecordStat(StatType type, uint64_t v);
 
-  Status BeginTxn();
-  Status CommitTxn();
-  ObserverOrUniquePtr<rocksdb::WriteBatchBase> GetWriteBatchBase();
+  Status BeginTxn(const std::string &ns);
+  Status CommitTxn(const std::string &ns);
+  void DiscardTxn(const std::string &ns);
+  ObserverOrUniquePtr<rocksdb::WriteBatchBase> GetWriteBatchBase(const std::string &ns);
+
+  // Check if a namespace has an active transaction
+  bool IsNamespaceTxnActive(const std::string &ns) const;
 
   Storage(const Storage &) = delete;
   Storage &operator=(const Storage &) = delete;
@@ -396,16 +401,22 @@ class Storage {
 
   std::atomic<bool> db_in_retryable_io_error_{false};
 
-  // is_txn_mode_ is used to determine whether the current Storage is in transactional mode,
-  // .i.e, in "EXEC" command(CommandExec).
-  std::atomic<bool> is_txn_mode_ = false;
-  // txn_write_batch_ is used as the global write batch for the transaction mode,
-  // all writes will be grouped in this write batch when entering the transaction mode,
-  // then write it at once when committing.
-  //
-  // Notice: the reason why we can use the global transaction? because the EXEC is an exclusive
-  // command, so it won't have multi transactions to be executed at the same time.
-  std::unique_ptr<rocksdb::WriteBatchWithIndex> txn_write_batch_;
+  // NamespaceTxnState holds the transaction state for a single namespace.
+  // Each namespace can have its own independent transaction, allowing parallel EXEC
+  // commands across different namespaces.
+  struct NamespaceTxnState {
+    std::atomic<bool> is_active{false};
+    std::unique_ptr<rocksdb::WriteBatchWithIndex> batch;
+  };
+
+  // ns_txn_mutex_ protects access to ns_txn_states_ map.
+  // Use shared_lock for read operations (checking if txn is active, getting batch).
+  // Use unique_lock for write operations (begin/commit/discard txn).
+  mutable std::shared_mutex ns_txn_mutex_;
+
+  // ns_txn_states_ maps namespace to its transaction state.
+  // This allows namespace-isolated transactions instead of a global transaction.
+  std::unordered_map<std::string, NamespaceTxnState> ns_txn_states_;
 
   rocksdb::WriteOptions default_write_opts_;
 
@@ -429,6 +440,9 @@ class Storage {
 /// Context does not provide thread safety guarantees and is generally only passed as a parameter between APIs.
 struct Context {
   engine::Storage *storage = nullptr;
+
+  /// ns is the namespace for this context, used for namespace-isolated transactions.
+  std::string ns;
 
   /// batch can be nullptr if
   /// 1. The Context is not in transactional mode.
@@ -461,6 +475,10 @@ struct Context {
   /// TODO: Change it to defer getting the context, and the snapshot is pinned after the first read operation
   explicit Context(engine::Storage *storage)
       : storage(storage), txn_context_enabled(storage->GetConfig()->txn_context_enabled) {}
+
+  /// Constructor with namespace for namespace-isolated transactions
+  Context(engine::Storage *storage, std::string ns)
+      : storage(storage), ns(std::move(ns)), txn_context_enabled(storage->GetConfig()->txn_context_enabled) {}
   ~Context() {
     // A moved-from object doesn't have `storage`.
     if (storage) {
@@ -474,15 +492,22 @@ struct Context {
   Context &operator=(Context &&ctx) noexcept {
     if (this != &ctx) {
       storage = ctx.storage;
+      ns = std::move(ctx.ns);
       snapshot_ = ctx.snapshot_;
       batch = std::move(ctx.batch);
+      txn_context_enabled = ctx.txn_context_enabled;
 
       ctx.storage = nullptr;
       ctx.snapshot_ = nullptr;
     }
     return *this;
   }
-  Context(Context &&ctx) noexcept : storage(ctx.storage), batch(std::move(ctx.batch)), snapshot_(ctx.snapshot_) {
+  Context(Context &&ctx) noexcept
+      : storage(ctx.storage),
+        ns(std::move(ctx.ns)),
+        batch(std::move(ctx.batch)),
+        txn_context_enabled(ctx.txn_context_enabled),
+        snapshot_(ctx.snapshot_) {
     ctx.storage = nullptr;
     ctx.snapshot_ = nullptr;
   }

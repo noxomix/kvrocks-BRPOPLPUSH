@@ -867,6 +867,26 @@ std::unique_lock<std::shared_mutex> Server::WorkExclusivityGuard() {
   return std::unique_lock(works_concurrency_rw_lock_);
 }
 
+std::shared_lock<std::shared_mutex> Server::WorkConcurrencyGuard(const std::string &ns) {
+  // Get or create the namespace-specific lock
+  std::shared_mutex *ns_lock = nullptr;
+  {
+    std::unique_lock map_lock(ns_locks_mutex_);
+    ns_lock = &ns_locks_[ns];
+  }
+  return std::shared_lock(*ns_lock);
+}
+
+std::unique_lock<std::shared_mutex> Server::WorkExclusivityGuard(const std::string &ns) {
+  // Get or create the namespace-specific lock
+  std::shared_mutex *ns_lock = nullptr;
+  {
+    std::unique_lock map_lock(ns_locks_mutex_);
+    ns_lock = &ns_locks_[ns];
+  }
+  return std::unique_lock(*ns_lock);
+}
+
 uint64_t Server::GetClientID() { return client_id_.fetch_add(1, std::memory_order_relaxed); }
 
 void Server::recordInstantaneousMetrics() {

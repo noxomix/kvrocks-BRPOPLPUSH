@@ -824,7 +824,7 @@ rocksdb::Status TimeSeries::getTimeSeriesMetadata(engine::Context &ctx, const Sl
 
 rocksdb::Status TimeSeries::createTimeSeries(engine::Context &ctx, const Slice &ns_key,
                                              TimeSeriesMetadata *metadata_out, const TSCreateOption *option) {
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisTimeSeries, {"createTimeSeries"});
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
@@ -853,7 +853,7 @@ rocksdb::Status TimeSeries::getOrCreateTimeSeries(engine::Context &ctx, const Sl
 
 rocksdb::Status TimeSeries::upsertCommon(engine::Context &ctx, const Slice &ns_key, TimeSeriesMetadata &metadata,
                                          SampleBatch &sample_batch, DownstreamUpsertArgs *ds_args) {
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   auto s = upsertCommonInBatch(ctx, ns_key, metadata, sample_batch, batch, ds_args);
   if (!s.ok()) return s;
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
@@ -1284,7 +1284,7 @@ rocksdb::Status TimeSeries::upsertDownStream(engine::Context &ctx, const Slice &
     }
   }
 
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisTimeSeries, {"upsertDownStream"});
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
@@ -1367,7 +1367,7 @@ rocksdb::Status TimeSeries::getCommon(engine::Context &ctx, const Slice &ns_key,
 
 rocksdb::Status TimeSeries::delRangeCommon(engine::Context &ctx, const Slice &ns_key, TimeSeriesMetadata &metadata,
                                            uint64_t from, uint64_t to, uint64_t *deleted, bool inclusive_to) {
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   auto s = delRangeCommonInBatch(ctx, ns_key, metadata, from, to, batch, deleted, inclusive_to);
   if (!s.ok()) return s;
   return storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
@@ -1469,7 +1469,7 @@ rocksdb::Status TimeSeries::delRangeDownStream(engine::Context &ctx, const Slice
                                                uint64_t to) {
   if (from > to || ds_user_keys.empty()) return rocksdb::Status::OK();
 
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisTimeSeries);
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
@@ -2052,7 +2052,7 @@ rocksdb::Status TimeSeries::CreateRule(engine::Context &ctx, const Slice &src_ke
   }
 
   // Create downstream metadata
-  auto batch = storage_->GetWriteBatchBase();
+  auto batch = GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisTimeSeries);
   s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;

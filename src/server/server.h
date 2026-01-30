@@ -325,8 +325,13 @@ class Server {
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
   void SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint64_t duration, const redis::Connection *conn);
 
+  // Global locks (for commands without namespace or global commands like CLUSTER)
   std::shared_lock<std::shared_mutex> WorkConcurrencyGuard();
   std::unique_lock<std::shared_mutex> WorkExclusivityGuard();
+
+  // Namespace-specific locks (for namespace-isolated commands like EXEC)
+  std::shared_lock<std::shared_mutex> WorkConcurrencyGuard(const std::string &ns);
+  std::unique_lock<std::shared_mutex> WorkExclusivityGuard(const std::string &ns);
 
   Stats stats;
   engine::Storage *storage;
@@ -431,6 +436,9 @@ class Server {
 
   // threads
   std::shared_mutex works_concurrency_rw_lock_;
+  // Namespace-specific locks for namespace-isolated exclusive commands
+  mutable std::shared_mutex ns_locks_mutex_;
+  std::unordered_map<std::string, std::shared_mutex> ns_locks_;
   std::thread cron_thread_;
   std::thread compaction_checker_thread_;
   TaskRunner task_runner_;

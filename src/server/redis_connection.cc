@@ -450,12 +450,25 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     // that can guarantee other threads can't come into critical zone, such as DEBUG,
     // CLUSTER subcommand, CONFIG SET, MULTI, LUA (in the immediate future).
     // Otherwise, we just use 'ConcurrencyGuard' to allow all workers to execute commands at the same time.
+    //
+    // For namespace-isolated commands (like EXEC), we use namespace-specific locks
+    // so that different namespaces can execute exclusive commands in parallel.
     if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
       // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
     } else if (cmd_flags & kCmdExclusive) {
-      exclusivity = srv_->WorkExclusivityGuard();
+      // Use namespace-specific lock if namespace is set, otherwise use global lock
+      if (!ns_.empty()) {
+        exclusivity = srv_->WorkExclusivityGuard(ns_);
+      } else {
+        exclusivity = srv_->WorkExclusivityGuard();
+      }
     } else {
-      concurrency = srv_->WorkConcurrencyGuard();
+      // Use namespace-specific concurrency guard if namespace is set
+      if (!ns_.empty()) {
+        concurrency = srv_->WorkConcurrencyGuard(ns_);
+      } else {
+        concurrency = srv_->WorkConcurrencyGuard();
+      }
     }
 
     if (srv_->IsLoading() && !(cmd_flags & kCmdLoading)) {
@@ -543,7 +556,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
 
         guard.emplace(srv_->storage->GetLockManager(), lock_keys);
       }
-      engine::Context ctx(srv_->storage);
+      engine::Context ctx(srv_->storage, ns_);
 
       std::vector<GlobalIndexer::RecordResult> index_records;
       if (!srv_->index_mgr.index_map.empty() && IsCmdForIndexing(cmd_flags, attributes->category) &&

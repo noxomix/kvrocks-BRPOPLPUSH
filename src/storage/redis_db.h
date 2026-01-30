@@ -153,6 +153,13 @@ class Database {
   rocksdb::ColumnFamilyHandle *metadata_cf_handle_;
   std::string namespace_;
 
+  // GetWriteBatchBase returns a write batch for this namespace.
+  // If a transaction is active for this namespace, returns the transaction's batch.
+  // Otherwise, returns a new write batch.
+  ObserverOrUniquePtr<rocksdb::WriteBatchBase> GetWriteBatchBase() {
+    return storage_->GetWriteBatchBase(namespace_);
+  }
+
  private:
   // Already internal keys
   [[nodiscard]] rocksdb::Status existsInternal(engine::Context &ctx, const std::vector<std::string> &keys, int *ret);
