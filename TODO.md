@@ -34,6 +34,11 @@ KONZEPT - Blocking vs. Locking:
 - **Locking** (MULTI/EXEC): Connection ist AKTIV, Commands werden gequeued. Bei EXEC kurzer Lock für Atomizität.
   Connection antwortet sofort auf jeden Command ("QUEUED"), ist nie "blocked".
 `blocked_clients` zählt nur schlafende Connections, nicht Transaktionen.
+
+LEARNING - Blocking-Structs brauchen Namespace:
+Wenn Blocking-Datenstrukturen (ConnContext, StreamConsumer, WaitContext) für tenant-aware Zählung genutzt werden,
+muss der Namespace zum Zeitpunkt des Blockings gespeichert werden. Blocking-Commands erfordern Auth,
+daher ist GetNamespace() immer verfügbar. Zählung erfolgt on-demand bei INFO, nicht im Hot-Path.
 }
 
 ## Erledigt
@@ -136,13 +141,15 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
   - ConnContext hat bereits `ns` Feld (Batch 1.5), Filtering fehlt noch
 - [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
   - [x] `used_percent` - GEFIXT (`GetTotalSize(ns)`)
-- [x] INFO clients - `connected_clients`, `monitor_clients` ✅ per-NS, `blocked_clients` noch global (Batch 1.5)
+- [x] INFO clients - `connected_clients`, `monitor_clients`, `blocked_clients` ✅ alle per-NS
 - [x] DBSIZE - ✅ Bereits namespace-aware
 
 ### 3. Bereits korrekt (tenant-lokal)
 - Alle Daten-Commands (GET, SET, HGET, ZADD, etc.)
 - KEYS, SCAN, FLUSHDB
 - MULTI/EXEC/WATCH
+- Blocking-Commands (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP, XREAD BLOCK, WAIT)
+  > Aufweck-Logik ist durch Key-Prefix bereits tenant-aware. Tenant A's LPUSH weckt nur Tenant A's BLPOP.
 
 ---
 
@@ -162,11 +169,12 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
    - [x] `connected_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
    - [x] `monitor_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
 
-   **Batch 1.5 - blocked_clients (Mittel):** 🔄 IN PROGRESS
+   **Batch 1.5 - blocked_clients (Mittel):** ✅ ERLEDIGT
    - [x] `ConnContext` um `ns` Feld erweitert
    - [x] `GetBlockedClientsCount(self)` implementiert - iteriert blocking_keys_, blocked_stream_consumers_, wait_contexts_
-   - [ ] Tests schreiben und verifizieren
-   > Admin: globaler Counter O(1), Tenant: On-demand Zählung mit Namespace-Filter
+   - [x] Tests: `client_isolation_test.go:TestBlockedClientsNamespaceIsolation`
+   > **Effizienz:** Admin O(1) (atomic load), Tenant on-demand bei INFO (~200µs worst case).
+   > Zero-cost im Hot-Path (Block/Unblock). Blocking-Logik war bereits tenant-aware (Key-Prefix).
 
    **Batch 2 - Per-Worker Sharded Namespace Stats (Mittel):** ✅ ERLEDIGT
    - [x] `total_commands_processed` - Per-Worker ns_stats_ Map
@@ -179,10 +187,10 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
    **Batch 3 - Komplexer (Mittel-Hoch):**
    - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
    - [ ] `total_connections_received` - Kumulativer Counter
-   - [ ] `used_memory_lua` - Lua-States aggregieren
+- [ ] `used_memory_lua` - Lua-States aggregieren
 
-   **Batch 4 - Aufwendig (Hoch):**
-   - [ ] `cmdstat_*` - Per-Connection Command-Map + Aggregation
+  **Batch 4 - Aufwendig (Hoch):**
+  - [ ] `cmdstat_*` - Per-Connection Command-Map + Aggregation
 
 //für mich selber, claude bitte hier erst ignorieren: {
     eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
