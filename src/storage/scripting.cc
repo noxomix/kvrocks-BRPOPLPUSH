@@ -645,13 +645,17 @@ Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::
 Status FunctionFlush(redis::Connection *conn, engine::Context *ctx) {
   auto storage = conn->GetServer()->storage;
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
+  const std::string &ns = conn->GetNamespace();
 
-  auto s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, engine::kLuaLibCodePrefix,
-                                util::StringNext(engine::kLuaLibCodePrefix));
+  // Delete only functions for THIS namespace (not all namespaces)
+  std::string lib_code_start = engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, "");
+  std::string lib_code_end = util::StringNext(lib_code_start);
+  auto s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, lib_code_start, lib_code_end);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
-  s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, engine::kLuaFuncLibPrefix,
-                           util::StringNext(engine::kLuaFuncLibPrefix));
+  std::string func_lib_start = engine::ComposeFunctionKey(engine::kLuaFuncLibPrefix, ns, "");
+  std::string func_lib_end = util::StringNext(func_lib_start);
+  s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, func_lib_start, func_lib_end);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
   conn->GetServer()->ScriptReset();

@@ -75,6 +75,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
   lua_State *Lua() { return lua_; }
   void LuaReset();
+  void LuaResetNamespace(const std::string &ns);
   int64_t GetLuaMemorySize();
 
   std::map<int, redis::Connection *> GetConnections() const { return conns_; }

@@ -85,6 +85,10 @@ func TestClusterReplication(t *testing.T) {
 		// allow to run the read-only command in the replica
 		require.NoError(t, replicaClient.ReadOnly(ctx).Err())
 
+		// Restore cluster configuration after restart (data was lost with Close)
+		require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODEID", replicaNodeID).Err())
+		require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
 		util.WaitForOffsetSync(t, masterClient, replicaClient, 5*time.Second)
 		require.Equal(t, "v1", replicaClient.Get(ctx, "k0").Val())
 		require.Equal(t, map[string]string{"f0": "v0", "f1": "v1"}, replicaClient.HGetAll(ctx, "k2").Val())

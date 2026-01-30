@@ -547,11 +547,13 @@ std::string EscapeString(std::string_view s) {
 }
 
 std::string StringNext(std::string s) {
-  for (auto iter = s.rbegin(); iter != s.rend(); ++iter) {
-    if (*iter != char(0xff)) {
-      (*iter)++;
-      break;
-    }
+  // Remove trailing 0xFF bytes first
+  while (!s.empty() && static_cast<unsigned char>(s.back()) == 0xFF) {
+    s.pop_back();
+  }
+  // Increment last byte if string not empty
+  if (!s.empty()) {
+    s.back()++;
   }
   return s;
 }
