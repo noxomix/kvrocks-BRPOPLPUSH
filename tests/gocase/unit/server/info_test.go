@@ -262,8 +262,8 @@ func TestInfoStatsNamespaceSwitch(t *testing.T) {
 		switchClient := srv.NewClientWithOption(&redis.Options{Password: "switchtoken1"})
 		defer func() { require.NoError(t, switchClient.Close()) }()
 
-		// Verify we're in ns1
-		ns, err := switchClient.Do(ctx, "NAMESPACE", "GET").Result()
+		// Verify we're in ns1 (NAMESPACE CURRENT is not admin-only)
+		ns, err := switchClient.Do(ctx, "NAMESPACE", "CURRENT").Result()
 		require.NoError(t, err)
 		require.Equal(t, "switch_ns1", ns)
 
@@ -289,7 +289,7 @@ func TestInfoStatsNamespaceSwitch(t *testing.T) {
 		require.NoError(t, result.Err())
 
 		// Verify we're now in ns2
-		ns, err = switchClient.Do(ctx, "NAMESPACE", "GET").Result()
+		ns, err = switchClient.Do(ctx, "NAMESPACE", "CURRENT").Result()
 		require.NoError(t, err)
 		require.Equal(t, "switch_ns2", ns)
 
