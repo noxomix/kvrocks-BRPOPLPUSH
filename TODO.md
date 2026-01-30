@@ -63,12 +63,13 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 
 ### 2. Tenant-aware machen (sinnvoll)
 
-- [ ] CLIENT LIST - Nur eigene Connections zeigen (Niedrig)
-- [ ] CLIENT KILL - Nur eigene Connections killen (Niedrig)
+- [x] CLIENT LIST - Nur eigene Connections zeigen ✅ GEFIXT
+- [x] CLIENT KILL - Nur eigene Connections killen ✅ GEFIXT
 - [ ] SLOWLOG - Nur eigene Queries zeigen (Mittel)
 - [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
-- [ ] INFO keyspace - Prüfen ob schon namespace-aware
-- [ ] DBSIZE - Prüfen ob schon namespace-aware
+- [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
+  - [ ] `used_percent` nutzt `GetTotalSize()` ohne NS → zeigt globale DB-Größe statt Tenant-Größe
+- [x] DBSIZE - ✅ Bereits namespace-aware
 
 ### 3. Bereits korrekt (tenant-lokal)
 - Alle Daten-Commands (GET, SET, HGET, ZADD, etc.)
@@ -80,7 +81,25 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 ## Implementierungs-Reihenfolge
 
 1. [ ] Quick Win: `kCmdAdmin` für COMPACT, DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
-2. [ ] Prüfen: DBSIZE, INFO - schon namespace-aware?
-3. [ ] CLIENT LIST/KILL tenant-aware
+2. [x] ~~Prüfen: DBSIZE, INFO~~ - Beide bereits namespace-aware
+3. [x] ~~CLIENT LIST/KILL tenant-aware~~ - GEFIXT (Tests: `client_isolation_test.go`)
 4. [ ] SLOWLOG tenant-aware
 5. [ ] MONITOR tenant-aware
+6. [ ] INFO vollständig tenant-aware:
+   - **Ansatz:** Per-Connection Stats → bei INFO aggregieren (kein Hot-Path Impact)
+   - **Keyspace Bug:** `used_percent` nutzt `GetTotalSize()` statt `GetTotalSize(ns)` (`server.cc:1468`)
+   - **Clients (on-demand zählen):**
+     - [ ] `connected_clients` - Connections im eigenen NS zählen
+     - [ ] `blocked_clients` - Blocked Connections im eigenen NS
+     - [ ] `monitor_clients` - Monitor Connections im eigenen NS
+   - **Stats (Per-Connection Counter → aggregieren):**
+     - [ ] `total_connections_received` - Connections pro NS
+     - [ ] `total_commands_processed` - Commands pro NS
+     - [ ] `instantaneous_ops_per_sec` - Ops/sec pro NS
+     - [ ] `total_net_input_bytes` - Traffic pro NS
+     - [ ] `total_net_output_bytes` - Traffic pro NS
+   - **CommandStats (Per-Connection Map → aggregieren):**
+     - [ ] `cmdstat_*` - Command-Aufrufe pro NS (get, set, hget, etc.)
+   - **Memory:**
+     - [ ] `used_memory_lua` - Lua-Memory pro NS (bereits per-Worker, aggregieren)
+   - **Bleiben global:** Server, CPU, Persistence, Replication, RocksDB, Cluster

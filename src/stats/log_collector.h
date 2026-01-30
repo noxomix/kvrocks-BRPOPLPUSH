@@ -42,6 +42,7 @@ class SlowEntry {
   std::string client_name;
   std::string ip;
   uint32_t port;
+  std::string ns;  // Namespace for tenant isolation
   std::string ToRedisString() const;
   void DumpToLogFile(spdlog::level::level_enum) const;
 };
@@ -72,6 +73,11 @@ class LogCollector {
   void PushEntry(std::unique_ptr<T> &&entry);
   std::string GetLatestEntries(int64_t cnt);
   void SetDumpToLogfileLevel(spdlog::level::level_enum level);
+
+  // Namespace-aware filter methods for tenant isolation
+  ssize_t SizeWithFilter(const std::function<bool(const T &)> &filter);
+  void ResetWithFilter(const std::function<bool(const T &)> &filter);
+  std::string GetLatestEntriesWithFilter(int64_t cnt, const std::function<bool(const T &)> &filter);
 
  private:
   std::mutex mu_;

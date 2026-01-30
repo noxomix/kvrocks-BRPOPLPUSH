@@ -29,6 +29,148 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSlowlogNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass":             password,
+		"slowlog-log-slower-than": "0", // Log all commands
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin client
+	adminRdb := srv.NewClientWithOption(&redis.Options{Password: password})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Namespace clients
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{Password: "token1"})
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{Password: "token2"})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Reset slowlog
+	require.NoError(t, adminRdb.Do(ctx, "SLOWLOG", "RESET").Err())
+
+	t.Run("Tenants only see their own slowlog entries", func(t *testing.T) {
+		// ns1: Execute some commands
+		require.NoError(t, ns1Rdb.Set(ctx, "ns1_key", "ns1_value", 0).Err())
+		require.NoError(t, ns1Rdb.Get(ctx, "ns1_key").Err())
+
+		// ns2: Execute some commands
+		require.NoError(t, ns2Rdb.Set(ctx, "ns2_key", "ns2_value", 0).Err())
+		require.NoError(t, ns2Rdb.Get(ctx, "ns2_key").Err())
+
+		// ns1: SLOWLOG GET should only show ns1 commands
+		ns1Log := ns1Rdb.SlowLogGet(ctx, -1).Val()
+		for _, entry := range ns1Log {
+			// Should not see ns2 keys
+			for _, arg := range entry.Args {
+				require.NotContains(t, arg, "ns2_key", "ns1 should not see ns2 commands")
+			}
+		}
+
+		// ns2: SLOWLOG GET should only show ns2 commands
+		ns2Log := ns2Rdb.SlowLogGet(ctx, -1).Val()
+		for _, entry := range ns2Log {
+			// Should not see ns1 keys
+			for _, arg := range entry.Args {
+				require.NotContains(t, arg, "ns1_key", "ns2 should not see ns1 commands")
+			}
+		}
+
+		// Verify ns1 actually has some entries with ns1_key
+		foundNs1Key := false
+		for _, entry := range ns1Log {
+			for _, arg := range entry.Args {
+				if strings.Contains(arg, "ns1_key") {
+					foundNs1Key = true
+					break
+				}
+			}
+		}
+		require.True(t, foundNs1Key, "ns1 should see its own ns1_key commands")
+
+		// Verify ns2 actually has some entries with ns2_key
+		foundNs2Key := false
+		for _, entry := range ns2Log {
+			for _, arg := range entry.Args {
+				if strings.Contains(arg, "ns2_key") {
+					foundNs2Key = true
+					break
+				}
+			}
+		}
+		require.True(t, foundNs2Key, "ns2 should see its own ns2_key commands")
+	})
+
+	t.Run("Admin sees all slowlog entries", func(t *testing.T) {
+		adminLog := adminRdb.SlowLogGet(ctx, -1).Val()
+
+		// Admin should see both ns1 and ns2 commands
+		foundNs1 := false
+		foundNs2 := false
+		for _, entry := range adminLog {
+			for _, arg := range entry.Args {
+				if strings.Contains(arg, "ns1_key") {
+					foundNs1 = true
+				}
+				if strings.Contains(arg, "ns2_key") {
+					foundNs2 = true
+				}
+			}
+		}
+		require.True(t, foundNs1, "Admin should see ns1 commands")
+		require.True(t, foundNs2, "Admin should see ns2 commands")
+	})
+
+	t.Run("SLOWLOG LEN is namespace-aware", func(t *testing.T) {
+		ns1Len := ns1Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+		ns2Len := ns2Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+		adminLen := adminRdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+
+		// Admin should see more entries than each individual tenant
+		require.GreaterOrEqual(t, adminLen, ns1Len, "Admin should see >= ns1 entries")
+		require.GreaterOrEqual(t, adminLen, ns2Len, "Admin should see >= ns2 entries")
+	})
+
+	t.Run("SLOWLOG RESET only clears own namespace for tenant", func(t *testing.T) {
+		// Get current count for ns2
+		ns2LenBefore := ns2Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+
+		// ns1 resets - should only clear ns1 entries
+		require.NoError(t, ns1Rdb.Do(ctx, "SLOWLOG", "RESET").Err())
+
+		// ns1 should have 0 entries (plus maybe the RESET command itself)
+		ns1LenAfter := ns1Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+		require.LessOrEqual(t, ns1LenAfter, int64(1), "ns1 should have <= 1 entries after reset")
+
+		// ns2 should still have entries - unchanged by ns1's reset
+		ns2LenAfter := ns2Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+		require.Equal(t, ns2LenBefore, ns2LenAfter, "ns2 entries should be unchanged after ns1 reset")
+	})
+
+	t.Run("Admin SLOWLOG RESET clears all entries", func(t *testing.T) {
+		// Create some entries first
+		require.NoError(t, ns1Rdb.Set(ctx, "test1", "val1", 0).Err())
+		require.NoError(t, ns2Rdb.Set(ctx, "test2", "val2", 0).Err())
+
+		// Admin resets
+		require.NoError(t, adminRdb.Do(ctx, "SLOWLOG", "RESET").Err())
+
+		// All namespaces should have 0 entries (plus maybe the RESET command for admin)
+		ns1Len := ns1Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+		ns2Len := ns2Rdb.Do(ctx, "SLOWLOG", "LEN").Val().(int64)
+
+		require.Equal(t, int64(0), ns1Len, "ns1 should have 0 entries after admin reset")
+		require.Equal(t, int64(0), ns2Len, "ns2 should have 0 entries after admin reset")
+	})
+}
+
 func TestSlowlog(t *testing.T) {
 	srv := util.StartServer(t, map[string]string{
 		"slowlog-log-slower-than": "1000000",
