@@ -159,7 +159,21 @@ func (s *KvrocksServer) Start() {
 	cmd := exec.Command(b)
 
 	dir := s.configs["dir"]
-	f, err := os.Open(filepath.Join(dir, "kvrocks.conf"))
+	confPath := filepath.Join(dir, "kvrocks.conf")
+
+	// Create directory and config file if they don't exist (needed for Start after Close)
+	require.NoError(s.t, os.MkdirAll(dir, 0755))
+	if _, err := os.Stat(confPath); os.IsNotExist(err) {
+		f, err := os.Create(confPath)
+		require.NoError(s.t, err)
+		for k, v := range s.configs {
+			_, err := fmt.Fprintf(f, "%s %s\n", k, v)
+			require.NoError(s.t, err)
+		}
+		require.NoError(s.t, f.Close())
+	}
+
+	f, err := os.Open(confPath)
 	require.NoError(s.t, err)
 	defer func() { require.NoError(s.t, f.Close()) }()
 
@@ -234,6 +248,7 @@ func StartServerWithCLIOptions(
 
 	dir := *workspace
 	require.NotEmpty(t, dir, "please set the workspace by `-workspace`")
+	require.NoError(t, os.MkdirAll(dir, 0755))
 	dir, err = os.MkdirTemp(dir, fmt.Sprintf("%s-%d-*", t.Name(), time.Now().UnixMilli()))
 	require.NoError(t, err)
 	configs["dir"] = dir

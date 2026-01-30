@@ -42,7 +42,7 @@ if (cmd_flags & kCmdExclusive) {
 | Komponente | Key-Format | Code |
 |------------|-----------|------|
 | **EXEC/Transactions** | Per-NS `WriteBatchWithIndex` | storage.h:438-448 |
-| **FUNCTION LOAD/LIST/DELETE** | `<prefix><ns_len><ns><name>` | storage.h:90-96 |
+| **FUNCTION LOAD/LIST/DELETE/FLUSH** | `<prefix><ns_len><ns><name>` | storage.h:90-96, scripting.cc:645 |
 | **FT.CREATE/DROPINDEX** | Namespace-spezifisch | cmd_search.cc |
 | **Worker Locks** | `ns_locks_[namespace]` | server.cc:870-885 |
 
@@ -82,6 +82,66 @@ auto concurrency = conn_->GetServer()->WorkConcurrencyGuard(conn_->GetNamespace(
 ```
 
 **Betroffene Commands:** BLPOP, BRPOP, BLMPOP, BLMOVE, BZPOPMIN, BZPOPMAX, BZMPOP
+
+### FUNCTION FLUSH Namespace-Isolation (scripting.cc:645-663)
+
+**Problem:** FUNCTION FLUSH löschte ALLE Funktionen aller Namespaces.
+
+**Vorher:**
+```cpp
+DeleteRange(cf, "lua_lib_code_", StringNext("lua_lib_code_"));  // Löschte ALLES!
+```
+
+**Nachher:**
+```cpp
+const std::string &ns = conn->GetNamespace();
+std::string start = ComposeFunctionKey(kLuaLibCodePrefix, ns, "");
+std::string end = util::StringNext(start);
+DeleteRange(cf, start, end);  // Löscht nur aktuellen Namespace
+```
+
+### ns_locks_mutex_ Bottleneck (server.cc:870-909)
+
+**Problem:** Jeder Command musste `unique_lock` auf `ns_locks_mutex_` acquiren.
+
+**Lösung:** Read-Write Lock Pattern - `shared_lock` für existierende Namespaces (Fast-Path), `unique_lock` nur beim Erstellen neuer Namespaces (Slow-Path).
+
+```cpp
+// Fast-path: shared_lock for existing namespaces (common case)
+{
+  std::shared_lock map_lock(ns_locks_mutex_);
+  auto it = ns_locks_.find(ns);
+  if (it != ns_locks_.end()) {
+    ns_lock = &it->second;
+  }
+}
+
+// Slow-path: unique_lock only when namespace is new (rare)
+if (!ns_lock) {
+  std::unique_lock map_lock(ns_locks_mutex_);
+  ns_lock = &ns_locks_[ns];
+}
+```
+
+---
+
+## Analyse: GetWriteBatchBase Observer-Pointer (Fragil aber sicher)
+
+Das Design sieht fragil aus:
+```cpp
+ObserverOrUniquePtr<...> Storage::GetWriteBatchBase(const std::string &ns) {
+  std::shared_lock lock(ns_txn_mutex_);
+  // ... return batch.get() ...
+}  // Lock released! Pointer könnte danach ungültig werden...
+```
+
+**Warum es trotzdem sicher ist:**
+- EXEC hält `WorkExclusivityGuard(ns)` während der gesamten Transaktion
+- Nur EXEC ruft BeginTxn/CommitTxn auf
+- CommitTxn kann nicht parallel zu ExecuteCommands laufen
+- Die Lock-Hierarchie schützt, nicht der Code selbst
+
+**Konsequenz:** Kein Fix nötig, aber zukünftige Änderungen könnten das brechen.
 
 ---
 

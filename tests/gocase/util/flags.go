@@ -23,7 +23,7 @@ import "flag"
 
 var binPath = flag.String("binPath", "", "directory including kvrocks build files")
 var workspace = flag.String("workspace", "", "directory of cases workspace")
-var deleteOnExit = flag.Bool("deleteOnExit", false, "whether to delete workspace on exit")
+var deleteOnExit = flag.Bool("deleteOnExit", true, "whether to delete workspace on exit")
 var cliPath = flag.String("cliPath", "redis-cli", "path to redis-cli")
 var tlsEnable = flag.Bool("tlsEnable", false, "enable TLS-related test cases")
 

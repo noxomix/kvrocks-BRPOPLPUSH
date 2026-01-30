@@ -868,22 +868,44 @@ std::unique_lock<std::shared_mutex> Server::WorkExclusivityGuard() {
 }
 
 std::shared_lock<std::shared_mutex> Server::WorkConcurrencyGuard(const std::string &ns) {
-  // Get or create the namespace-specific lock
   std::shared_mutex *ns_lock = nullptr;
+
+  // Fast-path: shared_lock for existing namespaces (common case)
   {
+    std::shared_lock map_lock(ns_locks_mutex_);
+    auto it = ns_locks_.find(ns);
+    if (it != ns_locks_.end()) {
+      ns_lock = &it->second;
+    }
+  }
+
+  // Slow-path: unique_lock only when namespace is new (rare)
+  if (!ns_lock) {
     std::unique_lock map_lock(ns_locks_mutex_);
     ns_lock = &ns_locks_[ns];
   }
+
   return std::shared_lock(*ns_lock);
 }
 
 std::unique_lock<std::shared_mutex> Server::WorkExclusivityGuard(const std::string &ns) {
-  // Get or create the namespace-specific lock
   std::shared_mutex *ns_lock = nullptr;
+
+  // Fast-path: shared_lock for existing namespaces (common case)
   {
+    std::shared_lock map_lock(ns_locks_mutex_);
+    auto it = ns_locks_.find(ns);
+    if (it != ns_locks_.end()) {
+      ns_lock = &it->second;
+    }
+  }
+
+  // Slow-path: unique_lock only when namespace is new (rare)
+  if (!ns_lock) {
     std::unique_lock map_lock(ns_locks_mutex_);
     ns_lock = &ns_locks_[ns];
   }
+
   return std::unique_lock(*ns_lock);
 }
 
