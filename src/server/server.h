@@ -313,6 +313,7 @@ class Server {
   void ScriptReset();
   void ScriptResetNamespace(const std::string &ns);
   Status ScriptFlush();
+  uint64_t GetScriptResetGeneration() const { return script_reset_generation_.load(); }
 
   Status FunctionGetCode(const rocksdb::Slice &ns, const std::string &lib, std::string *code) const;
   Status FunctionGetLib(const rocksdb::Slice &ns, const std::string &func, std::string *lib) const;
@@ -456,6 +457,9 @@ class Server {
   std::atomic<size_t> watched_key_size_ = 0;
   std::map<std::string, std::set<redis::Connection *>> watched_key_map_;
   std::shared_mutex watched_key_mutex_;
+
+  // script reset generation (for async lazy reset)
+  std::atomic<uint64_t> script_reset_generation_{0};
 
   // SCAN ring buffer
   std::atomic<uint16_t> cursor_counter_ = {0};

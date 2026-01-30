@@ -1886,14 +1886,14 @@ Status Server::FunctionSetLib(const rocksdb::Slice &ns, const std::string &func,
 }
 
 void Server::ScriptReset() {
-  for (auto &wt : worker_threads_) {
-    wt->GetWorker()->LuaReset();
-  }
+  // Increment generation - workers will reset lazily when they see the new generation
+  script_reset_generation_.fetch_add(1);
 }
 
 void Server::ScriptResetNamespace(const std::string &ns) {
+  // Mark namespace for reset on all workers - they will reset lazily
   for (auto &wt : worker_threads_) {
-    wt->GetWorker()->LuaResetNamespace(ns);
+    wt->GetWorker()->MarkNamespaceForReset(ns);
   }
 }
 

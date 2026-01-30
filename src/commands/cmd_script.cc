@@ -94,6 +94,9 @@ class CommandScript : public Commander {
         }
       }
     } else if (args_.size() == 3 && subcommand_ == "load") {
+      // Check if Lua state needs reset before accessing it
+      conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
       std::string sha;
       auto s = lua::CreateFunction(srv, args_[2], &sha, conn->Owner()->Lua(), true);
       if (!s.IsOK()) {

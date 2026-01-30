@@ -302,6 +302,9 @@ Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::st
 
   const auto libname = GET_OR_RET(ExtractLibNameFromShebang(first_line));
 
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   if (FunctionIsLibExist(conn, ctx, libname, need_to_store)) {
     if (!replace) {
       return {Status::NotOK, "library already exists, please specify REPLACE to force load"};
@@ -361,6 +364,9 @@ Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::st
 
 bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std::string &libname,
                         bool need_check_storage) {
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   auto srv = conn->GetServer();
   auto lua = conn->Owner()->Lua();
   const std::string &ns = conn->GetNamespace();
@@ -398,6 +404,9 @@ bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std
 Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::string &name,
                     const std::vector<std::string> &keys, const std::vector<std::string> &argv, std::string *output,
                     bool read_only) {
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   auto srv = conn->GetServer();
   auto lua = conn->Owner()->Lua();
   const std::string &ns = conn->GetNamespace();
@@ -555,6 +564,9 @@ Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Cont
 // NOTE: it is required to load the library to lua runtime before listing (calling this function)
 // i.e. it will output nothing if the library is only in storage but not loaded
 Status FunctionListLib(redis::Connection *conn, const std::string &libname, std::string *output) {
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   auto lua = conn->Owner()->Lua();
   const std::string &ns = conn->GetNamespace();
   std::string ns_prefixed_libname = ns + "_" + libname;
@@ -594,6 +606,9 @@ Status FunctionListLib(redis::Connection *conn, const std::string &libname, std:
 }
 
 Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::string &name) {
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   auto lua = conn->Owner()->Lua();
   const std::string &ns = conn->GetNamespace();
   std::string ns_prefixed_libname = ns + "_" + name;
@@ -663,6 +678,9 @@ Status FunctionFlush(redis::Connection *conn, engine::Context *ctx) {
 Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const std::string &body_or_sha,
                           const std::vector<std::string> &keys, const std::vector<std::string> &argv, bool evalsha,
                           std::string *output, bool read_only) {
+  // Check if Lua state needs reset before accessing it
+  conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
+
   Server *srv = conn->GetServer();
   // Use the worker's private Lua VM when entering the read-only mode
   lua_State *lua = conn->Owner()->Lua();

@@ -611,6 +611,32 @@ void Worker::LuaResetNamespace(const std::string &ns) {
   lua_pop(lua, 1);  // Pop REDIS_FUNCTION_LIBRARIES table
 }
 
+void Worker::MarkNamespaceForReset(const std::string &ns) {
+  std::lock_guard<std::mutex> lock(ns_reset_mutex_);
+  namespaces_to_reset_.insert(ns);
+}
+
+void Worker::CheckAndResetIfNeeded(const std::string &ns) {
+  // 1. Check global reset (SCRIPT FLUSH)
+  auto current_gen = srv->GetScriptResetGeneration();
+  if (current_gen > last_script_reset_generation_) {
+    LuaReset();  // Full reset
+    last_script_reset_generation_ = current_gen;
+    // Clear namespace set - full reset covers everything
+    std::lock_guard<std::mutex> lock(ns_reset_mutex_);
+    namespaces_to_reset_.clear();
+    return;
+  }
+
+  // 2. Check namespace-specific reset (FUNCTION FLUSH)
+  std::lock_guard<std::mutex> lock(ns_reset_mutex_);
+  auto it = namespaces_to_reset_.find(ns);
+  if (it != namespaces_to_reset_.end()) {
+    namespaces_to_reset_.erase(it);
+    LuaResetNamespace(ns);
+  }
+}
+
 int64_t Worker::GetLuaMemorySize() { return (int64_t)lua_gc(lua_, LUA_GCCOUNT, 0) * 1024; }
 
 void Worker::KickoutIdleClients(int timeout) {

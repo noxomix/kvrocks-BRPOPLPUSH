@@ -30,8 +30,10 @@
 #include <lua.hpp>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -76,6 +78,8 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   lua_State *Lua() { return lua_; }
   void LuaReset();
   void LuaResetNamespace(const std::string &ns);
+  void MarkNamespaceForReset(const std::string &ns);
+  void CheckAndResetIfNeeded(const std::string &ns);
   int64_t GetLuaMemorySize();
 
   std::map<int, redis::Connection *> GetConnections() const { return conns_; }
@@ -101,6 +105,11 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   struct ev_token_bucket_cfg *rate_limit_group_cfg_ = nullptr;
   std::atomic<lua_State *> lua_;
   std::atomic<bool> is_terminated_ = false;
+
+  // Async script reset support
+  std::mutex ns_reset_mutex_;
+  std::unordered_set<std::string> namespaces_to_reset_;
+  uint64_t last_script_reset_generation_{0};
 };
 
 class WorkerThread {
