@@ -43,6 +43,32 @@ Der Test ist timing-sensitiv und hängt nicht von Lua/Scripting ab.
 
 ---
 
+## Gefixt: SLOWLOG Namespace-Isolation
+
+**Problem:** Globaler `slow_log_` - alle Tenants sehen alle Einträge (Informationsleakage)
+
+**Lösung:** Namespace im SlowEntry speichern + bei Abfrage filtern
+- `SlowEntry.ns` Feld hinzugefügt
+- Generische Filter-Methoden in LogCollector: `SizeWithFilter()`, `ResetWithFilter()`, `GetLatestEntriesWithFilter()`
+- CommandSlowlog prüft `conn->IsAdmin()` und filtert entsprechend
+
+**Verhalten:**
+| Command | Tenant | Admin |
+|---------|--------|-------|
+| SLOWLOG GET | Nur eigene | Alle |
+| SLOWLOG LEN | Count eigene | Count alle |
+| SLOWLOG RESET | Löscht eigene | Löscht alle |
+
+**Geänderte Dateien:**
+- `src/stats/log_collector.h` - `ns` Feld + Filter-Methodendeklarationen
+- `src/stats/log_collector.cc` - Filter-Methoden implementiert
+- `src/server/server.cc` - `entry->ns = conn->GetNamespace()`
+- `src/commands/cmd_server.cc` - CommandSlowlog tenant-aware
+
+**Tests:** `tests/gocase/unit/slowlog/slowlog_test.go:TestSlowlogNamespaceIsolation`
+
+---
+
 ## Offen: Command-Klassifizierung für Tenant-Isolation
 
 ### Prinzip
@@ -65,7 +91,7 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 
 - [x] CLIENT LIST - Nur eigene Connections zeigen ✅ GEFIXT
 - [x] CLIENT KILL - Nur eigene Connections killen ✅ GEFIXT
-- [ ] SLOWLOG - Nur eigene Queries zeigen (Mittel)
+- [x] SLOWLOG - Nur eigene Queries zeigen ✅ GEFIXT
 - [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
 - [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
   - [ ] `used_percent` nutzt `GetTotalSize()` ohne NS → zeigt globale DB-Größe statt Tenant-Größe
@@ -83,7 +109,7 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 1. [ ] Quick Win: `kCmdAdmin` für COMPACT, DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
 2. [x] ~~Prüfen: DBSIZE, INFO~~ - Beide bereits namespace-aware
 3. [x] ~~CLIENT LIST/KILL tenant-aware~~ - GEFIXT (Tests: `client_isolation_test.go`)
-4. [ ] SLOWLOG tenant-aware
+4. [x] ~~SLOWLOG tenant-aware~~ - GEFIXT (Tests: `slowlog_test.go:TestSlowlogNamespaceIsolation`)
 5. [ ] MONITOR tenant-aware
 6. [ ] INFO vollständig tenant-aware:
    - **Ansatz:** Per-Connection Stats → bei INFO aggregieren (kein Hot-Path Impact)
