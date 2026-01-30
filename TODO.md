@@ -87,19 +87,23 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 5. [ ] MONITOR tenant-aware
 6. [ ] INFO vollständig tenant-aware:
    - **Ansatz:** Per-Connection Stats → bei INFO aggregieren (kein Hot-Path Impact)
-   - **Keyspace Bug:** `used_percent` nutzt `GetTotalSize()` statt `GetTotalSize(ns)` (`server.cc:1468`)
-   - **Clients (on-demand zählen):**
-     - [ ] `connected_clients` - Connections im eigenen NS zählen
-     - [ ] `blocked_clients` - Blocked Connections im eigenen NS
-     - [ ] `monitor_clients` - Monitor Connections im eigenen NS
-   - **Stats (Per-Connection Counter → aggregieren):**
-     - [ ] `total_connections_received` - Connections pro NS
-     - [ ] `total_commands_processed` - Commands pro NS
-     - [ ] `instantaneous_ops_per_sec` - Ops/sec pro NS
-     - [ ] `total_net_input_bytes` - Traffic pro NS
-     - [ ] `total_net_output_bytes` - Traffic pro NS
-   - **CommandStats (Per-Connection Map → aggregieren):**
-     - [ ] `cmdstat_*` - Command-Aufrufe pro NS (get, set, hget, etc.)
-   - **Memory:**
-     - [ ] `used_memory_lua` - Lua-Memory pro NS (bereits per-Worker, aggregieren)
    - **Bleiben global:** Server, CPU, Persistence, Replication, RocksDB, Cluster
+
+   **Batch 1 - Quick Wins (Trivial/Niedrig):**
+   - [ ] `used_percent` - 1 Zeile fix (`server.cc:1468`: `GetTotalSize(ns)`)
+   - [ ] `connected_clients` - On-demand zählen
+   - [ ] `blocked_clients` - On-demand zählen
+   - [ ] `monitor_clients` - On-demand zählen
+
+   **Batch 2 - Per-Connection Counter (Mittel):**
+   - [ ] `total_commands_processed` - Counter zu Connection
+   - [ ] `total_net_input_bytes` - Counter zu Connection
+   - [ ] `total_net_output_bytes` - Counter zu Connection
+
+   **Batch 3 - Komplexer (Mittel-Hoch):**
+   - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
+   - [ ] `total_connections_received` - Kumulativer Counter
+   - [ ] `used_memory_lua` - Lua-States aggregieren
+
+   **Batch 4 - Aufwendig (Hoch):**
+   - [ ] `cmdstat_*` - Per-Connection Command-Map + Aggregation
