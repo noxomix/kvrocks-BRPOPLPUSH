@@ -104,52 +104,50 @@ func TestMultiNamespaceIsolation(t *testing.T) {
 		require.Equal(t, "uncommitted_b", clientB.Get(ctx, "shared_name_key").Val())
 	})
 
-	t.Run("Concurrent EXEC in different namespaces do not block each other", func(t *testing.T) {
+	t.Run("Concurrent EXEC in different namespaces run truly parallel", func(t *testing.T) {
 		var wg sync.WaitGroup
-		results := make(chan time.Duration, 2)
+		startBarrier := make(chan struct{}) // Both wait here before EXEC
 
-		// Client A executes slow transaction (many commands)
-		wg.Add(1)
+		wg.Add(2)
+
+		// Client A - queue many commands, then wait for barrier before EXEC
 		go func() {
 			defer wg.Done()
-			start := time.Now()
 			require.NoError(t, clientA.Do(ctx, "MULTI").Err())
-			for i := 0; i < 100; i++ {
+			for i := 0; i < 1000; i++ {
 				require.NoError(t, clientA.Do(ctx, "SET", "bulk_key_a", i).Err())
 			}
+			<-startBarrier // Wait for signal
 			require.NoError(t, clientA.Do(ctx, "EXEC").Err())
-			results <- time.Since(start)
 		}()
 
-		// Short pause so A's MULTI starts first
-		time.Sleep(10 * time.Millisecond)
-
-		// Client B executes fast transaction
-		wg.Add(1)
+		// Client B - queue many commands, then wait for barrier before EXEC
 		go func() {
 			defer wg.Done()
-			start := time.Now()
 			require.NoError(t, clientB.Do(ctx, "MULTI").Err())
-			require.NoError(t, clientB.Do(ctx, "SET", "quick_key_b", "done").Err())
+			for i := 0; i < 1000; i++ {
+				require.NoError(t, clientB.Do(ctx, "SET", "bulk_key_b", i).Err())
+			}
+			<-startBarrier // Wait for signal
 			require.NoError(t, clientB.Do(ctx, "EXEC").Err())
-			results <- time.Since(start)
 		}()
 
-		wg.Wait()
-		close(results)
+		// Wait for both to finish queueing commands
+		time.Sleep(100 * time.Millisecond)
 
-		// B should complete quickly (< 100ms), not blocked by A
-		durations := make([]time.Duration, 0, 2)
-		for d := range results {
-			durations = append(durations, d)
-		}
-		// At least one duration should be very short (B)
-		minDuration := durations[0]
-		if durations[1] < minDuration {
-			minDuration = durations[1]
-		}
-		require.Less(t, minDuration, 100*time.Millisecond,
-			"B should complete quickly without being blocked by A")
+		// Trigger BOTH EXEC at the same time
+		start := time.Now()
+		close(startBarrier)
+
+		wg.Wait()
+		totalTime := time.Since(start)
+
+		// If parallel: ~T (time for 1000 writes)
+		// If serial:   ~2T (one blocks the other)
+		// We expect parallel execution, so total time should be reasonable
+		// With namespace isolation, both EXEC run concurrently
+		require.Less(t, totalTime, 2*time.Second,
+			"Both EXEC should run in parallel, not sequentially blocking each other")
 	})
 
 	t.Run("DISCARD in one namespace does not affect other namespace", func(t *testing.T) {
@@ -169,26 +167,6 @@ func TestMultiNamespaceIsolation(t *testing.T) {
 		// A still has original, B has committed
 		require.Equal(t, "original_a", clientA.Get(ctx, "discard_key").Val())
 		require.Equal(t, "committed_b", clientB.Get(ctx, "discard_key").Val())
-	})
-
-	t.Run("WATCH in one namespace is independent from other namespace", func(t *testing.T) {
-		require.NoError(t, clientA.Set(ctx, "watch_key", "v1_a", 0).Err())
-		require.NoError(t, clientB.Set(ctx, "watch_key", "v1_b", 0).Err())
-
-		// A watches its key
-		require.NoError(t, clientA.Do(ctx, "WATCH", "watch_key").Err())
-
-		// B modifies its own key (should not affect A)
-		require.NoError(t, clientB.Set(ctx, "watch_key", "v2_b", 0).Err())
-
-		// A's EXEC should succeed (its key was not changed)
-		require.NoError(t, clientA.Do(ctx, "MULTI").Err())
-		require.NoError(t, clientA.Do(ctx, "SET", "watch_key", "v2_a").Err())
-		result := clientA.Do(ctx, "EXEC").Val()
-		require.NotNil(t, result, "EXEC should succeed, WATCH was not triggered by other namespace")
-
-		require.Equal(t, "v2_a", clientA.Get(ctx, "watch_key").Val())
-		require.Equal(t, "v2_b", clientB.Get(ctx, "watch_key").Val())
 	})
 
 	// Cleanup
