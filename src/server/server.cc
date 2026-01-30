@@ -1752,6 +1752,7 @@ void Server::SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint
   entry->client_name = conn->GetName();
   entry->ip = conn->GetIP();
   entry->port = conn->GetPort();
+  entry->ns = conn->GetNamespace();
   slow_log_.PushEntry(std::move(entry));
 }
 

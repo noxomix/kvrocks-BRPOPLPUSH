@@ -133,5 +133,49 @@ std::string LogCollector<T>::GetLatestEntries(int64_t cnt) {
   return output;
 }
 
+template <class T>
+ssize_t LogCollector<T>::SizeWithFilter(const std::function<bool(const T &)> &filter) {
+  std::lock_guard<std::mutex> guard(mu_);
+  if (!filter) return static_cast<ssize_t>(entries_.size());
+  ssize_t count = 0;
+  for (const auto &entry : entries_) {
+    if (filter(*entry)) count++;
+  }
+  return count;
+}
+
+template <class T>
+void LogCollector<T>::ResetWithFilter(const std::function<bool(const T &)> &filter) {
+  std::lock_guard<std::mutex> guard(mu_);
+  if (!filter) {
+    while (!entries_.empty()) entries_.pop_front();
+    return;
+  }
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&filter](const auto &entry) { return filter(*entry); }),
+                 entries_.end());
+}
+
+template <class T>
+std::string LogCollector<T>::GetLatestEntriesWithFilter(int64_t cnt, const std::function<bool(const T &)> &filter) {
+  std::lock_guard<std::mutex> guard(mu_);
+
+  std::vector<const T *> filtered;
+  for (const auto &entry : entries_) {
+    if (!filter || filter(*entry)) {
+      filtered.push_back(entry.get());
+    }
+  }
+
+  size_t n = (cnt > 0) ? std::min(filtered.size(), static_cast<size_t>(cnt)) : filtered.size();
+
+  std::string output;
+  output.append(redis::MultiLen(n));
+  for (size_t i = 0; i < n; i++) {
+    output.append(filtered[i]->ToRedisString());
+  }
+  return output;
+}
+
 template class LogCollector<SlowEntry>;
 template class LogCollector<PerfEntry>;

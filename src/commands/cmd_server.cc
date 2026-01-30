@@ -431,18 +431,35 @@ class CommandSlowlog : public Commander {
     return Status::OK();
   }
 
-  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, [[maybe_unused]] Connection *conn,
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
                  std::string *output) override {
     auto slowlog = srv->GetSlowLog();
+    const std::string ns = conn->GetNamespace();
+
+    // Filter function: match entries for this namespace only
+    auto ns_filter = [&ns](const SlowEntry &entry) { return entry.ns == ns; };
+
     if (subcommand_ == "reset") {
-      slowlog->Reset();
+      if (conn->IsAdmin()) {
+        slowlog->Reset();  // Admin: delete all
+      } else {
+        slowlog->ResetWithFilter(ns_filter);  // Tenant: delete only own
+      }
       *output = redis::RESP_OK;
       return Status::OK();
     } else if (subcommand_ == "len") {
-      *output = redis::Integer(static_cast<int64_t>(slowlog->Size()));
+      if (conn->IsAdmin()) {
+        *output = redis::Integer(static_cast<int64_t>(slowlog->Size()));
+      } else {
+        *output = redis::Integer(static_cast<int64_t>(slowlog->SizeWithFilter(ns_filter)));
+      }
       return Status::OK();
     } else if (subcommand_ == "get") {
-      *output = slowlog->GetLatestEntries(cnt_);
+      if (conn->IsAdmin()) {
+        *output = slowlog->GetLatestEntries(cnt_);  // Admin: see all
+      } else {
+        *output = slowlog->GetLatestEntriesWithFilter(cnt_, ns_filter);
+      }
       return Status::OK();
     }
     return {Status::NotOK, "SLOWLOG subcommand must be one of RESET, LEN, GET"};
