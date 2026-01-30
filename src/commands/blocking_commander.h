@@ -76,7 +76,7 @@ class BlockingCommander : public Commander,
       // the callback here might cause the current execution also in transaction mode.
       //
       // For more context, please refer to: https://github.com/apache/kvrocks/issues/2900
-      auto concurrency = conn_->GetServer()->WorkConcurrencyGuard();
+      auto concurrency = conn_->GetServer()->WorkConcurrencyGuard(conn_->GetNamespace());
 
       auto guard = GetLocks();
       done = OnBlockingWrite();
