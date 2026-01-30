@@ -14,14 +14,19 @@ Auf einem Worker können viele Tenant connections laufen. Aber nur eine davon is
 Wenn wir irgendwelche commands haben die daten von mehrere workern direkt aquirieren müssen zB statistiken über einen tenant (namespace) dann dürfen andere worker
 nicht so lange blockieren, sonst könnte ein namespace andere namespaces absichlich verlangsamen (noisy oder evil neighbor).
 
-WICHTIG - ns_ Default-Initialisierung:
-Die Connection::ns_ Variable MUSS leer ("") bleiben bis AUTH erfolgt ist!
-Der Auth-Flow in ExecuteCommands() prüft `if (GetNamespace().empty())` um zu entscheiden ob AUTH nötig ist.
-Wenn ns_ einen Default-Wert wie kDefaultNamespace hat, wird dieser Check übersprungen und:
-- BecomeAdmin() wird nie aufgerufen wenn kein requirepass gesetzt ist
-- Alle Admin-Commands (CLUSTER, CONFIG, etc.) schlagen fehl mit "admin permission required"
-Für per-Namespace Stats: Prüfe `!GetNamespace().empty()` BEVOR Stats getrackt werden.
-Bytes/Commands VOR AUTH werden nur global gezählt (korrekt, da Namespace noch unbekannt).
+LEARNING - Sentinel-Werte bei Auth-Flows nicht ändern:
+State-Variablen die im Auth-Flow als "nicht authentifiziert" Marker dienen (z.B. leerer String, nullptr, 0)
+dürfen NICHT mit Default-Werten initialisiert werden. Der Auth-Flow nutzt diese Sentinel-Werte um zu
+entscheiden ob Authentifizierung nötig ist. Konkret: `ns_` muss leer bleiben bis AUTH erfolgt ist.
+
+LEARNING - Per-Tenant Tracking nur nach Auth:
+Wenn per-Namespace/Tenant Stats getrackt werden sollen, immer prüfen ob der Tenant bekannt ist
+(z.B. `!GetNamespace().empty()`). Traffic VOR Authentifizierung kann keinem Tenant zugeordnet werden
+und wird nur global gezählt. Das ist korrekt und kein Bug.
+
+LEARNING - Aggregation optimieren:
+Bei Cross-Worker Aggregation (z.B. INFO stats) nicht alle Daten von allen Workern holen und dann filtern.
+Stattdessen: Gezielt nur die benötigten Daten anfragen (z.B. `GetNamespaceStats(ns)` statt `GetAllStats()`).
 }
 
 ## Erledigt
@@ -151,10 +156,13 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
    > Wird über Server-weite Wait-Contexts getrackt, nicht per-Connection-Flag.
    > Tenant-aware = BlockingKey-Struktur um Namespace erweitern.
 
-   **Batch 2 - Per-Connection Counter (Mittel):**
-   - [ ] `total_commands_processed` - Counter zu Connection
-   - [ ] `total_net_input_bytes` - Counter zu Connection
-   - [ ] `total_net_output_bytes` - Counter zu Connection
+   **Batch 2 - Per-Worker Sharded Namespace Stats (Mittel):** ✅ ERLEDIGT
+   - [x] `total_commands_processed` - Per-Worker ns_stats_ Map
+   - [x] `total_net_input_bytes` - Per-Worker ns_stats_ Map
+   - [x] `total_net_output_bytes` - Per-Worker ns_stats_ Map
+   > Design: Per-Worker sharded stats (nicht per-Connection) um 256-Worker Contention zu vermeiden.
+   > Jeder Worker hat eigene `ns_stats_` Map mit Mutex. INFO aggregiert über alle Worker.
+   > Tests: `tests/gocase/unit/server/info_test.go:TestInfoStatsNamespaceIsolation`
 
    **Batch 3 - Komplexer (Mittel-Hoch):**
    - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung

@@ -666,6 +666,44 @@ void Worker::CheckAndResetIfNeeded(const std::string &ns) {
   }
 }
 
+// Per-namespace stats methods for tenant isolation
+void Worker::IncrCallsForNamespace(const std::string &ns) {
+  std::lock_guard<std::mutex> lock(ns_stats_mu_);
+  ns_stats_[ns].total_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Worker::IncrInboundBytesForNamespace(const std::string &ns, uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(ns_stats_mu_);
+  ns_stats_[ns].in_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void Worker::IncrOutboundBytesForNamespace(const std::string &ns, uint64_t bytes) {
+  std::lock_guard<std::mutex> lock(ns_stats_mu_);
+  ns_stats_[ns].out_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+NamespaceStatsSnapshot Worker::GetNamespaceStats(const std::string &ns) const {
+  std::lock_guard<std::mutex> lock(ns_stats_mu_);
+  auto it = ns_stats_.find(ns);
+  if (it == ns_stats_.end()) {
+    return {};  // Empty stats if namespace not found
+  }
+  return {it->second.total_calls.load(std::memory_order_relaxed),
+          it->second.in_bytes.load(std::memory_order_relaxed),
+          it->second.out_bytes.load(std::memory_order_relaxed)};
+}
+
+std::unordered_map<std::string, NamespaceStatsSnapshot> Worker::GetNamespaceStatsSnapshot() const {
+  std::lock_guard<std::mutex> lock(ns_stats_mu_);
+  std::unordered_map<std::string, NamespaceStatsSnapshot> snapshot;
+  for (const auto &[ns, stats] : ns_stats_) {
+    snapshot[ns] = {stats.total_calls.load(std::memory_order_relaxed),
+                    stats.in_bytes.load(std::memory_order_relaxed),
+                    stats.out_bytes.load(std::memory_order_relaxed)};
+  }
+  return snapshot;
+}
+
 int64_t Worker::GetLuaMemorySize() { return (int64_t)lua_gc(lua_, LUA_GCCOUNT, 0) * 1024; }
 
 void Worker::KickoutIdleClients(int timeout) {
