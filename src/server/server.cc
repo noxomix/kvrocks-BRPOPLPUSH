@@ -1891,6 +1891,12 @@ void Server::ScriptReset() {
   }
 }
 
+void Server::ScriptResetNamespace(const std::string &ns) {
+  for (auto &wt : worker_threads_) {
+    wt->GetWorker()->LuaResetNamespace(ns);
+  }
+}
+
 Status Server::ScriptFlush() {
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
   engine::Context ctx(storage);

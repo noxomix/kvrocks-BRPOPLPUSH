@@ -311,6 +311,7 @@ class Server {
   Status ScriptGet(const std::string &sha, std::string *body) const;
   Status ScriptSet(const std::string &sha, const std::string &body) const;
   void ScriptReset();
+  void ScriptResetNamespace(const std::string &ns);
   Status ScriptFlush();
 
   Status FunctionGetCode(const rocksdb::Slice &ns, const std::string &lib, std::string *code) const;

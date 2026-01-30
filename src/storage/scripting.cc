@@ -633,11 +633,9 @@ Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::
                            engine::ComposeFunctionKey(engine::kLuaLibCodePrefix, ns, name));
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
-  // reset all lua context from all workers
+  // Reset lua context for this namespace in all workers
   // to ensure the library is removed from all lua states
-  // TODO: optimize it to only delete this library
-  // instead of resetting all libraries
-  conn->GetServer()->ScriptReset();
+  conn->GetServer()->ScriptResetNamespace(ns);
 
   return Status::OK();
 }
@@ -658,7 +656,7 @@ Status FunctionFlush(redis::Connection *conn, engine::Context *ctx) {
   s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, func_lib_start, func_lib_end);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
 
-  conn->GetServer()->ScriptReset();
+  conn->GetServer()->ScriptResetNamespace(ns);
   return Status::OK();
 }
 
