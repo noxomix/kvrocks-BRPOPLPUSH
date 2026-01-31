@@ -1,4 +1,4 @@
-# Namespace-Isolation: Offene Probleme
+# Namespace-Isolation
 
 Konstitution: {
 Bitte auch architektur.md konsolidieren je nach szenario. Auch wenn nicht alles 100% aktuell ist, weil wir Schritt für Schritt ja namespace
@@ -7,7 +7,6 @@ awareness implementieren. Dennoch ist das grudnverösnis von workern und Paralle
 Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im worstcase 50-100.000 connecitons parallel.
 Worker sind naütlrich nicht für bestimmte tenant reserviert. Es ist wichtig dies zu verstehen, weil so manche arten von locks oder datenstrutkturen entpsechend auf diesen demand
 angepasst werden müssen das wir später kein bottleneck haben.
-
 
 In KVrocks ist ein ADMIN automatisch nur der defualt namespace (__namespace/_namespace). Bei tenant aware functions ist es wichtig abzuwägen,
 ob im ADMIN fall global aggiert werden soll zB Flush scripts alle namespace scripts flusht oder nur im eignene tenant. Das haben wir bislang nicht zuverlässig
@@ -44,165 +43,41 @@ muss der Namespace zum Zeitpunkt des Blockings gespeichert werden. Blocking-Comm
 daher ist GetNamespace() immer verfügbar. Zählung erfolgt on-demand bei INFO, nicht im Hot-Path.
 }
 
-## Erledigt
-
-- [x] ~~ns_locks_ Pointer-Invalidation~~ - KEIN PROBLEM (C++ Standard garantiert Stabilität)
-- [x] ~~Storage::Write() TOCTOU~~ - WorkExclusivityGuard schützt
-- [x] ~~WATCH nicht namespace-aware~~ - GEFIXT mit `MakeWatchedKey(ns, key)`
-- [x] ~~FLUSHDB/FLUSHALL~~ - FLUSHDB löscht nur eigenen NS, FLUSHALL nur Admin
-- [x] ~~FUNCTION FLUSH Segfault~~ - GEFIXT mit Async Reset (siehe unten)
-
 ---
 
-## Gefixt: FUNCTION FLUSH Segfault
+## Tasks
 
-**Problem:** `ScriptResetNamespace()` griff auf Lua-States anderer Worker zu → Use-After-Free/Segfault
+**Commands tenant-aware:**
+- [ ] MONITOR - Nur eigene Commands zeigen
+- [ ] PUB/SUB - Namespace-Isolation (SUBSCRIBE, PUBLISH, PUBSUB CHANNELS etc.)
+- [x] CLIENT LIST/KILL - Nur eigene Connections (Tests: `client_isolation_test.go`)
+- [x] SLOWLOG - Nur eigene Queries (Tests: `slowlog_test.go`)
+- [x] DBSIZE, INFO keyspace - Bereits namespace-aware
+- [x] WATCH - `MakeWatchedKey(ns, key)`
+- [x] FLUSHDB/FLUSHALL - FLUSHDB nur eigener NS, FLUSHALL nur Admin
+- [x] kCmdAdmin für DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
 
-**Lösung:** Async Reset (Lazy Reset)
-- Jeder Worker resettet nur seinen **eigenen** Lua-State
-- `FUNCTION FLUSH` setzt nur ein Flag pro Worker
-- Vor jeder Lua-Operation prüft Worker das Flag und resettet sich selbst
-- Kein Cross-Thread Zugriff mehr → Thread-safe
-- Perfekte Tenant-Isolation (Tenant A kann B nicht blockieren)
+**INFO Stats:**
+- [ ] `total_connections_received` - Kumulativer Counter (einfach)
+- [ ] `instantaneous_ops_per_sec` - Rate-Berechnung (mittel)
+- [ ] `cmdstat_*` - Per-Command Stats (mittel-hoch, Memory-Overhead)
+- [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)
+- [x] `used_percent` - `GetTotalSize(ns)`
+- [x] `connected_clients`, `monitor_clients` - `GetClientCounts()`
+- [x] `blocked_clients` - ConnContext.ns + `GetBlockedClientsCount()`
+- [x] `total_commands_processed`, `total_net_input/output_bytes` - Per-Worker ns_stats_ Map
 
-**Bug gefunden:** Self-Reset bei `FUNCTION LOAD REPLACE`
-- `ScriptResetNamespace()` setzte Flag für ALLE Worker inkl. aktuellem
-- Bei `FUNCTION LOAD REPLACE`: Delete → Load → nächste Lua-Op sieht eigenes Flag → Reset → Library weg!
-- **Fix:** `ScriptResetNamespace(ns, Worker* exclude)` - aktueller Worker wird ausgeschlossen
-- Aktueller Worker ruft `LuaResetNamespace(ns)` synchron auf, andere werden asynchron markiert
+**Bugs gefixt:**
+- [x] FUNCTION FLUSH Segfault - Async Reset statt Cross-Thread Zugriff (Tests: `function_namespace_test.go`)
+- [x] ns_locks_ Pointer-Invalidation - Kein Problem (C++ garantiert Stabilität)
+- [x] Storage::Write() TOCTOU - WorkExclusivityGuard schützt
 
-**Geänderte Dateien:**
-- `src/server/server.h` - `script_reset_generation_` (Generation Counter)
-- `src/server/server.cc` - `ScriptReset()`, `ScriptResetNamespace()`
-- `src/server/worker.h` - `ns_reset_mutex_`, `namespaces_to_reset_`, `last_script_reset_generation_`
-- `src/server/worker.cc` - `MarkNamespaceForReset()`, `CheckAndResetIfNeeded()`
-- `src/storage/scripting.cc` - `CheckAndResetIfNeeded()` vor allen Lua-Einstiegspunkten
-- `src/commands/cmd_script.cc` - `CheckAndResetIfNeeded()` vor SCRIPT LOAD
-
-**Tests:** `tests/gocase/unit/scripting/function_namespace_test.go`
-
-**Hinweis:** Gelegentlich schlägt `TestFullSyncReplication` fehl (Timeout bei WaitForOffsetSync).
-Unklar ob durch diese Änderungen verursacht oder vorher existierendes Flaky-Test-Problem.
-Der Test ist timing-sensitiv und hängt nicht von Lua/Scripting ab.
-
----
-
-## Gefixt: SLOWLOG Namespace-Isolation
-
-**Problem:** Globaler `slow_log_` - alle Tenants sehen alle Einträge (Informationsleakage)
-
-**Lösung:** Namespace im SlowEntry speichern + bei Abfrage filtern
-- `SlowEntry.ns` Feld hinzugefügt
-- Generische Filter-Methoden in LogCollector: `SizeWithFilter()`, `ResetWithFilter()`, `GetLatestEntriesWithFilter()`
-- CommandSlowlog prüft `conn->IsAdmin()` und filtert entsprechend
-
-**Verhalten:**
-| Command | Tenant | Admin |
-|---------|--------|-------|
-| SLOWLOG GET | Nur eigene | Alle |
-| SLOWLOG LEN | Count eigene | Count alle |
-| SLOWLOG RESET | Löscht eigene | Löscht alle |
-
-**Geänderte Dateien:**
-- `src/stats/log_collector.h` - `ns` Feld + Filter-Methodendeklarationen
-- `src/stats/log_collector.cc` - Filter-Methoden implementiert
-- `src/server/server.cc` - `entry->ns = conn->GetNamespace()`
-- `src/commands/cmd_server.cc` - CommandSlowlog tenant-aware
-
-**Tests:** `tests/gocase/unit/slowlog/slowlog_test.go:TestSlowlogNamespaceIsolation`
+**Niedrige Priorität:**
+- [ ] SELECT (Logical Databases) - Ist No-Op, evtl. Key-Prefix pro DB
+- [ ] COMPACT kompaktiert Propagate CF nicht für Tenants (Background-Compaction macht's)
+- [ ] COMPACT globales Lock - Noisy-Neighbor möglich, aber selten/manuell
 
 ---
-
-## Niedrige Priorität: COMPACT kompaktiert nicht alle CFs für Tenants
-
-Tenant-COMPACT kompaktiert Propagate CF (Lua-Scripts) nicht, weil Key-Format anders ist.
-**Kein Sicherheitsproblem, kein Crash-Risiko.** Background-Compaction erledigt das automatisch.
-
----
-
-## Offen: Command-Klassifizierung für Tenant-Isolation
-
-### Prinzip
-**Global = Beeinflusst etwas außerhalb des eigenen Namespace**
-
-### 1. Admin-only (nicht tenant-aware möglich)
-Technisch nicht isolierbar - müssen Admin-only bleiben:
-
-**kCmdAdmin hinzugefügt:**
-- [x] FLUSHMEMTABLE - RocksDB-global
-- [x] FLUSHBLOCKCACHE - RocksDB-global
-- [x] DEBUG - Kann Server crashen
-
-**Bereits korrekt:**
-- [x] COMPACT - Namespace-aware für Daten-Keys (Lua-Scripts siehe "Niedrige Priorität")
-
-**kCmdAdmin bereits vorhanden:**
-- [x] CONFIG SET, SHUTDOWN, BGSAVE/RDB/SST
-- [x] SLAVEOF/REPLICAOF, CLUSTER *, FLUSHALL
-
-### 2. Tenant-aware machen (sinnvoll)
-
-- [x] CLIENT LIST - Nur eigene Connections zeigen ✅ GEFIXT
-- [x] CLIENT KILL - Nur eigene Connections killen ✅ GEFIXT
-- [x] SLOWLOG - Nur eigene Queries zeigen ✅ GEFIXT
-- [ ] MONITOR - Nur eigene Commands zeigen (Mittel)
-- [ ] PUB/SUB - Namespace-Isolation (Mittel-Hoch)
-  - SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE - Nur Messages aus eigenem NS empfangen
-  - PUBLISH - Nur an Subscriber im eigenen NS senden
-  - PUBSUB CHANNELS/NUMSUB/NUMPAT - Nur eigene NS-Daten zeigen
-  - ConnContext hat bereits `ns` Feld (Batch 1.5), Filtering fehlt noch
-- [x] INFO keyspace - ✅ Bereits namespace-aware (keys, expires, avg_ttl, used_db_size)
-  - [x] `used_percent` - GEFIXT (`GetTotalSize(ns)`)
-- [x] INFO clients - `connected_clients`, `monitor_clients`, `blocked_clients` ✅ alle per-NS
-- [x] DBSIZE - ✅ Bereits namespace-aware
-
-### 3. Bereits korrekt (tenant-lokal)
-- Alle Daten-Commands (GET, SET, HGET, ZADD, etc.)
-- KEYS, SCAN, FLUSHDB
-- MULTI/EXEC/WATCH
-- Blocking-Commands (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP, XREAD BLOCK, WAIT)
-  > Aufweck-Logik ist durch Key-Prefix bereits tenant-aware. Tenant A's LPUSH weckt nur Tenant A's BLPOP.
-
----
-
-## Implementierungs-Reihenfolge
-
-1. [x] ~~Quick Win: `kCmdAdmin` für DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE~~ - ERLEDIGT (COMPACT war bereits namespace-aware)
-2. [x] ~~Prüfen: DBSIZE, INFO~~ - Beide bereits namespace-aware
-3. [x] ~~CLIENT LIST/KILL tenant-aware~~ - GEFIXT (Tests: `client_isolation_test.go`)
-4. [x] ~~SLOWLOG tenant-aware~~ - GEFIXT (Tests: `slowlog_test.go:TestSlowlogNamespaceIsolation`)
-5. [ ] MONITOR tenant-aware
-6. [ ] INFO vollständig tenant-aware:
-   - **Ansatz:** Per-Connection Stats → bei INFO aggregieren (kein Hot-Path Impact)
-   - **Bleiben global:** Server, CPU, Persistence, Replication, RocksDB, Cluster
-
-   **Batch 1 - Quick Wins (Trivial/Niedrig):** ✅ ERLEDIGT
-   - [x] `used_percent` - `GetTotalSize(ns)` statt `GetTotalSize()`
-   - [x] `connected_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
-   - [x] `monitor_clients` - On-demand per-Namespace zählen via `GetClientCounts()`
-
-   **Batch 1.5 - blocked_clients (Mittel):** ✅ ERLEDIGT
-   - [x] `ConnContext` um `ns` Feld erweitert
-   - [x] `GetBlockedClientsCount(self)` implementiert - iteriert blocking_keys_, blocked_stream_consumers_, wait_contexts_
-   - [x] Tests: `client_isolation_test.go:TestBlockedClientsNamespaceIsolation`
-   > **Effizienz:** Admin O(1) (atomic load), Tenant on-demand bei INFO (~200µs worst case).
-   > Zero-cost im Hot-Path (Block/Unblock). Blocking-Logik war bereits tenant-aware (Key-Prefix).
-
-   **Batch 2 - Per-Worker Sharded Namespace Stats (Mittel):** ✅ ERLEDIGT
-   - [x] `total_commands_processed` - Per-Worker ns_stats_ Map
-   - [x] `total_net_input_bytes` - Per-Worker ns_stats_ Map
-   - [x] `total_net_output_bytes` - Per-Worker ns_stats_ Map
-   > Design: Per-Worker sharded stats (nicht per-Connection) um 256-Worker Contention zu vermeiden.
-   > Jeder Worker hat eigene `ns_stats_` Map mit Mutex. INFO aggregiert über alle Worker.
-   > Tests: `tests/gocase/unit/server/info_test.go:TestInfoStatsNamespaceIsolation`
-
-   **Batch 3 - Komplexer (Mittel-Hoch):**
-   - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
-   - [ ] `total_connections_received` - Kumulativer Counter
-- [ ] `used_memory_lua` - Lua-States aggregieren
-
-  **Batch 4 - Aufwendig (Hoch):**
-  - [ ] `cmdstat_*` - Per-Connection Command-Map + Aggregation
 
 //für mich selber, claude bitte hier erst ignorieren: {
     eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
