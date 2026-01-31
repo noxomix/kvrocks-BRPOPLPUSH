@@ -103,48 +103,21 @@ Replication-Änderungen.
 
 ---
 
-## Tasks
+## Erledigt
 
 **Commands tenant-aware:**
-- [x] **PUB/SUB Tenant-Isolation** - Vollständige Isolation, Admin = normaler Tenant
-  - [x] Phase 1: Datenstruktur (server.h)
-    - [x] `NamespacePubSub` struct (mutex + channels + patterns Maps)
-    - [x] `pubsub_namespaces_` Map mit shared_mutex
-    - [x] `CleanupPubSubNamespace()` deklarieren
-  - [x] Phase 2: Subscribe/Unsubscribe (server.cc)
-    - [x] `SubscribeChannel()` - unique_lock + inline GetOrCreate
-    - [x] `UnsubscribeChannel()` - NS-Lookup + NS-Lock
-    - [x] `PSubscribeChannel()` - unique_lock + inline GetOrCreate
-    - [x] `PUnsubscribeChannel()` - NS-Lookup + NS-Lock
-  - [x] Phase 3: Publish (server.cc)
-    - [x] `PublishMessage()` - NS-Lookup, Pattern-Match nur eigene, Reply außerhalb Lock
-  - [x] Phase 4: Info-Commands
-    - [x] `GetChannelsByPattern()` - Nur eigene NS (Admin = normaler Tenant)
-    - [x] `ListChannelSubscribeNum()` - Nur eigene NS (Admin = normaler Tenant)
-    - [x] `GetPubSubPatternSize()` - Namespace-Parameter (Admin = normaler Tenant)
-    - [x] cmd_pubsub.cc: PUBSUB CHANNELS/NUMSUB/NUMPAT namespace-aware
-    - [x] INFO pubsub_channels/patterns: Nur eigene NS
-  - [x] Phase 5: Cleanup
-    - [x] cmd_server.cc: `NAMESPACE DEL` ruft `CleanupPubSubNamespace()` auf
-  - [x] Phase 6: Persistence (RocksDB)
-    - [x] redis_pubsub.cc: `ComposeNamespaceKey()` für Replication
-    - [x] replication.cc: `ExtractNamespaceKey()` beim Empfang
-  - [x] Phase 7: Tests
-    - [x] `pubsub_isolation_test.go` - Cross-Tenant, Same-NS, Pattern, PUBSUB CHANNELS/NUMSUB/NUMPAT
-  - [ ] SPÄTER: Shard PubSub (SSUBSCRIBE etc.) - wird vorerst nicht genutzt
-- [x] MONITOR - Bereits namespace-aware (Tenant sieht nur eigene, Admin alle)
+- [x] PUB/SUB Tenant-Isolation (Vollständig: Datenstruktur, Subscribe/Unsubscribe, Publish, Info-Commands, Cleanup, Persistence, Tests)
+- [x] Shard PubSub Namespace-Isolation (SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH)
+- [x] MONITOR - Tenant sieht nur eigene, Admin alle
 - [x] CLIENT LIST/KILL - Nur eigene Connections (Tests: `client_isolation_test.go`)
 - [x] SLOWLOG - Nur eigene Queries (Tests: `slowlog_test.go`)
-- [x] DBSIZE, INFO keyspace - Bereits namespace-aware
+- [x] DBSIZE, INFO keyspace - Namespace-aware
 - [x] WATCH - `MakeWatchedKey(ns, key)`
 - [x] FLUSHDB/FLUSHALL - FLUSHDB nur eigener NS, FLUSHALL nur Admin
 - [x] kCmdAdmin für DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
+- [x] Blocking Mutex Namespace-Isolation (BLPOP/BRPOP/BZPOP/XREAD BLOCK) - Tests: `blocking_isolation_test.go`
 
 **INFO Stats:**
-- [ ] `total_connections_received` - Kumulativer Counter (einfach)
-- [ ] `instantaneous_ops_per_sec` - Rate-Berechnung (mittel)
-- [ ] `cmdstat_*` - Per-Command Stats (mittel-hoch, Memory-Overhead)
-- [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)
 - [x] `used_percent` - `GetTotalSize(ns)`
 - [x] `connected_clients`, `monitor_clients` - `GetClientCounts()`
 - [x] `blocked_clients` - ConnContext.ns + `GetBlockedClientsCount()`
@@ -152,88 +125,48 @@ Replication-Änderungen.
 
 **Bugs gefixt:**
 - [x] FUNCTION FLUSH Segfault - Async Reset statt Cross-Thread Zugriff (Tests: `function_namespace_test.go`)
-- [x] ns_locks_ Pointer-Invalidation - Kein Problem (C++ garantiert Stabilität)
+- [x] ns_locks_ Pointer-Invalidation - C++ garantiert Stabilität
 - [x] Storage::Write() TOCTOU - WorkExclusivityGuard schützt
 
-**Noisy-Neighbor Locking (P1):**
-- [ ] **I/O unter Lock entfernen** - Copy-then-Reply Pattern (wie PublishMessage)
-  - [ ] `WakeupBlockingConns()` (server.cc:819-840) - LPUSH/RPUSH/ZADD weckt BLPOP/BZPOP
-    - [ ] Blocked clients unter Lock in Vector kopieren
-    - [ ] Lock releasen
-    - [ ] `EnableWriteEvent()` außerhalb Lock aufrufen
-  - [ ] `OnEntryAddedToStream()` (server.cc:842-868) - XADD weckt XREAD BLOCK
-    - [ ] Stream consumers unter Lock in Vector kopieren
-    - [ ] Lock releasen
-    - [ ] `EnableWriteEvent()` außerhalb Lock aufrufen
-  - [ ] `WakeupWaitConnections()` (server.cc:888-912) - Replication WAIT
-    - [ ] Wait contexts unter Lock in Vector kopieren
-    - [ ] Lock releasen
-    - [ ] `Reply()` + `EnableWriteEvent()` außerhalb Lock aufrufen
-- [ ] **db_job_mu_ globaler Mutex** (server.h:433) - COMPACT/BGSAVE/DBSIZE blockieren sich gegenseitig
+**Performance-Fixes:**
+- [x] `GetNamespace()` gibt `const std::string&` statt Kopie zurück (`redis_connection.h:157`)
+- [x] Doppelte `GetNamespace()`-Aufrufe eliminiert durch Caching
+- [x] `WakeupBlockingConns` - `std::move` statt Kopie (`server.cc:833`)
+- [x] `PublishMessage` - `pair<Worker*, int>` statt ConnContext (`server.cc:449-472`)
+
+---
+
+## Offen
+
+**Hohe Priorität - Noisy-Neighbor Locking:**
+- [ ] **I/O unter Lock entfernen** - Copy-then-Reply Pattern
+  - [ ] `WakeupBlockingConns()` (server.cc:819-840) - Lock releasen vor `EnableWriteEvent()`
+  - [ ] `OnEntryAddedToStream()` (server.cc:842-868) - Lock releasen vor `EnableWriteEvent()`
+  - [ ] `WakeupWaitConnections()` (server.cc:888-912) - Lock releasen vor `Reply()` + `EnableWriteEvent()`
+- [ ] **db_job_mu_ globaler Mutex** (server.h:433)
   - Problem: Ein Tenant's COMPACT (Minuten) blockiert alle anderen DB-Jobs
-  - [ ] Option A: Aufteilen in `compaction_mu_`, `bgsave_mu_`, `scan_mu_`
-  - [ ] Option B: Per-Namespace Job-Queues
-- [ ] **works_concurrency_rw_lock_ Full-Sync** (server.h:476) - Blockiert ALLE Commands
-  - Problem: Full-Sync nimmt exclusive Lock, busy-wait mit 1ms polling (server.cc:1801-1808)
-  - [ ] Option A: Condition Variable statt busy-wait
-  - [ ] Option B: Sync ohne globalen Command-Block
+  - Option A: Aufteilen in `compaction_mu_`, `bgsave_mu_`, `scan_mu_`
+  - Option B: Per-Namespace Job-Queues
+- [ ] **works_concurrency_rw_lock_ Full-Sync** (server.h:476)
+  - Problem: Full-Sync nimmt exclusive Lock, busy-wait mit 1ms polling
+  - Option A: Condition Variable statt busy-wait
+  - Option B: Sync ohne globalen Command-Block
+
+**Mittlere Priorität - INFO Stats:**
+- [ ] `total_connections_received` - Kumulativer Counter
+- [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
+- [ ] `cmdstat_*` - Per-Command Stats (Memory-Overhead bedenken)
+- [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)
 
 **Niedrige Priorität:**
-- [ ] **SCRIPT FLUSH Namespace-Isolation** - Hybrid-Ansatz
-  - [ ] Scripts als `f_{ns}_{sha}` statt `f_{sha}` speichern (scripting.cc)
-  - [ ] SCRIPT FLUSH als kCmdAdmin markieren (cmd_script.cc)
-  - [ ] Alternativ: Nur kCmdAdmin ohne Prefix-Änderung (minimal)
-- [ ] SELECT (Logical Databases) - Ist No-Op, evtl. workround indem man "sub tnenats" implementiert (also namespace zB <ns> + "2" oder so und dann set logic und überprüfung)
-- [ ] COMPACT kompaktiert Propagate CF nicht für Tenants (Background-Compaction macht's)
-- [ ] COMPACT globales Lock - Noisy-Neighbor möglich, aber selten/manuell
-- [ ] MONITOR globales Lock - O(n_workers) Locks pro Command wenn aktiv, Reply() unter Lock
-- [x] **Blocking Mutex Namespace-Isolation** (~150-200 Zeilen) - Noisy-Neighbor bei BLPOP/XREAD BLOCK
-  - [x] Phase 1: Datenstrukturen (server.h)
-    - [x] `NamespaceBlockingKeys` struct (mutex + keys Map)
-    - [x] `NamespaceStreamConsumers` struct (mutex + consumers Map)
-    - [x] `blocking_keys_by_ns_` + `stream_consumers_by_ns_` Maps mit shared_mutex
-  - [x] Phase 2: Key-Blocking (server.cc)
-    - [x] `BlockOnKey()` - GetOrCreate + NS-Lock
-    - [x] `UnblockOnKey()` - NS-Lookup + NS-Lock
-    - [x] `WakeupBlockingConns()` - ns Parameter hinzugefügt
-  - [x] Phase 3: Stream-Blocking (server.cc)
-    - [x] `BlockOnStreams()` - GetOrCreate + NS-Lock
-    - [x] `UnblockOnStreams()` - NS-Lookup + NS-Lock
-    - [x] `OnEntryAddedToStream()` - NS-Lookup (ns bereits Parameter)
-  - [x] Phase 4: Caller-Anpassungen
-    - [x] cmd_list.cc: WakeupBlockingConns mit ns
-    - [x] cmd_zset.cc: WakeupBlockingConns mit ns
-  - [x] Phase 5: Cleanup
-    - [x] cmd_server.cc: `NAMESPACE DEL` ruft `CleanupBlockingNamespace()` auf
-  - [x] Phase 6: GetBlockedClientsCount per-NS
-  - [x] Phase 7: Tests
-    - [x] `blocking_isolation_test.go` - Cross-Tenant Isolation (Tests: `blocking_isolation_test.go`)
+- [ ] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` oder nur kCmdAdmin
+- [ ] SELECT (Logical Databases) - Workaround mit Sub-Namespaces möglich
+- [ ] COMPACT kompaktiert Propagate CF nicht für Tenants
+- [ ] MONITOR globales Lock - O(n_workers) Locks pro Command, Reply() unter Lock
 
 ---
 
-**Performance-Fixes (Throughput-Regression nach Isolation-Änderungen):**
-- [x] **KRITISCH: `GetNamespace()` gibt Kopie statt Referenz zurück**
-  - Datei: `src/server/redis_connection.h:157`
-  - Problem: `std::string GetNamespace() const { return ns_; }` kopiert String bei JEDEM Aufruf
-  - Impact: 7-11 String-Kopien (Heap-Allokationen) pro SET-Befehl
-  - Fix: `const std::string& GetNamespace() const { return ns_; }`
-- [x] Doppelte `GetNamespace()`-Aufrufe eliminieren (nach obigem Fix weniger kritisch)
-  - `src/server/redis_connection.cc:144-145` - 2x Aufruf bei Reply
-  - `src/server/redis_connection.cc:370-371` - 2x Aufruf bei Execute
-  - `src/server/redis_request.cc:68-69, 109-110, 136-137` - 2x Aufrufe beim Parsen
-  - Fix: `const auto& ns = GetNamespace();` einmal cachen
-- [x] `WakeupBlockingConns` - `std::move` statt Kopie
-  - Datei: `src/server/server.cc:833`
-  - Problem: `auto conn_ctx = iter->second.front();` kopiert ConnContext inkl. String
-  - Fix: `auto conn_ctx = std::move(iter->second.front());`
-- [x] `PublishMessage` - nur Worker*/fd statt ConnContext kopieren
-  - Datei: `src/server/server.cc:449-472`
-  - Problem: `vector<ConnContext>` kopiert ns-String für jeden Subscriber
-  - Fix: `vector<pair<Worker*, int>>` - ns wird für Reply nicht benötigt
-
----
-
-//für mich selber, claude bitte hier erst ignorieren: {
+//für mich selber, claude bitte hier ignorieren: {
     eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
     so könnte es sein, dass  es nur wenn nch kein namespace gestzt istder ns im Conn obj gespeichert/gestzt wird. Das dringend noch prüfen.
-}achso
+}
