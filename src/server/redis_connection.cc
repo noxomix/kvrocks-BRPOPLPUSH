@@ -141,8 +141,9 @@ void Connection::Reply(const std::string &msg) {
   }
 
   owner_->srv->stats.IncrOutboundBytes(msg.size());
-  if (!GetNamespace().empty()) {
-    owner_->IncrOutboundBytesForNamespace(GetNamespace(), msg.size());
+  const auto& ns = GetNamespace();
+  if (!ns.empty()) {
+    owner_->IncrOutboundBytesForNamespace(ns, msg.size());
   }
   if (in_exec_) {
     queued_replies_.push_back(msg);
@@ -367,8 +368,9 @@ Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_n
                                   const std::vector<std::string> &cmd_tokens, Commander *current_cmd,
                                   std::string *reply) {
   srv_->stats.IncrCalls(cmd_name);
-  if (!GetNamespace().empty()) {
-    owner_->IncrCallsForNamespace(GetNamespace());
+  const auto& ns = GetNamespace();
+  if (!ns.empty()) {
+    owner_->IncrCallsForNamespace(ns);
   }
 
   auto start = std::chrono::high_resolution_clock::now();

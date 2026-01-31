@@ -79,6 +79,26 @@ KONZEPT - Admin-Verhalten differenzieren:
 Maintenance-Commands (COMPACT, FLUSHALL, DEBUG): Admin = global
 Daten-Commands (PUBSUB, normale Keys): Admin = normaler Tenant (default namespace)
 Konsistenz wichtiger als Convenience.
+
+KONZEPT - Cluster vs. Namespaces:
+Cluster-Mode deaktiviert Namespaces by Design. Slot-Migration (slot_import.cc) arbeitet
+nur mit kDefaultNamespace - kein Bug, da beide Features sich gegenseitig ausschließen.
+
+KONZEPT - Replication ist Instanz-Ebene:
+Replication (SLAVEOF/REPLICAOF) repliziert ALLE Daten der Instanz inkl. aller Namespaces.
+Full-Sync kopiert alles - korrekt by Design. Tenant-Isolation auf Infra-Ebene = separate Instanzen.
+
+KONZEPT - EVAL Scripts vs. FUNCTION Isolation:
+EVAL-Scripts: Global by SHA gecached (`f_{sha}`), aber Ausführung namespace-aware (redis.call nutzt conn->GetNamespace()).
+FUNCTION: Vollständig per-NS isoliert (`<ns>_<lib>`), LuaResetNamespace() für Cleanup.
+SCRIPT FLUSH: Global - löscht alle Scripts (Noisy Neighbor). Kein Auto-Eviction für ungenutzte Scripts.
+Hybrid-Fix: Scripts als `f_{ns}_{sha}` speichern (Isolation + Kollisionsschutz) + SCRIPT FLUSH admin-only.
+
+LEARNING - Blocking-State ist server-lokal:
+Blocking-State (welche Connections warten worauf) ist transient und nicht repliziert.
+Nur Daten-Operationen (LPUSH, XADD) werden repliziert. Jeder Server (Primary/Replica)
+verwaltet eigene Blocking-Clients. → Per-Namespace Blocking-Refactoring benötigt keine
+Replication-Änderungen.
 }
 
 ---
@@ -135,7 +155,34 @@ Konsistenz wichtiger als Convenience.
 - [x] ns_locks_ Pointer-Invalidation - Kein Problem (C++ garantiert Stabilität)
 - [x] Storage::Write() TOCTOU - WorkExclusivityGuard schützt
 
+**Noisy-Neighbor Locking (P1):**
+- [ ] **I/O unter Lock entfernen** - Copy-then-Reply Pattern (wie PublishMessage)
+  - [ ] `WakeupBlockingConns()` (server.cc:819-840) - LPUSH/RPUSH/ZADD weckt BLPOP/BZPOP
+    - [ ] Blocked clients unter Lock in Vector kopieren
+    - [ ] Lock releasen
+    - [ ] `EnableWriteEvent()` außerhalb Lock aufrufen
+  - [ ] `OnEntryAddedToStream()` (server.cc:842-868) - XADD weckt XREAD BLOCK
+    - [ ] Stream consumers unter Lock in Vector kopieren
+    - [ ] Lock releasen
+    - [ ] `EnableWriteEvent()` außerhalb Lock aufrufen
+  - [ ] `WakeupWaitConnections()` (server.cc:888-912) - Replication WAIT
+    - [ ] Wait contexts unter Lock in Vector kopieren
+    - [ ] Lock releasen
+    - [ ] `Reply()` + `EnableWriteEvent()` außerhalb Lock aufrufen
+- [ ] **db_job_mu_ globaler Mutex** (server.h:433) - COMPACT/BGSAVE/DBSIZE blockieren sich gegenseitig
+  - Problem: Ein Tenant's COMPACT (Minuten) blockiert alle anderen DB-Jobs
+  - [ ] Option A: Aufteilen in `compaction_mu_`, `bgsave_mu_`, `scan_mu_`
+  - [ ] Option B: Per-Namespace Job-Queues
+- [ ] **works_concurrency_rw_lock_ Full-Sync** (server.h:476) - Blockiert ALLE Commands
+  - Problem: Full-Sync nimmt exclusive Lock, busy-wait mit 1ms polling (server.cc:1801-1808)
+  - [ ] Option A: Condition Variable statt busy-wait
+  - [ ] Option B: Sync ohne globalen Command-Block
+
 **Niedrige Priorität:**
+- [ ] **SCRIPT FLUSH Namespace-Isolation** - Hybrid-Ansatz
+  - [ ] Scripts als `f_{ns}_{sha}` statt `f_{sha}` speichern (scripting.cc)
+  - [ ] SCRIPT FLUSH als kCmdAdmin markieren (cmd_script.cc)
+  - [ ] Alternativ: Nur kCmdAdmin ohne Prefix-Änderung (minimal)
 - [ ] SELECT (Logical Databases) - Ist No-Op, evtl. workround indem man "sub tnenats" implementiert (also namespace zB <ns> + "2" oder so und dann set logic und überprüfung)
 - [ ] COMPACT kompaktiert Propagate CF nicht für Tenants (Background-Compaction macht's)
 - [ ] COMPACT globales Lock - Noisy-Neighbor möglich, aber selten/manuell
@@ -161,6 +208,28 @@ Konsistenz wichtiger als Convenience.
   - [x] Phase 6: GetBlockedClientsCount per-NS
   - [x] Phase 7: Tests
     - [x] `blocking_isolation_test.go` - Cross-Tenant Isolation (Tests: `blocking_isolation_test.go`)
+
+---
+
+**Performance-Fixes (Throughput-Regression nach Isolation-Änderungen):**
+- [ ] **KRITISCH: `GetNamespace()` gibt Kopie statt Referenz zurück**
+  - Datei: `src/server/redis_connection.h:157`
+  - Problem: `std::string GetNamespace() const { return ns_; }` kopiert String bei JEDEM Aufruf
+  - Impact: 7-11 String-Kopien (Heap-Allokationen) pro SET-Befehl
+  - Fix: `const std::string& GetNamespace() const { return ns_; }`
+- [ ] Doppelte `GetNamespace()`-Aufrufe eliminieren (nach obigem Fix weniger kritisch)
+  - `src/server/redis_connection.cc:144-145` - 2x Aufruf bei Reply
+  - `src/server/redis_connection.cc:370-371` - 2x Aufruf bei Execute
+  - `src/server/redis_request.cc:68-69, 109-110, 136-137` - 2x Aufrufe beim Parsen
+  - Fix: `const auto& ns = GetNamespace();` einmal cachen
+- [ ] `WakeupBlockingConns` - `std::move` statt Kopie
+  - Datei: `src/server/server.cc:833`
+  - Problem: `auto conn_ctx = iter->second.front();` kopiert ConnContext inkl. String
+  - Fix: `auto conn_ctx = std::move(iter->second.front());`
+- [ ] `PublishMessage` - nur Worker*/fd statt ConnContext kopieren
+  - Datei: `src/server/server.cc:449-472`
+  - Problem: `vector<ConnContext>` kopiert ns-String für jeden Subscriber
+  - Fix: `vector<pair<Worker*, int>>` - ns wird für Reply nicht benötigt
 
 ---
 
