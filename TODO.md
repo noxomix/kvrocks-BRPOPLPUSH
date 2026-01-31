@@ -99,6 +99,12 @@ Blocking-State (welche Connections warten worauf) ist transient und nicht repliz
 Nur Daten-Operationen (LPUSH, XADD) werden repliziert. Jeder Server (Primary/Replica)
 verwaltet eigene Blocking-Clients. → Per-Namespace Blocking-Refactoring benötigt keine
 Replication-Änderungen.
+
+LEARNING - AUTH und Namespace-Wechsel:
+AUTH während MULTI ist ein Bug - Commands nach AUTH in der Transaction laufen im neuen
+Namespace. Fix: AUTH braucht `no-multi` Flag.
+AUTH während Blocking (BLPOP etc.) ist KEIN Problem - Read-Callback ist nullptr während
+Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 }
 
 ---
@@ -138,6 +144,9 @@ Replication-Änderungen.
 
 ## Offen
 
+**Security-Bug:**
+- [x] **AUTH in MULTI** - `no-multi` Flag hinzugefügt (`cmd_server.cc:1575`)
+
 **Hohe Priorität - Noisy-Neighbor Locking:**
 - [ ] **I/O unter Lock entfernen** - Copy-then-Reply Pattern
   - [ ] `WakeupBlockingConns()` (server.cc:819-840) - Lock releasen vor `EnableWriteEvent()`
@@ -166,7 +175,7 @@ Replication-Änderungen.
 
 ---
 
-//für mich selber, claude bitte hier ignorieren: {
-    eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
-    so könnte es sein, dass  es nur wenn nch kein namespace gestzt istder ns im Conn obj gespeichert/gestzt wird. Das dringend noch prüfen.
+//für mich selber: {
+    GEPRÜFT: Re-AUTH während Blocking ist kein Problem (Read-Callback ist nullptr).
+    GEPRÜFT: Re-AUTH während MULTI ist ein Bug → Task oben angelegt.
 }

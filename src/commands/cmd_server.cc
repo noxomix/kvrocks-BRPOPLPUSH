@@ -1572,7 +1572,7 @@ class CommandFlushBlockCache : public Commander {
 };
 
 REDIS_REGISTER_COMMANDS(
-    Server, MakeCmdAttr<CommandAuth>("auth", 2, "read-only ok-loading auth", NO_KEY),
+    Server, MakeCmdAttr<CommandAuth>("auth", 2, "read-only ok-loading auth no-multi", NO_KEY),
     MakeCmdAttr<CommandPing>("ping", -1, "read-only", NO_KEY),
     MakeCmdAttr<CommandSelect>("select", 2, "read-only", NO_KEY),
     MakeCmdAttr<CommandInfo>("info", -1, "read-only ok-loading", NO_KEY),
