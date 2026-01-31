@@ -36,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <tuple>
 #include <utility>
 
 #include "commands/command_parser.h"
@@ -817,52 +818,70 @@ void Server::UnblockOnStreams(const std::vector<std::string> &keys, redis::Conne
 }
 
 void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, size_t n_conns) {
-  std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
-  auto it = blocking_keys_by_ns_.find(ns);
-  if (it == blocking_keys_by_ns_.end()) {
-    return;
-  }
+  std::vector<std::pair<Worker *, int>> to_wakeup;
 
-  std::lock_guard<std::mutex> guard(it->second->mu);
-  auto iter = it->second->keys.find(key);
-  if (iter == it->second->keys.end() || iter->second.empty()) {
-    return;
-  }
-
-  while (n_conns-- && !iter->second.empty()) {
-    auto conn_ctx = std::move(iter->second.front());
-    auto s = conn_ctx.owner->EnableWriteEvent(conn_ctx.fd);
-    if (!s.IsOK()) {
-      error("[server] Failed to enable write event on blocked client {}: {}", conn_ctx.fd, s.Msg());
+  {
+    std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
+    auto it = blocking_keys_by_ns_.find(ns);
+    if (it == blocking_keys_by_ns_.end()) {
+      return;
     }
-    iter->second.pop_front();
+
+    std::lock_guard<std::mutex> guard(it->second->mu);
+    auto iter = it->second->keys.find(key);
+    if (iter == it->second->keys.end() || iter->second.empty()) {
+      return;
+    }
+
+    while (n_conns-- && !iter->second.empty()) {
+      auto conn_ctx = std::move(iter->second.front());
+      iter->second.pop_front();
+      to_wakeup.emplace_back(conn_ctx.owner, conn_ctx.fd);
+    }
+  }  // Lock released
+
+  // I/O outside lock - EnableWriteEvent validates fd internally
+  for (const auto &[owner, fd] : to_wakeup) {
+    auto s = owner->EnableWriteEvent(fd);
+    if (!s.IsOK()) {
+      error("[server] Failed to enable write event on blocked client {}: {}", fd, s.Msg());
+    }
   }
 }
 
 void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id) {
-  std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
-  auto ns_it = stream_consumers_by_ns_.find(ns);
-  if (ns_it == stream_consumers_by_ns_.end()) {
-    return;
-  }
+  std::vector<std::pair<Worker *, int>> to_wakeup;
 
-  std::lock_guard<std::mutex> guard(ns_it->second->mu);
-  auto iter = ns_it->second->consumers.find(key);
-  if (iter == ns_it->second->consumers.end() || iter->second.empty()) {
-    return;
-  }
+  {
+    std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
+    auto ns_it = stream_consumers_by_ns_.find(ns);
+    if (ns_it == stream_consumers_by_ns_.end()) {
+      return;
+    }
 
-  for (auto it = iter->second.begin(); it != iter->second.end();) {
-    auto consumer = *it;
-    // No need to check consumer->ns == ns since we already filtered by namespace
-    if (entry_id > consumer->last_consumed_id) {
-      auto s = consumer->owner->EnableWriteEvent(consumer->fd);
-      if (!s.IsOK()) {
-        error("[server] Failed to enable write event on blocked stream consumer {}: {}", consumer->fd, s.Msg());
+    std::lock_guard<std::mutex> guard(ns_it->second->mu);
+    auto iter = ns_it->second->consumers.find(key);
+    if (iter == ns_it->second->consumers.end() || iter->second.empty()) {
+      return;
+    }
+
+    for (auto it = iter->second.begin(); it != iter->second.end();) {
+      auto consumer = *it;
+      // No need to check consumer->ns == ns since we already filtered by namespace
+      if (entry_id > consumer->last_consumed_id) {
+        to_wakeup.emplace_back(consumer->owner, consumer->fd);
+        it = iter->second.erase(it);
+      } else {
+        ++it;
       }
-      it = iter->second.erase(it);
-    } else {
-      ++it;
+    }
+  }  // Lock released
+
+  // I/O outside lock - EnableWriteEvent validates fd internally
+  for (const auto &[owner, fd] : to_wakeup) {
+    auto s = owner->EnableWriteEvent(fd);
+    if (!s.IsOK()) {
+      error("[server] Failed to enable write event on blocked stream consumer {}: {}", fd, s.Msg());
     }
   }
 }
@@ -886,28 +905,37 @@ void Server::BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target
 }
 
 void Server::WakeupWaitConnections(rocksdb::SequenceNumber seq) {
-  std::unique_lock<std::shared_mutex> guard(wait_contexts_mu_);
+  // Store (Worker*, fd, reached_replicas) - no Connection* needed to avoid Use-After-Free
+  std::vector<std::tuple<Worker *, int, size_t>> to_wakeup;
 
-  // find the last entry with target_seq > seq, which cannot wakeup
-  auto end_it = wait_contexts_.upper_bound(seq);
-  for (auto it = wait_contexts_.begin(); it != end_it;) {
-    // Count how many replicas have reached the target sequence
-    size_t reached_replicas = GetReplicasReachedSequence(it->second.target_seq);
+  {
+    std::unique_lock<std::shared_mutex> guard(wait_contexts_mu_);
 
-    // If enough replicas have reached the target sequence, wake up the connection
-    if (reached_replicas >= it->second.num_replicas) {
-      // Send the response with the number of replicas that have reached the target sequence
-      it->second.conn->Reply(redis::Integer(reached_replicas));
+    // find the last entry with target_seq > seq, which cannot wakeup
+    auto end_it = wait_contexts_.upper_bound(seq);
+    for (auto it = wait_contexts_.begin(); it != end_it;) {
+      // Count how many replicas have reached the target sequence
+      size_t reached_replicas = GetReplicasReachedSequence(it->second.target_seq);
 
-      auto s = it->second.conn->Owner()->EnableWriteEvent(it->second.conn->GetFD());
-      if (!s.IsOK()) {
-        error("[server] Failed to enable write event on WAIT connection {}: {}", it->second.conn->GetFD(), s.Msg());
+      // If enough replicas have reached the target sequence, collect for wakeup
+      if (reached_replicas >= it->second.num_replicas) {
+        to_wakeup.emplace_back(it->second.conn->Owner(), it->second.conn->GetFD(), reached_replicas);
+        it = wait_contexts_.erase(it);
+        continue;
       }
-      it = wait_contexts_.erase(it);
-      DecrBlockedClientNum();
-      continue;
+      ++it;
     }
-    ++it;
+  }  // Lock released
+
+  // I/O + counter outside lock - Worker::Reply validates fd internally
+  for (const auto &[owner, fd, reached_replicas] : to_wakeup) {
+    auto reply = redis::Integer(reached_replicas);
+    auto s = owner->Reply(fd, reply);
+    if (s.IsOK()) {
+      std::ignore = owner->EnableWriteEvent(fd);
+    }
+    // Note: Connection might already be closed, but counter must still be decremented
+    DecrBlockedClientNum();
   }
 }
 

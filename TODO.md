@@ -60,6 +60,9 @@ Deadlock unmöglich wenn Reihenfolge konsistent eingehalten.
 LEARNING - Copy-then-Reply bei Fan-Out:
 Bei Broadcast (PUBLISH, MONITOR): Empfänger-Liste unter Lock kopieren,
 Lock releasen, DANN Reply senden. Verhindert Lock-Hold während I/O.
+WICHTIG: Nur `(Worker*, fd)` kopieren, NICHT `Connection*` - Connection kann nach
+Lock-Release gelöscht werden (Use-After-Free). `Worker::Reply(fd, msg)` und
+`Worker::EnableWriteEvent(fd)` validieren fd intern → sicher.
 
 LEARNING - GetOrCreate Race Condition:
 FALSCH: `GetOrCreate()` → return raw pointer → caller nutzt pointer
@@ -148,10 +151,10 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 - [x] **AUTH in MULTI** - `no-multi` Flag hinzugefügt (`cmd_server.cc:1575`)
 
 **Hohe Priorität - Noisy-Neighbor Locking:**
-- [ ] **I/O unter Lock entfernen** - Copy-then-Reply Pattern
-  - [ ] `WakeupBlockingConns()` (server.cc:819-840) - Lock releasen vor `EnableWriteEvent()`
-  - [ ] `OnEntryAddedToStream()` (server.cc:842-868) - Lock releasen vor `EnableWriteEvent()`
-  - [ ] `WakeupWaitConnections()` (server.cc:888-912) - Lock releasen vor `Reply()` + `EnableWriteEvent()`
+- [x] **I/O unter Lock entfernen** - Copy-then-Reply Pattern
+  - [x] `WakeupBlockingConns()` - `vector<pair<Worker*, fd>>` sammeln, Lock lösen, EnableWriteEvent
+  - [x] `OnEntryAddedToStream()` - `vector<pair<Worker*, fd>>` sammeln, Lock lösen, EnableWriteEvent
+  - [x] `WakeupWaitConnections()` - `vector<tuple<Worker*, fd, replicas>>`, Worker::Reply statt Connection::Reply
 - [ ] **db_job_mu_ globaler Mutex** (server.h:433)
   - Problem: Ein Tenant's COMPACT (Minuten) blockiert alle anderen DB-Jobs
   - Option A: Aufteilen in `compaction_mu_`, `bgsave_mu_`, `scan_mu_`
