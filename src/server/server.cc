@@ -705,12 +705,22 @@ void Server::ListSChannelSubscribeNum(const std::vector<std::string> &channels,
 }
 
 void Server::BlockOnKey(const std::string &key, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
+  // Use unique_lock since we may need to create the namespace entry
+  std::unique_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
 
-  if (auto iter = blocking_keys_.find(key); iter == blocking_keys_.end()) {
-    blocking_keys_.emplace(key, std::list<ConnContext>{conn_ctx});
+  // Get or create namespace entry (inline to avoid race condition)
+  auto it = blocking_keys_by_ns_.find(ns);
+  if (it == blocking_keys_by_ns_.end()) {
+    it = blocking_keys_by_ns_.emplace(ns, std::make_unique<NamespaceBlockingKeys>()).first;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+
+  if (auto iter = it->second->keys.find(key); iter == it->second->keys.end()) {
+    it->second->keys.emplace(key, std::list<ConnContext>{conn_ctx});
   } else {
     iter->second.emplace_back(conn_ctx);
   }
@@ -719,10 +729,17 @@ void Server::BlockOnKey(const std::string &key, redis::Connection *conn) {
 }
 
 void Server::UnblockOnKey(const std::string &key, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto iter = blocking_keys_.find(key);
-  if (iter == blocking_keys_.end()) {
+  std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
+  auto it = blocking_keys_by_ns_.find(ns);
+  if (it == blocking_keys_by_ns_.end()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto iter = it->second->keys.find(key);
+  if (iter == it->second->keys.end()) {
     return;
   }
 
@@ -730,7 +747,7 @@ void Server::UnblockOnKey(const std::string &key, redis::Connection *conn) {
     if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
-        blocking_keys_.erase(iter);
+        it->second->keys.erase(iter);
       }
       break;
     }
@@ -741,16 +758,26 @@ void Server::UnblockOnKey(const std::string &key, redis::Connection *conn) {
 
 void Server::BlockOnStreams(const std::vector<std::string> &keys, const std::vector<redis::StreamEntryID> &entry_ids,
                             redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(blocked_stream_consumers_mu_);
+  const std::string &ns = conn->GetNamespace();
 
+  // Use unique_lock since we may need to create the namespace entry
+  std::unique_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
+
+  // Get or create namespace entry (inline to avoid race condition)
+  auto it = stream_consumers_by_ns_.find(ns);
+  if (it == stream_consumers_by_ns_.end()) {
+    it = stream_consumers_by_ns_.emplace(ns, std::make_unique<NamespaceStreamConsumers>()).first;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
   IncrBlockedClientNum();
 
   for (size_t i = 0; i < keys.size(); ++i) {
-    auto consumer = std::make_shared<StreamConsumer>(conn->Owner(), conn->GetFD(), conn->GetNamespace(), entry_ids[i]);
-    if (auto iter = blocked_stream_consumers_.find(keys[i]); iter == blocked_stream_consumers_.end()) {
+    auto consumer = std::make_shared<StreamConsumer>(conn->Owner(), conn->GetFD(), ns, entry_ids[i]);
+    if (auto iter = it->second->consumers.find(keys[i]); iter == it->second->consumers.end()) {
       std::set<std::shared_ptr<StreamConsumer>> consumers;
       consumers.insert(consumer);
-      blocked_stream_consumers_.emplace(keys[i], consumers);
+      it->second->consumers.emplace(keys[i], consumers);
     } else {
       iter->second.insert(consumer);
     }
@@ -758,35 +785,47 @@ void Server::BlockOnStreams(const std::vector<std::string> &keys, const std::vec
 }
 
 void Server::UnblockOnStreams(const std::vector<std::string> &keys, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(blocked_stream_consumers_mu_);
+  const std::string &ns = conn->GetNamespace();
 
+  std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
+  auto it = stream_consumers_by_ns_.find(ns);
+  if (it == stream_consumers_by_ns_.end()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
   DecrBlockedClientNum();
 
   for (const auto &key : keys) {
-    auto iter = blocked_stream_consumers_.find(key);
-    if (iter == blocked_stream_consumers_.end()) {
+    auto iter = it->second->consumers.find(key);
+    if (iter == it->second->consumers.end()) {
       continue;
     }
 
-    for (auto it = iter->second.begin(); it != iter->second.end();) {
-      const auto &consumer = *it;
+    for (auto consumer_it = iter->second.begin(); consumer_it != iter->second.end();) {
+      const auto &consumer = *consumer_it;
       if (conn->GetFD() == consumer->fd && conn->Owner() == consumer->owner) {
-        iter->second.erase(it);
+        iter->second.erase(consumer_it);
         if (iter->second.empty()) {
-          blocked_stream_consumers_.erase(iter);
+          it->second->consumers.erase(iter);
         }
         break;
       }
-      ++it;
+      ++consumer_it;
     }
   }
 }
 
-void Server::WakeupBlockingConns(const std::string &key, size_t n_conns) {
-  std::lock_guard<std::mutex> guard(blocking_keys_mu_);
+void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, size_t n_conns) {
+  std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
+  auto it = blocking_keys_by_ns_.find(ns);
+  if (it == blocking_keys_by_ns_.end()) {
+    return;
+  }
 
-  auto iter = blocking_keys_.find(key);
-  if (iter == blocking_keys_.end() || iter->second.empty()) {
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto iter = it->second->keys.find(key);
+  if (iter == it->second->keys.end() || iter->second.empty()) {
     return;
   }
 
@@ -801,16 +840,22 @@ void Server::WakeupBlockingConns(const std::string &key, size_t n_conns) {
 }
 
 void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id) {
-  std::lock_guard<std::mutex> guard(blocked_stream_consumers_mu_);
+  std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
+  auto ns_it = stream_consumers_by_ns_.find(ns);
+  if (ns_it == stream_consumers_by_ns_.end()) {
+    return;
+  }
 
-  auto iter = blocked_stream_consumers_.find(key);
-  if (iter == blocked_stream_consumers_.end() || iter->second.empty()) {
+  std::lock_guard<std::mutex> guard(ns_it->second->mu);
+  auto iter = ns_it->second->consumers.find(key);
+  if (iter == ns_it->second->consumers.end() || iter->second.empty()) {
     return;
   }
 
   for (auto it = iter->second.begin(); it != iter->second.end();) {
     auto consumer = *it;
-    if (consumer->ns == ns && entry_id > consumer->last_consumed_id) {
+    // No need to check consumer->ns == ns since we already filtered by namespace
+    if (entry_id > consumer->last_consumed_id) {
       auto s = consumer->owner->EnableWriteEvent(consumer->fd);
       if (!s.IsOK()) {
         error("[server] Failed to enable write event on blocked stream consumer {}: {}", consumer->fd, s.Msg());
@@ -819,6 +864,17 @@ void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key,
     } else {
       ++it;
     }
+  }
+}
+
+void Server::CleanupBlockingNamespace(const std::string &ns) {
+  {
+    std::unique_lock<std::shared_mutex> lock(blocking_keys_ns_mu_);
+    blocking_keys_by_ns_.erase(ns);
+  }
+  {
+    std::unique_lock<std::shared_mutex> lock(stream_consumers_ns_mu_);
+    stream_consumers_by_ns_.erase(ns);
   }
 }
 
@@ -954,22 +1010,26 @@ int Server::GetBlockedClientsCount(redis::Connection *self) {
   const std::string &ns = self->GetNamespace();
   int count = 0;
 
-  // 1. blocking_keys_ (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP)
+  // 1. blocking_keys (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP)
   {
-    std::lock_guard<std::mutex> guard(blocking_keys_mu_);
-    for (const auto &[key, contexts] : blocking_keys_) {
-      for (const auto &ctx : contexts) {
-        if (ctx.ns == ns) count++;
+    std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
+    auto it = blocking_keys_by_ns_.find(ns);
+    if (it != blocking_keys_by_ns_.end()) {
+      std::lock_guard<std::mutex> guard(it->second->mu);
+      for (const auto &[key, contexts] : it->second->keys) {
+        count += static_cast<int>(contexts.size());
       }
     }
   }
 
-  // 2. blocked_stream_consumers_ (XREAD BLOCK)
+  // 2. stream_consumers (XREAD BLOCK, XREADGROUP BLOCK)
   {
-    std::lock_guard<std::mutex> guard(blocked_stream_consumers_mu_);
-    for (const auto &[key, consumers] : blocked_stream_consumers_) {
-      for (const auto &consumer : consumers) {
-        if (consumer->ns == ns) count++;
+    std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
+    auto it = stream_consumers_by_ns_.find(ns);
+    if (it != stream_consumers_by_ns_.end()) {
+      std::lock_guard<std::mutex> guard(it->second->mu);
+      for (const auto &[key, consumers] : it->second->consumers) {
+        count += static_cast<int>(consumers.size());
       }
     }
   }

@@ -78,7 +78,7 @@ class CommandZAdd : public Commander {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    srv->WakeupBlockingConns(args_[1], member_scores_.size());
+    srv->WakeupBlockingConns(conn->GetNamespace(), args_[1], member_scores_.size());
 
     if (flags_.HasIncr()) {
       auto new_score = member_scores_[0].score;

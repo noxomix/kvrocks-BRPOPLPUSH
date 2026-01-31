@@ -101,8 +101,9 @@ class CommandNamespace : public Commander {
     } else if (args_.size() == 3 && sub_command == "del") {
       Status s = srv->GetNamespace()->Del(args_[2]);
       if (s.IsOK()) {
-        // Cleanup PubSub subscriptions for deleted namespace (tenant isolation)
+        // Cleanup per-namespace resources for deleted namespace (tenant isolation)
         srv->CleanupPubSubNamespace(args_[2]);
+        srv->CleanupBlockingNamespace(args_[2]);
       }
       *output = s.IsOK() ? redis::RESP_OK : redis::Error(s);
       warn("Deleted namespace: {}, addr: {}, result: {}", args_[2], conn->GetAddr(), s.Msg());

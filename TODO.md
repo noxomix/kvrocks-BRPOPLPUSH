@@ -46,6 +46,39 @@ LEARNING - Per-Namespace Sharding bei globalen Mutexen:
 Globale Mutexe die von allen Tenants genutzt werden (blocking_keys_mu_, blocked_stream_consumers_mu_)
 müssen durch per-Namespace Strukturen ersetzt werden: `unordered_map<ns, unique_ptr<NamespaceStruct>>`
 mit shared_mutex für Lookup + mutex pro Namespace. Pattern: GetOrCreate() bei Block, Cleanup bei NS-Delete.
+
+PATTERN - Nested Map für Per-Namespace Datenstrukturen:
+Struktur: `unordered_map<ns, unique_ptr<NamespaceStruct>>` + `shared_mutex` für Map-Zugriff.
+shared_lock für Lookup (parallel), unique_lock nur bei Create/Delete.
+Eigener mutex pro Namespace-Struct → Tenants blockieren sich nicht gegenseitig.
+
+LEARNING - Lock-Reihenfolge bei Nested Structures:
+IMMER: 1. Outer Map Lock → 2. Inner Struct Lock. Niemals umgekehrt.
+Subscribe/Create braucht unique_lock auf Outer, Query nur shared_lock.
+Deadlock unmöglich wenn Reihenfolge konsistent eingehalten.
+
+LEARNING - Copy-then-Reply bei Fan-Out:
+Bei Broadcast (PUBLISH, MONITOR): Empfänger-Liste unter Lock kopieren,
+Lock releasen, DANN Reply senden. Verhindert Lock-Hold während I/O.
+
+LEARNING - GetOrCreate Race Condition:
+FALSCH: `GetOrCreate()` → return raw pointer → caller nutzt pointer
+RICHTIG: Lock halten während gesamter Operation (inline GetOrCreate)
+Grund: Zwischen return und Nutzung könnte Cleanup den Pointer invalidieren.
+
+LEARNING - Replication benötigt Namespace im Key:
+RocksDB-Key: `ComposeNamespaceKey(ns, data)` → Format: `<1-byte ns_len><namespace><data>`
+Replica extrahiert mit `ExtractNamespaceKey()` → korrekte Tenant-Zuordnung.
+User-sichtbarer Name bleibt unverändert (kein Prefix sichtbar).
+
+LEARNING - Destruktor muss Subscriptions/Registrierungen aufräumen:
+Connection::~Connection() MUSS alle Registrierungen entfernen (UnsubscribeAll etc.)
+Sonst: Stale Einträge in Maps → Zugriff auf geschlossene FDs/invalidierte Objekte.
+
+KONZEPT - Admin-Verhalten differenzieren:
+Maintenance-Commands (COMPACT, FLUSHALL, DEBUG): Admin = global
+Daten-Commands (PUBSUB, normale Keys): Admin = normaler Tenant (default namespace)
+Konsistenz wichtiger als Convenience.
 }
 
 ---
@@ -103,32 +136,31 @@ mit shared_mutex für Lookup + mutex pro Namespace. Pattern: GetOrCreate() bei B
 - [x] Storage::Write() TOCTOU - WorkExclusivityGuard schützt
 
 **Niedrige Priorität:**
-- [ ] SELECT (Logical Databases) - Ist No-Op, evtl. Key-Prefix pro DB
+- [ ] SELECT (Logical Databases) - Ist No-Op, evtl. workround indem man "sub tnenats" implementiert (also namespace zB <ns> + "2" oder so und dann set logic und überprüfung)
 - [ ] COMPACT kompaktiert Propagate CF nicht für Tenants (Background-Compaction macht's)
 - [ ] COMPACT globales Lock - Noisy-Neighbor möglich, aber selten/manuell
 - [ ] MONITOR globales Lock - O(n_workers) Locks pro Command wenn aktiv, Reply() unter Lock
-- [ ] **Blocking Mutex Namespace-Isolation** (~150-200 Zeilen) - Noisy-Neighbor bei BLPOP/XREAD BLOCK
-  - [ ] Phase 1: Datenstrukturen (server.h)
-    - [ ] `NamespaceBlockingKeys` struct (mutex + keys Map)
-    - [ ] `NamespaceStreamConsumers` struct (mutex + consumers Map)
-    - [ ] `blocking_keys_by_ns_` + `stream_consumers_by_ns_` Maps mit shared_mutex
-    - [ ] `GetOrCreateBlockingKeys()` + `GetOrCreateStreamConsumers()` deklarieren
-  - [ ] Phase 2: Key-Blocking (server.cc)
-    - [ ] `BlockOnKey()` - GetOrCreate + NS-Lock
-    - [ ] `UnblockOnKey()` - NS-Lookup + NS-Lock
-    - [ ] `WakeupBlockingConns()` - ns Parameter hinzufügen
-  - [ ] Phase 3: Stream-Blocking (server.cc)
-    - [ ] `BlockOnStreams()` - GetOrCreate + NS-Lock
-    - [ ] `UnblockOnStreams()` - NS-Lookup + NS-Lock
-    - [ ] `OnEntryAddedToStream()` - NS-Lookup (ns bereits Parameter)
-  - [ ] Phase 4: Caller-Anpassungen
-    - [ ] cmd_list.cc: WakeupBlockingConns mit ns
-    - [ ] cmd_zset.cc: WakeupBlockingConns mit ns
-  - [ ] Phase 5: Cleanup
-    - [ ] namespace.cc: `Del()` ruft `CleanupBlockingNamespace()` auf
-  - [ ] Phase 6: GetBlockedClientsCount per-NS
-  - [ ] Phase 7: Tests
-    - [ ] `blocking_isolation_test.go` - Cross-Tenant Isolation, Load Test
+- [x] **Blocking Mutex Namespace-Isolation** (~150-200 Zeilen) - Noisy-Neighbor bei BLPOP/XREAD BLOCK
+  - [x] Phase 1: Datenstrukturen (server.h)
+    - [x] `NamespaceBlockingKeys` struct (mutex + keys Map)
+    - [x] `NamespaceStreamConsumers` struct (mutex + consumers Map)
+    - [x] `blocking_keys_by_ns_` + `stream_consumers_by_ns_` Maps mit shared_mutex
+  - [x] Phase 2: Key-Blocking (server.cc)
+    - [x] `BlockOnKey()` - GetOrCreate + NS-Lock
+    - [x] `UnblockOnKey()` - NS-Lookup + NS-Lock
+    - [x] `WakeupBlockingConns()` - ns Parameter hinzugefügt
+  - [x] Phase 3: Stream-Blocking (server.cc)
+    - [x] `BlockOnStreams()` - GetOrCreate + NS-Lock
+    - [x] `UnblockOnStreams()` - NS-Lookup + NS-Lock
+    - [x] `OnEntryAddedToStream()` - NS-Lookup (ns bereits Parameter)
+  - [x] Phase 4: Caller-Anpassungen
+    - [x] cmd_list.cc: WakeupBlockingConns mit ns
+    - [x] cmd_zset.cc: WakeupBlockingConns mit ns
+  - [x] Phase 5: Cleanup
+    - [x] cmd_server.cc: `NAMESPACE DEL` ruft `CleanupBlockingNamespace()` auf
+  - [x] Phase 6: GetBlockedClientsCount per-NS
+  - [x] Phase 7: Tests
+    - [x] `blocking_isolation_test.go` - Cross-Tenant Isolation (Tests: `blocking_isolation_test.go`)
 
 ---
 

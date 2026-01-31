@@ -107,6 +107,20 @@ struct NamespacePubSub {
   std::map<std::string, std::list<ConnContext>> patterns;
 };
 
+// Per-namespace blocking keys isolation (BLPOP, BRPOP, BLMOVE, BLMPOP, BZPOPMIN, BZPOPMAX, BZMPOP)
+// Prevents noisy-neighbor effects from global mutex contention
+struct NamespaceBlockingKeys {
+  std::mutex mu;
+  std::map<std::string, std::list<ConnContext>> keys;  // key -> blocked connections
+};
+
+// Per-namespace stream consumers isolation (XREAD BLOCK, XREADGROUP BLOCK)
+// Prevents noisy-neighbor effects from global mutex contention
+struct NamespaceStreamConsumers {
+  std::mutex mu;
+  std::map<std::string, std::set<std::shared_ptr<StreamConsumer>>> consumers;  // stream -> consumers
+};
+
 // CURSOR_DICT_SIZE must be 2^n where n <= 16
 constexpr const size_t CURSOR_DICT_SIZE = 1024 * 16;
 static_assert((CURSOR_DICT_SIZE & (CURSOR_DICT_SIZE - 1)) == 0, "CURSOR_DICT_SIZE must be 2^n");
@@ -240,8 +254,9 @@ class Server {
   void BlockOnStreams(const std::vector<std::string> &keys, const std::vector<redis::StreamEntryID> &entry_ids,
                       redis::Connection *conn);
   void UnblockOnStreams(const std::vector<std::string> &keys, redis::Connection *conn);
-  void WakeupBlockingConns(const std::string &key, size_t n_conns);
+  void WakeupBlockingConns(const std::string &ns, const std::string &key, size_t n_conns);
   void OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id);
+  void CleanupBlockingNamespace(const std::string &ns);
 
   // WAIT command infrastructure
   void BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target_seq, uint64_t num_replicas);
@@ -434,13 +449,16 @@ class Server {
   // Shard PubSub (low priority, not currently used)
   std::vector<std::map<std::string, std::list<ConnContext>>> pubsub_shard_channels_;
   std::mutex pubsub_shard_channels_mu_;
-  std::map<std::string, std::list<ConnContext>> blocking_keys_;
-  std::mutex blocking_keys_mu_;
+
+  // Per-namespace blocking keys for tenant isolation (BLPOP, BRPOP, etc.)
+  mutable std::shared_mutex blocking_keys_ns_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespaceBlockingKeys>> blocking_keys_by_ns_;
+
+  // Per-namespace stream consumers for tenant isolation (XREAD BLOCK, XREADGROUP BLOCK)
+  mutable std::shared_mutex stream_consumers_ns_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespaceStreamConsumers>> stream_consumers_by_ns_;
 
   std::atomic<int> blocked_clients_{0};
-
-  std::mutex blocked_stream_consumers_mu_;
-  std::map<std::string, std::set<std::shared_ptr<StreamConsumer>>> blocked_stream_consumers_;
 
   // WAIT command blocking infrastructure
   struct WaitContext {

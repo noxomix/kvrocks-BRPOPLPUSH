@@ -52,7 +52,7 @@ class CommandPush : public Commander {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    srv->WakeupBlockingConns(args_[1], elems.size());
+    srv->WakeupBlockingConns(conn->GetNamespace(), args_[1], elems.size());
 
     *output = redis::Integer(ret);
     return Status::OK();
