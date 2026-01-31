@@ -64,6 +64,24 @@ WICHTIG: Nur `(Worker*, fd)` kopieren, NICHT `Connection*` - Connection kann nac
 Lock-Release gelöscht werden (Use-After-Free). `Worker::Reply(fd, msg)` und
 `Worker::EnableWriteEvent(fd)` validieren fd intern → sicher.
 
+KONZEPT - Per-NS Singleton statt Per-Worker:
+Wenn Daten per-Namespace gruppiert sind (MONITOR, PubSub), zentrale Struktur nutzen
+statt auf alle Worker zu verteilen. Vorteile:
+- O(1) statt O(n_workers) Lock-Akquisitionen pro Operation
+- Namespace-Isolation by-design (kein nachträglicher Filter nötig)
+- Cleanup bei Namespace-Delete trivial (eine Map löschen)
+Pattern: `unordered_map<ns, unique_ptr<NamespaceStruct>>` mit shared_mutex.
+
+LEARNING - CanMigrate für spezielle Connection-Typen:
+Connections mit Worker-spezifischer Registrierung (MONITOR, PubSub, Blocking)
+dürfen NICHT migriert werden. `CanMigrate()` muss alle relevanten Flags prüfen.
+Nach Migration wäre die Registrierung beim alten Worker, Reply geht ins Leere.
+
+LEARNING - Idempotenz bei Registrierung:
+Commands die Connection-State ändern (MONITOR, SUBSCRIBE) können mehrfach
+aufgerufen werden. Prüfe Flag BEVOR Registrierung: `if (kMonitor) return;`
+Sonst: Doppelte Einträge, Counter-Drift, Memory-Leak.
+
 LEARNING - GetOrCreate Race Condition:
 FALSCH: `GetOrCreate()` → return raw pointer → caller nutzt pointer
 RICHTIG: Lock halten während gesamter Operation (inline GetOrCreate)
@@ -91,6 +109,11 @@ KONZEPT - Replication ist Instanz-Ebene:
 Replication (SLAVEOF/REPLICAOF) repliziert ALLE Daten der Instanz inkl. aller Namespaces.
 Full-Sync kopiert alles - korrekt by Design. Tenant-Isolation auf Infra-Ebene = separate Instanzen.
 
+KONZEPT - Full-Sync Busy-Wait ist OK:
+`works_concurrency_rw_lock_` busy-wait (1ms polling) in `PrepareRestoreDB()` betrifft nur REPLICA-Seite.
+Replica gibt während Full-Sync sowieso "LOADING" zurück → kein Noisy-Neighbor für andere Tenants.
+Full-Sync ist selten (Initial-Sync, Connection-Loss). Optimierung (Condition Variable) nicht nötig.
+
 KONZEPT - EVAL Scripts vs. FUNCTION Isolation:
 EVAL-Scripts: Global by SHA gecached (`f_{sha}`), aber Ausführung namespace-aware (redis.call nutzt conn->GetNamespace()).
 FUNCTION: Vollständig per-NS isoliert (`<ns>_<lib>`), LuaResetNamespace() für Cleanup.
@@ -108,6 +131,13 @@ AUTH während MULTI ist ein Bug - Commands nach AUTH in der Transaction laufen i
 Namespace. Fix: AUTH braucht `no-multi` Flag.
 AUTH während Blocking (BLPOP etc.) ist KEIN Problem - Read-Callback ist nullptr während
 Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
+
+KONZEPT - WATCH Mutex niedrige Priorität:
+`watched_key_mutex_` ist global, aber WATCH ist in der Praxis sehr selten (<1% der Connections).
+Grund: Moderne Apps nutzen Lua Scripts oder atomare Commands (INCR, HINCRBY, etc.) statt WATCH.
+Typische Workloads (Caching, Sessions, Queues wie Laravel Queue, Pub/Sub) nutzen kein WATCH.
+Falls `watched_key_size_ == 0` → Early-Exit, kein Lock. Per-Namespace Sharding nur nötig
+falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 }
 
 ---
@@ -117,7 +147,7 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 **Commands tenant-aware:**
 - [x] PUB/SUB Tenant-Isolation (Vollständig: Datenstruktur, Subscribe/Unsubscribe, Publish, Info-Commands, Cleanup, Persistence, Tests)
 - [x] Shard PubSub Namespace-Isolation (SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH)
-- [x] MONITOR - Tenant sieht nur eigene, Admin alle
+- [x] MONITOR - Per-NS Singleton, O(1) statt O(n_workers), Copy-then-Reply (Tests: `monitor_isolation_test.go`)
 - [x] CLIENT LIST/KILL - Nur eigene Connections (Tests: `client_isolation_test.go`)
 - [x] SLOWLOG - Nur eigene Queries (Tests: `slowlog_test.go`)
 - [x] DBSIZE, INFO keyspace - Namespace-aware
@@ -142,6 +172,7 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 - [x] Doppelte `GetNamespace()`-Aufrufe eliminiert durch Caching
 - [x] `WakeupBlockingConns` - `std::move` statt Kopie (`server.cc:833`)
 - [x] `PublishMessage` - `pair<Worker*, int>` statt ConnContext (`server.cc:449-472`)
+- [x] `FeedMonitorConns` - Per-NS Singleton mit O(1) Lookup, Copy-then-Reply (`server.cc:433-475`)
 
 ---
 
@@ -158,10 +189,8 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 - [x] **db_job_mu_ globaler Mutex** - COMPACT admin-only (`cmd_server.cc:1603`)
   - Analyse: COMPACT/BGSAVE/SCAN blockieren sich NICHT gegenseitig (verschiedene Flags)
   - Lösung: COMPACT zu admin-only (konsistent mit BGSAVE), kein Tenant kann andere blockieren
-- [ ] **works_concurrency_rw_lock_ Full-Sync** (server.h:476)
-  - Problem: Full-Sync nimmt exclusive Lock, busy-wait mit 1ms polling
-  - Option A: Condition Variable statt busy-wait
-  - Option B: Sync ohne globalen Command-Block
+- [x] **works_concurrency_rw_lock_ Full-Sync** - Nicht nötig (siehe Konstitution)
+  - Betrifft nur Replica während Full-Sync, gibt sowieso "LOADING" zurück, also voll unnötig.
 
 **Mittlere Priorität - INFO Stats:**
 - [ ] `total_connections_received` - Kumulativer Counter
@@ -172,8 +201,8 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 **Niedrige Priorität:**
 - [ ] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` oder nur kCmdAdmin
 - [ ] SELECT (Logical Databases) - Workaround mit Sub-Namespaces möglich
-- [ ] COMPACT kompaktiert Propagate CF nicht für Tenants
-- [ ] MONITOR globales Lock - O(n_workers) Locks pro Command, Reply() unter Lock
+- [x] MONITOR Per-NS Singleton - O(1) statt O(n_workers), Copy-then-Reply, Tests: `monitor_isolation_test.go`
+- [LATER] WATCH globaler Mutex - Per-NS Sharding (nur falls WATCH intensiv genutzt, unwahrscheinlich)
 
 ---
 

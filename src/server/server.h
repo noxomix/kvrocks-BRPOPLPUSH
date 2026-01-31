@@ -121,6 +121,13 @@ struct NamespaceStreamConsumers {
   std::map<std::string, std::set<std::shared_ptr<StreamConsumer>>> consumers;  // stream -> consumers
 };
 
+// Per-namespace monitor clients isolation
+// Prevents O(n_workers) lock acquisitions per command
+struct NamespaceMonitors {
+  std::mutex mu;
+  std::unordered_map<int, Worker *> clients;  // fd -> Worker*
+};
+
 // CURSOR_DICT_SIZE must be 2^n where n <= 16
 constexpr const size_t CURSOR_DICT_SIZE = 1024 * 16;
 static_assert((CURSOR_DICT_SIZE & (CURSOR_DICT_SIZE - 1)) == 0, "CURSOR_DICT_SIZE must be 2^n");
@@ -226,6 +233,8 @@ class Server {
   void CleanupExitedSlaves();
   bool IsSlave() const { return !master_host_.empty(); }
   void FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens);
+  void RegisterMonitorClient(const std::string &ns, Worker *worker, int fd);
+  void UnregisterMonitorClient(const std::string &ns, int fd);
   static std::vector<std::string> RedactSensitiveTokens(const std::vector<std::string> &tokens);
   void IncrFetchFileThread() { fetch_file_threads_num_++; }
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
@@ -243,6 +252,8 @@ class Server {
 
   // PubSub namespace management
   void CleanupPubSubNamespace(const std::string &ns);
+  // Monitor namespace management
+  void CleanupMonitorNamespace(const std::string &ns);
   void SSubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
   void SUnsubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
   void GetSChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels);
@@ -457,6 +468,10 @@ class Server {
   // Per-namespace stream consumers for tenant isolation (XREAD BLOCK, XREADGROUP BLOCK)
   mutable std::shared_mutex stream_consumers_ns_mu_;
   std::unordered_map<std::string, std::unique_ptr<NamespaceStreamConsumers>> stream_consumers_by_ns_;
+
+  // Per-namespace monitor clients for tenant isolation (O(1) instead of O(n_workers))
+  mutable std::shared_mutex monitor_namespaces_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespaceMonitors>> monitor_namespaces_;
 
   std::atomic<int> blocked_clients_{0};
 

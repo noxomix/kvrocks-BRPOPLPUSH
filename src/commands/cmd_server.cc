@@ -104,6 +104,7 @@ class CommandNamespace : public Commander {
         // Cleanup per-namespace resources for deleted namespace (tenant isolation)
         srv->CleanupPubSubNamespace(args_[2]);
         srv->CleanupBlockingNamespace(args_[2]);
+        srv->CleanupMonitorNamespace(args_[2]);
       }
       *output = s.IsOK() ? redis::RESP_OK : redis::Error(s);
       warn("Deleted namespace: {}, addr: {}, result: {}", args_[2], conn->GetAddr(), s.Msg());

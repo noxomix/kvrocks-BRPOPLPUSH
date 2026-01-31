@@ -71,7 +71,6 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   Status Reply(int fd, const std::string &reply);
   void BecomeMonitorConn(redis::Connection *conn);
   void QuitMonitorConn(redis::Connection *conn);
-  void FeedMonitorConns(redis::Connection *conn, const std::string &response);
 
   std::string GetClientsStr(redis::Connection *self);
   void KillClient(redis::Connection *self, uint64_t id, const std::string &addr, uint64_t type, bool skipme,
@@ -113,7 +112,6 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::vector<evconnlistener *> listen_events_;
   std::mutex conns_mu_;
   std::map<int, redis::Connection *> conns_;
-  std::map<int, redis::Connection *> monitor_conns_;
   int last_iter_conn_fd_ = 0;  // fd of last processed connection in previous cron
 
   struct bufferevent_rate_limit_group *rate_limit_group_ = nullptr;

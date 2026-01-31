@@ -402,12 +402,60 @@ std::vector<std::string> Server::RedactSensitiveTokens(const std::vector<std::st
   return redacted_tokens;
 }
 
+void Server::RegisterMonitorClient(const std::string &ns, Worker *worker, int fd) {
+  {
+    std::unique_lock<std::shared_mutex> map_lock(monitor_namespaces_mu_);
+    auto it = monitor_namespaces_.find(ns);
+    if (it == monitor_namespaces_.end()) {
+      it = monitor_namespaces_.emplace(ns, std::make_unique<NamespaceMonitors>()).first;
+    }
+    std::lock_guard<std::mutex> ns_lock(it->second->mu);
+    it->second->clients.emplace(fd, worker);
+  }
+  monitor_clients_.fetch_add(1);
+}
+
+void Server::UnregisterMonitorClient(const std::string &ns, int fd) {
+  bool found = false;
+  {
+    std::shared_lock<std::shared_mutex> map_lock(monitor_namespaces_mu_);
+    auto it = monitor_namespaces_.find(ns);
+    if (it != monitor_namespaces_.end()) {
+      std::lock_guard<std::mutex> ns_lock(it->second->mu);
+      found = (it->second->clients.erase(fd) > 0);
+    }
+  }
+  if (found) {
+    monitor_clients_.fetch_sub(1);
+  }
+}
+
 void Server::FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens) {
   if (monitor_clients_ <= 0) return;
 
+  const std::string &ns = conn->GetNamespace();
+
+  // Collect monitor clients under lock
+  std::vector<std::pair<Worker *, int>> to_notify;
+  {
+    std::shared_lock<std::shared_mutex> map_lock(monitor_namespaces_mu_);
+    auto it = monitor_namespaces_.find(ns);
+    if (it != monitor_namespaces_.end()) {
+      std::lock_guard<std::mutex> ns_lock(it->second->mu);
+      for (const auto &[fd, worker] : it->second->clients) {
+        if (fd != conn->GetFD()) {  // Skip self
+          to_notify.emplace_back(worker, fd);
+        }
+      }
+    }
+  }
+
+  if (to_notify.empty()) return;
+
+  // Format output
   auto now_us = util::GetTimeStampUS();
   std::string output =
-      fmt::format("{}.{} [{} {}]", now_us / 1000000, now_us % 1000000, conn->GetNamespace(), conn->GetAddr());
+      fmt::format("{}.{} [{} {}]", now_us / 1000000, now_us % 1000000, ns, conn->GetAddr());
 
   auto redacted_tokens = RedactSensitiveTokens(tokens);
 
@@ -417,9 +465,9 @@ void Server::FeedMonitorConns(redis::Connection *conn, const std::vector<std::st
     output += "\"";
   }
 
-  for (const auto &worker_thread : worker_threads_) {
-    auto worker = worker_thread->GetWorker();
-    worker->FeedMonitorConns(conn, redis::SimpleString(output));
+  // Reply outside lock (Copy-then-Reply pattern)
+  for (const auto &[worker, fd] : to_notify) {
+    std::ignore = worker->Reply(fd, redis::SimpleString(output));
   }
 }
 
@@ -427,6 +475,17 @@ void Server::FeedMonitorConns(redis::Connection *conn, const std::vector<std::st
 void Server::CleanupPubSubNamespace(const std::string &ns) {
   std::unique_lock<std::shared_mutex> lock(pubsub_namespaces_mu_);
   pubsub_namespaces_.erase(ns);
+}
+
+// Cleanup Monitor resources when namespace is deleted
+void Server::CleanupMonitorNamespace(const std::string &ns) {
+  std::unique_lock<std::shared_mutex> lock(monitor_namespaces_mu_);
+  auto it = monitor_namespaces_.find(ns);
+  if (it != monitor_namespaces_.end()) {
+    // Adjust global counter by number of clients being removed
+    monitor_clients_.fetch_sub(static_cast<int>(it->second->clients.size()));
+    monitor_namespaces_.erase(it);
+  }
 }
 
 // Get pattern count for a specific namespace

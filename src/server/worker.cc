@@ -81,17 +81,9 @@ Worker::Worker(Server *srv, Config *config) : srv(srv), base_(event_base_new()) 
 }
 
 Worker::~Worker() {
-  std::vector<redis::Connection *> conns;
-  conns.reserve(conns_.size() + monitor_conns_.size());
-
+  // All connections (including monitors) are now in conns_
   for (const auto &iter : conns_) {
-    conns.emplace_back(iter.second);
-  }
-  for (const auto &iter : monitor_conns_) {
-    conns.emplace_back(iter.second);
-  }
-  for (const auto &iter : conns) {
-    iter->Close();
+    iter.second->Close();
   }
 
   timer_.reset();
@@ -363,14 +355,10 @@ redis::Connection *Worker::removeConnection(int fd) {
     conn = iter->second;
     conns_.erase(iter);
     srv->DecrClientNum();
-  }
-
-  iter = monitor_conns_.find(fd);
-  if (iter != monitor_conns_.end()) {
-    conn = iter->second;
-    monitor_conns_.erase(iter);
-    srv->DecrClientNum();
-    srv->DecrMonitorClientNum();
+    // Unregister from central monitor registry if this was a monitor connection
+    if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+      srv->UnregisterMonitorClient(conn->GetNamespace(), fd);
+    }
   }
 
   return conn;
@@ -437,20 +425,17 @@ void Worker::FreeConnectionByID(int fd, uint64_t id) {
   std::unique_lock<std::mutex> lock(conns_mu_);
   auto iter = conns_.find(fd);
   if (iter != conns_.end() && iter->second->GetID() == id) {
+    auto *conn = iter->second;
     if (rate_limit_group_ != nullptr) {
-      bufferevent_remove_from_rate_limit_group(iter->second->GetBufferEvent());
+      bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
     }
-    delete iter->second;
+    // Unregister from central monitor registry if this was a monitor connection
+    if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+      srv->UnregisterMonitorClient(conn->GetNamespace(), fd);
+    }
+    delete conn;
     conns_.erase(iter);
     srv->DecrClientNum();
-  }
-
-  iter = monitor_conns_.find(fd);
-  if (iter != monitor_conns_.end() && iter->second->GetID() == id) {
-    delete iter->second;
-    monitor_conns_.erase(iter);
-    srv->DecrClientNum();
-    srv->DecrMonitorClientNum();
   }
 }
 
@@ -479,35 +464,19 @@ Status Worker::Reply(int fd, const std::string &reply) {
 }
 
 void Worker::BecomeMonitorConn(redis::Connection *conn) {
-  {
-    std::lock_guard<std::mutex> guard(conns_mu_);
-    conns_.erase(conn->GetFD());
-    monitor_conns_[conn->GetFD()] = conn;
+  // Prevent double registration if MONITOR is called twice
+  if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+    return;
   }
-  srv->IncrMonitorClientNum();
+  // Connection stays in conns_, only flag changes + central registration
   conn->EnableFlag(redis::Connection::kMonitor);
+  srv->RegisterMonitorClient(conn->GetNamespace(), this, conn->GetFD());
 }
 
 void Worker::QuitMonitorConn(redis::Connection *conn) {
-  {
-    std::lock_guard<std::mutex> guard(conns_mu_);
-    monitor_conns_.erase(conn->GetFD());
-    conns_[conn->GetFD()] = conn;
-  }
-  srv->DecrMonitorClientNum();
+  // Connection stays in conns_, only flag changes + central unregistration
   conn->DisableFlag(redis::Connection::kMonitor);
-}
-
-void Worker::FeedMonitorConns(redis::Connection *conn, const std::string &response) {
-  std::unique_lock<std::mutex> lock(conns_mu_);
-
-  for (const auto &iter : monitor_conns_) {
-    if (conn == iter.second) continue;  // skip the monitor command
-
-    if (conn->GetNamespace() == iter.second->GetNamespace() || iter.second->GetNamespace() == kDefaultNamespace) {
-      iter.second->Reply(response);
-    }
-  }
+  srv->UnregisterMonitorClient(conn->GetNamespace(), conn->GetFD());
 }
 
 std::string Worker::GetClientsStr(redis::Connection *self) {
@@ -567,13 +536,10 @@ ClientCounts Worker::GetClientCounts(redis::Connection *self) {
       continue;
     }
     counts.connected++;
-  }
-  // Monitor connections
-  for (const auto &[fd, conn] : monitor_conns_) {
-    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
-      continue;
+    // Count monitor connections via flag
+    if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+      counts.monitor++;
     }
-    counts.monitor++;
   }
   return counts;
 }
