@@ -99,6 +99,14 @@ struct ChannelSubscribeNum {
   size_t subscribe_num;
 };
 
+// Per-namespace PubSub isolation to prevent cross-tenant message leakage
+// Each namespace has its own mutex + channels/patterns maps
+struct NamespacePubSub {
+  std::mutex mu;
+  std::map<std::string, std::list<ConnContext>> channels;
+  std::map<std::string, std::list<ConnContext>> patterns;
+};
+
 // CURSOR_DICT_SIZE must be 2^n where n <= 16
 constexpr const size_t CURSOR_DICT_SIZE = 1024 * 16;
 static_assert((CURSOR_DICT_SIZE & (CURSOR_DICT_SIZE - 1)) == 0, "CURSOR_DICT_SIZE must be 2^n");
@@ -209,15 +217,18 @@ class Server {
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
   int GetFetchFileThreadNum() const { return fetch_file_threads_num_; }
 
-  int PublishMessage(const std::string &channel, const std::string &msg);
+  int PublishMessage(const std::string &ns, const std::string &channel, const std::string &msg);
   void SubscribeChannel(const std::string &channel, redis::Connection *conn);
   void UnsubscribeChannel(const std::string &channel, redis::Connection *conn);
-  void GetChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels);
-  void ListChannelSubscribeNum(const std::vector<std::string> &channels,
+  void GetChannelsByPattern(const std::string &ns, const std::string &pattern, std::vector<std::string> *channels);
+  void ListChannelSubscribeNum(const std::string &ns, const std::vector<std::string> &channels,
                                std::vector<ChannelSubscribeNum> *channel_subscribe_nums);
   void PSubscribeChannel(const std::string &pattern, redis::Connection *conn);
   void PUnsubscribeChannel(const std::string &pattern, redis::Connection *conn);
-  size_t GetPubSubPatternSize() const { return pubsub_patterns_.size(); }
+  size_t GetPubSubPatternSize(const std::string &ns) const;
+
+  // PubSub namespace management
+  void CleanupPubSubNamespace(const std::string &ns);
   void SSubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
   void SUnsubscribeChannel(const std::string &channel, redis::Connection *conn, uint16_t slot);
   void GetSChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels);
@@ -416,9 +427,11 @@ class Server {
   LogCollector<SlowEntry> slow_log_;
   LogCollector<PerfEntry> perf_log_;
 
-  std::map<std::string, std::list<ConnContext>> pubsub_channels_;
-  std::map<std::string, std::list<ConnContext>> pubsub_patterns_;
-  std::mutex pubsub_channels_mu_;
+  // Per-namespace PubSub for tenant isolation (prevents cross-tenant message leakage)
+  mutable std::shared_mutex pubsub_namespaces_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespacePubSub>> pubsub_namespaces_;
+
+  // Shard PubSub (low priority, not currently used)
   std::vector<std::map<std::string, std::list<ConnContext>>> pubsub_shard_channels_;
   std::mutex pubsub_shard_channels_mu_;
   std::map<std::string, std::list<ConnContext>> blocking_keys_;

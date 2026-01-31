@@ -41,6 +41,11 @@ LEARNING - Blocking-Structs brauchen Namespace:
 Wenn Blocking-Datenstrukturen (ConnContext, StreamConsumer, WaitContext) für tenant-aware Zählung genutzt werden,
 muss der Namespace zum Zeitpunkt des Blockings gespeichert werden. Blocking-Commands erfordern Auth,
 daher ist GetNamespace() immer verfügbar. Zählung erfolgt on-demand bei INFO, nicht im Hot-Path.
+
+LEARNING - Per-Namespace Sharding bei globalen Mutexen:
+Globale Mutexe die von allen Tenants genutzt werden (blocking_keys_mu_, blocked_stream_consumers_mu_)
+müssen durch per-Namespace Strukturen ersetzt werden: `unordered_map<ns, unique_ptr<NamespaceStruct>>`
+mit shared_mutex für Lookup + mutex pro Namespace. Pattern: GetOrCreate() bei Block, Cleanup bei NS-Delete.
 }
 
 ---
@@ -48,8 +53,33 @@ daher ist GetNamespace() immer verfügbar. Zählung erfolgt on-demand bei INFO, 
 ## Tasks
 
 **Commands tenant-aware:**
-- [ ] MONITOR - Nur eigene Commands zeigen
-- [ ] PUB/SUB - Namespace-Isolation (SUBSCRIBE, PUBLISH, PUBSUB CHANNELS etc.)
+- [x] **PUB/SUB Tenant-Isolation** - Vollständige Isolation, Admin = normaler Tenant
+  - [x] Phase 1: Datenstruktur (server.h)
+    - [x] `NamespacePubSub` struct (mutex + channels + patterns Maps)
+    - [x] `pubsub_namespaces_` Map mit shared_mutex
+    - [x] `CleanupPubSubNamespace()` deklarieren
+  - [x] Phase 2: Subscribe/Unsubscribe (server.cc)
+    - [x] `SubscribeChannel()` - unique_lock + inline GetOrCreate
+    - [x] `UnsubscribeChannel()` - NS-Lookup + NS-Lock
+    - [x] `PSubscribeChannel()` - unique_lock + inline GetOrCreate
+    - [x] `PUnsubscribeChannel()` - NS-Lookup + NS-Lock
+  - [x] Phase 3: Publish (server.cc)
+    - [x] `PublishMessage()` - NS-Lookup, Pattern-Match nur eigene, Reply außerhalb Lock
+  - [x] Phase 4: Info-Commands
+    - [x] `GetChannelsByPattern()` - Nur eigene NS (Admin = normaler Tenant)
+    - [x] `ListChannelSubscribeNum()` - Nur eigene NS (Admin = normaler Tenant)
+    - [x] `GetPubSubPatternSize()` - Namespace-Parameter (Admin = normaler Tenant)
+    - [x] cmd_pubsub.cc: PUBSUB CHANNELS/NUMSUB/NUMPAT namespace-aware
+    - [x] INFO pubsub_channels/patterns: Nur eigene NS
+  - [x] Phase 5: Cleanup
+    - [x] cmd_server.cc: `NAMESPACE DEL` ruft `CleanupPubSubNamespace()` auf
+  - [x] Phase 6: Persistence (RocksDB)
+    - [x] redis_pubsub.cc: `ComposeNamespaceKey()` für Replication
+    - [x] replication.cc: `ExtractNamespaceKey()` beim Empfang
+  - [x] Phase 7: Tests
+    - [x] `pubsub_isolation_test.go` - Cross-Tenant, Same-NS, Pattern, PUBSUB CHANNELS/NUMSUB/NUMPAT
+  - [ ] SPÄTER: Shard PubSub (SSUBSCRIBE etc.) - wird vorerst nicht genutzt
+- [x] MONITOR - Bereits namespace-aware (Tenant sieht nur eigene, Admin alle)
 - [x] CLIENT LIST/KILL - Nur eigene Connections (Tests: `client_isolation_test.go`)
 - [x] SLOWLOG - Nur eigene Queries (Tests: `slowlog_test.go`)
 - [x] DBSIZE, INFO keyspace - Bereits namespace-aware
@@ -76,10 +106,33 @@ daher ist GetNamespace() immer verfügbar. Zählung erfolgt on-demand bei INFO, 
 - [ ] SELECT (Logical Databases) - Ist No-Op, evtl. Key-Prefix pro DB
 - [ ] COMPACT kompaktiert Propagate CF nicht für Tenants (Background-Compaction macht's)
 - [ ] COMPACT globales Lock - Noisy-Neighbor möglich, aber selten/manuell
+- [ ] MONITOR globales Lock - O(n_workers) Locks pro Command wenn aktiv, Reply() unter Lock
+- [ ] **Blocking Mutex Namespace-Isolation** (~150-200 Zeilen) - Noisy-Neighbor bei BLPOP/XREAD BLOCK
+  - [ ] Phase 1: Datenstrukturen (server.h)
+    - [ ] `NamespaceBlockingKeys` struct (mutex + keys Map)
+    - [ ] `NamespaceStreamConsumers` struct (mutex + consumers Map)
+    - [ ] `blocking_keys_by_ns_` + `stream_consumers_by_ns_` Maps mit shared_mutex
+    - [ ] `GetOrCreateBlockingKeys()` + `GetOrCreateStreamConsumers()` deklarieren
+  - [ ] Phase 2: Key-Blocking (server.cc)
+    - [ ] `BlockOnKey()` - GetOrCreate + NS-Lock
+    - [ ] `UnblockOnKey()` - NS-Lookup + NS-Lock
+    - [ ] `WakeupBlockingConns()` - ns Parameter hinzufügen
+  - [ ] Phase 3: Stream-Blocking (server.cc)
+    - [ ] `BlockOnStreams()` - GetOrCreate + NS-Lock
+    - [ ] `UnblockOnStreams()` - NS-Lookup + NS-Lock
+    - [ ] `OnEntryAddedToStream()` - NS-Lookup (ns bereits Parameter)
+  - [ ] Phase 4: Caller-Anpassungen
+    - [ ] cmd_list.cc: WakeupBlockingConns mit ns
+    - [ ] cmd_zset.cc: WakeupBlockingConns mit ns
+  - [ ] Phase 5: Cleanup
+    - [ ] namespace.cc: `Del()` ruft `CleanupBlockingNamespace()` auf
+  - [ ] Phase 6: GetBlockedClientsCount per-NS
+  - [ ] Phase 7: Tests
+    - [ ] `blocking_isolation_test.go` - Cross-Tenant Isolation, Load Test
 
 ---
 
 //für mich selber, claude bitte hier erst ignorieren: {
     eine conneciton kann glaube ich den namespace wechseln indem man wieder auth schickt. Bin mir nicht sicher ob alle commands global das bedenken bzw bei block counter oder
     so könnte es sein, dass  es nur wenn nch kein namespace gestzt istder ns im Conn obj gespeichert/gestzt wird. Das dringend noch prüfen.
-}
+}achso

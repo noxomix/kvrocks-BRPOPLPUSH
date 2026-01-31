@@ -422,32 +422,62 @@ void Server::FeedMonitorConns(redis::Connection *conn, const std::vector<std::st
   }
 }
 
-int Server::PublishMessage(const std::string &channel, const std::string &msg) {
+// Cleanup PubSub resources when namespace is deleted
+void Server::CleanupPubSubNamespace(const std::string &ns) {
+  std::unique_lock<std::shared_mutex> lock(pubsub_namespaces_mu_);
+  pubsub_namespaces_.erase(ns);
+}
+
+// Get pattern count for a specific namespace
+size_t Server::GetPubSubPatternSize(const std::string &ns) const {
+  std::shared_lock<std::shared_mutex> lock(pubsub_namespaces_mu_);
+
+  // Each namespace (including admin/default) sees only their own pattern count
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> ns_lock(it->second->mu);
+  return it->second->patterns.size();
+}
+
+int Server::PublishMessage(const std::string &ns, const std::string &channel, const std::string &msg) {
   int cnt = 0;
   int index = 0;
 
-  pubsub_channels_mu_.lock();
-
+  // Collect subscribers under lock, reply outside lock
   std::vector<ConnContext> to_publish_conn_ctxs;
-  if (auto iter = pubsub_channels_.find(channel); iter != pubsub_channels_.end()) {
-    for (const auto &conn_ctx : iter->second) {
-      to_publish_conn_ctxs.emplace_back(conn_ctx);
-    }
-  }
-
-  // The patterns variable records the pattern of connections
   std::vector<std::string> patterns;
   std::vector<ConnContext> to_publish_patterns_conn_ctxs;
-  for (const auto &iter : pubsub_patterns_) {
-    if (util::StringMatch(iter.first, channel, false)) {
-      for (const auto &conn_ctx : iter.second) {
-        to_publish_patterns_conn_ctxs.emplace_back(conn_ctx);
-        patterns.emplace_back(iter.first);
+
+  {
+    std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+
+    // Only publish to subscribers in the same namespace (tenant isolation)
+    auto it = pubsub_namespaces_.find(ns);
+    if (it != pubsub_namespaces_.end()) {
+      std::lock_guard<std::mutex> ns_lock(it->second->mu);
+
+      // Collect channel subscribers
+      if (auto iter = it->second->channels.find(channel); iter != it->second->channels.end()) {
+        for (const auto &conn_ctx : iter->second) {
+          to_publish_conn_ctxs.emplace_back(conn_ctx);
+        }
+      }
+
+      // Collect pattern subscribers
+      for (const auto &iter : it->second->patterns) {
+        if (util::StringMatch(iter.first, channel, false)) {
+          for (const auto &conn_ctx : iter.second) {
+            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx);
+            patterns.emplace_back(iter.first);
+          }
+        }
       }
     }
   }
-  pubsub_channels_mu_.unlock();
 
+  // Reply outside lock (avoids holding lock during I/O)
   std::string channel_reply;
   channel_reply.append(redis::MultiLen(3));
   channel_reply.append(redis::BulkString("message"));
@@ -478,21 +508,40 @@ int Server::PublishMessage(const std::string &channel, const std::string &msg) {
 }
 
 void Server::SubscribeChannel(const std::string &channel, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
-  if (auto iter = pubsub_channels_.find(channel); iter == pubsub_channels_.end()) {
-    pubsub_channels_.emplace(channel, std::list<ConnContext>{conn_ctx});
+  // Use unique_lock for Subscribe since we may need to create the namespace entry.
+  // This also protects against CleanupPubSubNamespace() deleting the entry.
+  std::unique_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+
+  // Get or create namespace PubSub (inline to avoid releasing lock)
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    auto pubsub = std::make_unique<NamespacePubSub>();
+    it = pubsub_namespaces_.emplace(ns, std::move(pubsub)).first;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+  if (auto iter = it->second->channels.find(channel); iter == it->second->channels.end()) {
+    it->second->channels.emplace(channel, std::list<ConnContext>{conn_ctx});
   } else {
     iter->second.emplace_back(conn_ctx);
   }
 }
 
 void Server::UnsubscribeChannel(const std::string &channel, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto iter = pubsub_channels_.find(channel);
-  if (iter == pubsub_channels_.end()) {
+  std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto iter = it->second->channels.find(channel);
+  if (iter == it->second->channels.end()) {
     return;
   }
 
@@ -500,29 +549,47 @@ void Server::UnsubscribeChannel(const std::string &channel, redis::Connection *c
     if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
-        pubsub_channels_.erase(iter);
+        it->second->channels.erase(iter);
       }
       break;
     }
   }
 }
 
-void Server::GetChannelsByPattern(const std::string &pattern, std::vector<std::string> *channels) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+void Server::GetChannelsByPattern(const std::string &ns, const std::string &pattern, std::vector<std::string> *channels) {
+  std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
 
-  for (const auto &iter : pubsub_channels_) {
+  // Each namespace (including admin/default) sees only their own channels
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  for (const auto &iter : it->second->channels) {
     if (pattern.empty() || util::StringMatch(pattern, iter.first, false)) {
       channels->emplace_back(iter.first);
     }
   }
 }
 
-void Server::ListChannelSubscribeNum(const std::vector<std::string> &channels,
+void Server::ListChannelSubscribeNum(const std::string &ns, const std::vector<std::string> &channels,
                                      std::vector<ChannelSubscribeNum> *channel_subscribe_nums) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+  std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
 
+  // Each namespace (including admin/default) sees only their own subscriber counts
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    // No subscriptions in this namespace, return all channels with 0 count
+    for (const auto &chan : channels) {
+      channel_subscribe_nums->emplace_back(ChannelSubscribeNum{chan, 0});
+    }
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
   for (const auto &chan : channels) {
-    if (auto iter = pubsub_channels_.find(chan); iter != pubsub_channels_.end()) {
+    if (auto iter = it->second->channels.find(chan); iter != it->second->channels.end()) {
       channel_subscribe_nums->emplace_back(ChannelSubscribeNum{iter->first, iter->second.size()});
     } else {
       channel_subscribe_nums->emplace_back(ChannelSubscribeNum{chan, 0});
@@ -531,21 +598,40 @@ void Server::ListChannelSubscribeNum(const std::vector<std::string> &channels,
 }
 
 void Server::PSubscribeChannel(const std::string &pattern, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
-  if (auto iter = pubsub_patterns_.find(pattern); iter == pubsub_patterns_.end()) {
-    pubsub_patterns_.emplace(pattern, std::list<ConnContext>{conn_ctx});
+  // Use unique_lock for Subscribe since we may need to create the namespace entry.
+  // This also protects against CleanupPubSubNamespace() deleting the entry.
+  std::unique_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+
+  // Get or create namespace PubSub (inline to avoid releasing lock)
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    auto pubsub = std::make_unique<NamespacePubSub>();
+    it = pubsub_namespaces_.emplace(ns, std::move(pubsub)).first;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+  if (auto iter = it->second->patterns.find(pattern); iter == it->second->patterns.end()) {
+    it->second->patterns.emplace(pattern, std::list<ConnContext>{conn_ctx});
   } else {
     iter->second.emplace_back(conn_ctx);
   }
 }
 
 void Server::PUnsubscribeChannel(const std::string &pattern, redis::Connection *conn) {
-  std::lock_guard<std::mutex> guard(pubsub_channels_mu_);
+  const std::string &ns = conn->GetNamespace();
 
-  auto iter = pubsub_patterns_.find(pattern);
-  if (iter == pubsub_patterns_.end()) {
+  std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+  auto it = pubsub_namespaces_.find(ns);
+  if (it == pubsub_namespaces_.end()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard(it->second->mu);
+  auto iter = it->second->patterns.find(pattern);
+  if (iter == it->second->patterns.end()) {
     return;
   }
 
@@ -553,7 +639,7 @@ void Server::PUnsubscribeChannel(const std::string &pattern, redis::Connection *
     if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
-        pubsub_patterns_.erase(iter);
+        it->second->patterns.erase(iter);
       }
       break;
     }
@@ -1444,9 +1530,18 @@ Server::InfoEntries Server::GetStatsInfo(const std::string &ns, bool is_admin) {
   entries.emplace_back("keyspace_misses", db_stats->keyspace_misses.load());
 
   {
-    std::lock_guard<std::mutex> lg(pubsub_channels_mu_);
-    entries.emplace_back("pubsub_channels", pubsub_channels_.size());
-    entries.emplace_back("pubsub_patterns", pubsub_patterns_.size());
+    // Each namespace (including admin/default) sees only their own pubsub stats
+    size_t total_channels = 0;
+    size_t total_patterns = 0;
+    std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
+    auto it = pubsub_namespaces_.find(ns);
+    if (it != pubsub_namespaces_.end()) {
+      std::lock_guard<std::mutex> ns_lock(it->second->mu);
+      total_channels = it->second->channels.size();
+      total_patterns = it->second->patterns.size();
+    }
+    entries.emplace_back("pubsub_channels", total_channels);
+    entries.emplace_back("pubsub_patterns", total_patterns);
   }
 
   return entries;

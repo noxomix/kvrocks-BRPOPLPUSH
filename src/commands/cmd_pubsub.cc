@@ -27,7 +27,7 @@ namespace redis {
 
 class CommandPublish : public Commander {
  public:
-  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, [[maybe_unused]] Connection *conn,
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
                  std::string *output) override {
     if (!srv->IsSlave()) {
       // Compromise: can't replicate a message to sub-replicas in a cascading-like structure.
@@ -35,13 +35,14 @@ class CommandPublish : public Commander {
       // hence the compromise solution
       redis::PubSub pubsub_db(srv->storage);
 
-      auto s = pubsub_db.Publish(ctx, args_[1], args_[2]);
+      auto s = pubsub_db.Publish(ctx, conn->GetNamespace(), args_[1], args_[2]);
       if (!s.ok()) {
         return {Status::RedisExecErr, s.ToString()};
       }
     }
 
-    int receivers = srv->PublishMessage(args_[1], args_[2]);
+    // Publish only to subscribers in the same namespace (tenant isolation)
+    int receivers = srv->PublishMessage(conn->GetNamespace(), args_[1], args_[2]);
 
     *output = redis::Integer(receivers);
 
@@ -51,20 +52,21 @@ class CommandPublish : public Commander {
 
 class CommandMPublish : public Commander {
  public:
-  Status Execute(engine::Context &ctx, Server *srv, [[maybe_unused]] Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     int total_receivers = 0;
 
     for (size_t i = 2; i < args_.size(); i++) {
       if (!srv->IsSlave()) {
         redis::PubSub pubsub_db(srv->storage);
 
-        auto s = pubsub_db.Publish(ctx, args_[1], args_[i]);
+        auto s = pubsub_db.Publish(ctx, conn->GetNamespace(), args_[1], args_[i]);
         if (!s.ok()) {
           return {Status::RedisExecErr, s.ToString()};
         }
       }
 
-      int receivers = srv->PublishMessage(args_[1], args_[i]);
+      // Publish only to subscribers in the same namespace (tenant isolation)
+      int receivers = srv->PublishMessage(conn->GetNamespace(), args_[1], args_[i]);
       total_receivers += receivers;
     }
 
@@ -210,15 +212,19 @@ class CommandPubSub : public Commander {
   }
 
   Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
+    const std::string &ns = conn->GetNamespace();
+
     if (subcommand_ == "numpat") {
-      *output = redis::Integer(srv->GetPubSubPatternSize());
+      // Only count patterns in the caller's namespace (tenant isolation)
+      *output = redis::Integer(srv->GetPubSubPatternSize(ns));
       return Status::OK();
     }
 
     if (subcommand_ == "numsub" || subcommand_ == "shardnumsub") {
       std::vector<ChannelSubscribeNum> channel_subscribe_nums;
       if (subcommand_ == "numsub") {
-        srv->ListChannelSubscribeNum(channels_, &channel_subscribe_nums);
+        // Only count subscribers in the caller's namespace (tenant isolation)
+        srv->ListChannelSubscribeNum(ns, channels_, &channel_subscribe_nums);
       } else {
         srv->ListSChannelSubscribeNum(channels_, &channel_subscribe_nums);
       }
@@ -235,7 +241,8 @@ class CommandPubSub : public Commander {
     if (subcommand_ == "channels" || subcommand_ == "shardchannels") {
       std::vector<std::string> channels;
       if (subcommand_ == "channels") {
-        srv->GetChannelsByPattern(pattern_, &channels);
+        // Only list channels in the caller's namespace (tenant isolation)
+        srv->GetChannelsByPattern(ns, pattern_, &channels);
       } else {
         srv->GetSChannelsByPattern(pattern_, &channels);
       }

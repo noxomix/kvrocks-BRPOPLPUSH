@@ -22,12 +22,15 @@
 
 namespace redis {
 
-rocksdb::Status PubSub::Publish(engine::Context &ctx, const Slice &channel, const Slice &value) {
+rocksdb::Status PubSub::Publish(engine::Context &ctx, const Slice &ns, const Slice &channel, const Slice &value) {
   if (storage_->GetConfig()->IsSlave()) {
     return rocksdb::Status::NotSupported("can't publish to db in slave mode");
   }
+  // Use ComposeNamespaceKey to include namespace in the key for tenant isolation during replication
+  // Format: <1-byte ns_len><namespace><channel>
+  auto ns_key = ComposeNamespaceKey(ns, channel, storage_->IsSlotIdEncoded());
   auto batch = GetWriteBatchBase();
-  auto s = batch->Put(pubsub_cf_handle_, channel, value);
+  auto s = batch->Put(pubsub_cf_handle_, ns_key, value);
   if (!s.ok()) {
     return s;
   }

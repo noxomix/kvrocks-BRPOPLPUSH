@@ -46,6 +46,7 @@
 #include "server/server.h"
 #include "status.h"
 #include "storage/batch_debugger.h"
+#include "storage/redis_metadata.h"
 #include "thread_util.h"
 #include "time_util.h"
 #include "unique_fd.h"
@@ -1130,9 +1131,13 @@ Status ReplicationThread::parseWriteBatch(const rocksdb::WriteBatch &write_batch
   if (!db_status.ok()) return {Status::NotOK, "failed to iterate over write batch: " + db_status.ToString()};
 
   switch (write_batch_handler.Type()) {
-    case kBatchTypePublish:
-      srv_->PublishMessage(write_batch_handler.Key(), write_batch_handler.Value());
+    case kBatchTypePublish: {
+      // The key now contains namespace prefix for tenant isolation
+      // Format: <1-byte ns_len><namespace><channel>
+      auto [ns, channel] = ExtractNamespaceKey<std::string>(write_batch_handler.Key(), storage_->IsSlotIdEncoded());
+      srv_->PublishMessage(ns, channel, write_batch_handler.Value());
       break;
+    }
     case kBatchTypePropagate:
       if (write_batch_handler.Key() == engine::kPropagateScriptCommand) {
         std::vector<std::string> tokens = util::TokenizeRedisProtocol(write_batch_handler.Value());
