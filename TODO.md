@@ -212,21 +212,21 @@ Replication-Änderungen.
 ---
 
 **Performance-Fixes (Throughput-Regression nach Isolation-Änderungen):**
-- [ ] **KRITISCH: `GetNamespace()` gibt Kopie statt Referenz zurück**
+- [x] **KRITISCH: `GetNamespace()` gibt Kopie statt Referenz zurück**
   - Datei: `src/server/redis_connection.h:157`
   - Problem: `std::string GetNamespace() const { return ns_; }` kopiert String bei JEDEM Aufruf
   - Impact: 7-11 String-Kopien (Heap-Allokationen) pro SET-Befehl
   - Fix: `const std::string& GetNamespace() const { return ns_; }`
-- [ ] Doppelte `GetNamespace()`-Aufrufe eliminieren (nach obigem Fix weniger kritisch)
+- [x] Doppelte `GetNamespace()`-Aufrufe eliminieren (nach obigem Fix weniger kritisch)
   - `src/server/redis_connection.cc:144-145` - 2x Aufruf bei Reply
   - `src/server/redis_connection.cc:370-371` - 2x Aufruf bei Execute
   - `src/server/redis_request.cc:68-69, 109-110, 136-137` - 2x Aufrufe beim Parsen
   - Fix: `const auto& ns = GetNamespace();` einmal cachen
-- [ ] `WakeupBlockingConns` - `std::move` statt Kopie
+- [x] `WakeupBlockingConns` - `std::move` statt Kopie
   - Datei: `src/server/server.cc:833`
   - Problem: `auto conn_ctx = iter->second.front();` kopiert ConnContext inkl. String
   - Fix: `auto conn_ctx = std::move(iter->second.front());`
-- [ ] `PublishMessage` - nur Worker*/fd statt ConnContext kopieren
+- [x] `PublishMessage` - nur Worker*/fd statt ConnContext kopieren
   - Datei: `src/server/server.cc:449-472`
   - Problem: `vector<ConnContext>` kopiert ns-String für jeden Subscriber
   - Fix: `vector<pair<Worker*, int>>` - ns wird für Reply nicht benötigt

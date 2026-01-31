@@ -446,9 +446,9 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
   int index = 0;
 
   // Collect subscribers under lock, reply outside lock
-  std::vector<ConnContext> to_publish_conn_ctxs;
+  std::vector<std::pair<Worker*, int>> to_publish_conn_ctxs;
   std::vector<std::string> patterns;
-  std::vector<ConnContext> to_publish_patterns_conn_ctxs;
+  std::vector<std::pair<Worker*, int>> to_publish_patterns_conn_ctxs;
 
   {
     std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
@@ -461,7 +461,7 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
       // Collect channel subscribers
       if (auto iter = it->second->channels.find(channel); iter != it->second->channels.end()) {
         for (const auto &conn_ctx : iter->second) {
-          to_publish_conn_ctxs.emplace_back(conn_ctx);
+          to_publish_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd);
         }
       }
 
@@ -469,7 +469,7 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
       for (const auto &iter : it->second->patterns) {
         if (util::StringMatch(iter.first, channel, false)) {
           for (const auto &conn_ctx : iter.second) {
-            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx);
+            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd);
             patterns.emplace_back(iter.first);
           }
         }
@@ -483,22 +483,22 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
   channel_reply.append(redis::BulkString("message"));
   channel_reply.append(redis::BulkString(channel));
   channel_reply.append(redis::BulkString(msg));
-  for (const auto &conn_ctx : to_publish_conn_ctxs) {
-    auto s = conn_ctx.owner->Reply(conn_ctx.fd, channel_reply);
+  for (const auto &[owner, fd] : to_publish_conn_ctxs) {
+    auto s = owner->Reply(fd, channel_reply);
     if (s.IsOK()) {
       cnt++;
     }
   }
 
   // We should publish corresponding pattern and message for connections
-  for (const auto &conn_ctx : to_publish_patterns_conn_ctxs) {
+  for (const auto &[owner, fd] : to_publish_patterns_conn_ctxs) {
     std::string pattern_reply;
     pattern_reply.append(redis::MultiLen(4));
     pattern_reply.append(redis::BulkString("pmessage"));
     pattern_reply.append(redis::BulkString(patterns[index++]));
     pattern_reply.append(redis::BulkString(channel));
     pattern_reply.append(redis::BulkString(msg));
-    auto s = conn_ctx.owner->Reply(conn_ctx.fd, pattern_reply);
+    auto s = owner->Reply(fd, pattern_reply);
     if (s.IsOK()) {
       cnt++;
     }
@@ -830,7 +830,7 @@ void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, 
   }
 
   while (n_conns-- && !iter->second.empty()) {
-    auto conn_ctx = iter->second.front();
+    auto conn_ctx = std::move(iter->second.front());
     auto s = conn_ctx.owner->EnableWriteEvent(conn_ctx.fd);
     if (!s.IsOK()) {
       error("[server] Failed to enable write event on blocked client {}: {}", conn_ctx.fd, s.Msg());
