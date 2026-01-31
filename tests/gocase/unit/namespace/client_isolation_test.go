@@ -433,3 +433,129 @@ func TestBlockedClientsNamespaceIsolation(t *testing.T) {
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
 }
+
+func TestBRPopLPushNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Helper to parse INFO output
+	parseInfoValue := func(info, key string) string {
+		for _, line := range strings.Split(info, "\r\n") {
+			if strings.HasPrefix(line, key+":") {
+				return strings.TrimPrefix(line, key+":")
+			}
+		}
+		return ""
+	}
+
+	t.Run("BRPOPLPUSH blocked clients isolated per namespace", func(t *testing.T) {
+		// Create blocking connections for BRPOPLPUSH
+		ns1BlockingRdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token1",
+		})
+		defer ns1BlockingRdb.Close()
+
+		ns2BlockingRdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token2",
+		})
+		defer ns2BlockingRdb.Close()
+
+		// Start BRPOPLPUSH in both namespaces on same key name (but different namespace)
+		done1 := make(chan string)
+		done2 := make(chan string)
+
+		go func() {
+			result := ns1BlockingRdb.BRPopLPush(ctx, "srclist", "dstlist", 3*time.Second)
+			done1 <- result.Val()
+		}()
+
+		go func() {
+			result := ns2BlockingRdb.BRPopLPush(ctx, "srclist", "dstlist", 3*time.Second)
+			done2 <- result.Val()
+		}()
+
+		// Give both BRPOPLPUSH time to start blocking
+		time.Sleep(200 * time.Millisecond)
+
+		// ns1 should see 1 blocked client
+		info := ns1Rdb.Info(ctx, "clients").Val()
+		blockedClients := parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "ns1 should see 1 blocked client")
+
+		// ns2 should see 1 blocked client
+		info = ns2Rdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "1", blockedClients, "ns2 should see 1 blocked client")
+
+		// Admin should see 2 blocked clients
+		info = adminRdb.Info(ctx, "clients").Val()
+		blockedClients = parseInfoValue(info, "blocked_clients")
+		require.Equal(t, "2", blockedClients, "Admin should see 2 blocked clients")
+
+		// Push to ns1's srclist - should only wake ns1's BRPOPLPUSH
+		require.NoError(t, ns1Rdb.RPush(ctx, "srclist", "value_for_ns1").Err())
+
+		// ns1 should receive the value
+		select {
+		case val := <-done1:
+			require.Equal(t, "value_for_ns1", val, "ns1 should receive pushed value")
+		case <-time.After(1 * time.Second):
+			t.Fatal("ns1 BRPOPLPUSH should have received value")
+		}
+
+		// ns2 should still be blocking (value was pushed to ns1, not ns2)
+		select {
+		case <-done2:
+			t.Fatal("ns2 BRPOPLPUSH should NOT have received anything yet")
+		case <-time.After(200 * time.Millisecond):
+			// Expected - ns2 is still blocking
+		}
+
+		// Now push to ns2
+		require.NoError(t, ns2Rdb.RPush(ctx, "srclist", "value_for_ns2").Err())
+
+		// ns2 should now receive
+		select {
+		case val := <-done2:
+			require.Equal(t, "value_for_ns2", val, "ns2 should receive pushed value")
+		case <-time.After(1 * time.Second):
+			t.Fatal("ns2 BRPOPLPUSH should have received value")
+		}
+
+		// Verify dstlist is isolated - each namespace has its own
+		ns1DstVal := ns1Rdb.LRange(ctx, "dstlist", 0, -1).Val()
+		ns2DstVal := ns2Rdb.LRange(ctx, "dstlist", 0, -1).Val()
+		require.Equal(t, []string{"value_for_ns1"}, ns1DstVal, "ns1 dstlist should have ns1's value")
+		require.Equal(t, []string{"value_for_ns2"}, ns2DstVal, "ns2 dstlist should have ns2's value")
+	})
+
+	// Cleanup
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}

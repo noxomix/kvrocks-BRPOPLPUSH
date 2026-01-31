@@ -1,7 +1,10 @@
 # Namespace-Isolation: Offene Probleme
 
 Konstitution: {
-Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im wortcase 10.000 connecitons oaralle.
+Bitte auch architektur.md konsolidieren je nach szenario. Auch wenn nicht alles 100% aktuell ist, weil wir Schritt für Schritt ja namespace
+awareness implementieren. Dennoch ist das grudnverösnis von workern und Parallelität wichtig. Aber immer logisch denken.
+
+Das ziel ist KVrocks ist tenant aware, pro instanz etwa 5-10 tenants. Jeder Tenant soll 10.000 writes gleichezeitig können also im worstcase 50-100.000 connecitons parallel.
 Worker sind naütlrich nicht für bestimmte tenant reserviert. Es ist wichtig dies zu verstehen, weil so manche arten von locks oder datenstrutkturen entpsechend auf diesen demand
 angepasst werden müssen das wir später kein bottleneck haben.
 
@@ -110,6 +113,13 @@ Der Test ist timing-sensitiv und hängt nicht von Lua/Scripting ab.
 
 ---
 
+## Niedrige Priorität: COMPACT kompaktiert nicht alle CFs für Tenants
+
+Tenant-COMPACT kompaktiert Propagate CF (Lua-Scripts) nicht, weil Key-Format anders ist.
+**Kein Sicherheitsproblem, kein Crash-Risiko.** Background-Compaction erledigt das automatisch.
+
+---
+
 ## Offen: Command-Klassifizierung für Tenant-Isolation
 
 ### Prinzip
@@ -118,11 +128,13 @@ Der Test ist timing-sensitiv und hängt nicht von Lua/Scripting ab.
 ### 1. Admin-only (nicht tenant-aware möglich)
 Technisch nicht isolierbar - müssen Admin-only bleiben:
 
-**kCmdAdmin fehlt - hinzufügen:**
-- [ ] COMPACT - RocksDB-global
-- [ ] FLUSHMEMTABLE - RocksDB-global
-- [ ] FLUSHBLOCKCACHE - RocksDB-global
-- [ ] DEBUG - Kann Server crashen
+**kCmdAdmin hinzugefügt:**
+- [x] FLUSHMEMTABLE - RocksDB-global
+- [x] FLUSHBLOCKCACHE - RocksDB-global
+- [x] DEBUG - Kann Server crashen
+
+**Bereits korrekt:**
+- [x] COMPACT - Namespace-aware für Daten-Keys (Lua-Scripts siehe "Niedrige Priorität")
 
 **kCmdAdmin bereits vorhanden:**
 - [x] CONFIG SET, SHUTDOWN, BGSAVE/RDB/SST
@@ -155,7 +167,7 @@ Technisch nicht isolierbar - müssen Admin-only bleiben:
 
 ## Implementierungs-Reihenfolge
 
-1. [ ] Quick Win: `kCmdAdmin` für COMPACT, DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE
+1. [x] ~~Quick Win: `kCmdAdmin` für DEBUG, FLUSHMEMTABLE, FLUSHBLOCKCACHE~~ - ERLEDIGT (COMPACT war bereits namespace-aware)
 2. [x] ~~Prüfen: DBSIZE, INFO~~ - Beide bereits namespace-aware
 3. [x] ~~CLIENT LIST/KILL tenant-aware~~ - GEFIXT (Tests: `client_isolation_test.go`)
 4. [x] ~~SLOWLOG tenant-aware~~ - GEFIXT (Tests: `slowlog_test.go:TestSlowlogNamespaceIsolation`)

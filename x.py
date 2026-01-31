@@ -306,7 +306,7 @@ def test_cpp(dir: str, rest: List[str]) -> None:
     run(str(unittest), *rest, cwd=str(basedir), verbose=True)
 
 
-def test_go(dir: str, cli_path: str, rest: List[str], filter: Optional[str] = None) -> None:
+def test_go(dir: str, cli_path: str, rest: List[str], filter: Optional[str] = None, suite: Optional[str] = None) -> None:
     go = find_command('go', msg='go is required for testing')
     find_command(cli_path, msg='redis-cli is required for testing')
 
@@ -314,8 +314,22 @@ def test_go(dir: str, cli_path: str, rest: List[str], filter: Optional[str] = No
     basedir = Path(__file__).parent.absolute() / 'tests' / 'gocase'
     workspace = basedir / 'workspace'
 
+    # Determine test package path
+    if suite:
+        # Check if suite exists as direct subdir (e.g., "integration", "tls")
+        # or under unit/ (e.g., "namespace" -> "unit/namespace")
+        if (basedir / suite).is_dir():
+            test_path = f'./{suite}/...'
+        elif (basedir / 'unit' / suite).is_dir():
+            test_path = f'./unit/{suite}/...'
+        else:
+            raise RuntimeError(f"Suite not found: {suite}\n"
+                               f"Available suites: integration, tls, or any directory under unit/")
+    else:
+        test_path = './...'
+
     args = [
-        'test', '-timeout=1800s', '-bench=.', './...',
+        'test', '-timeout=1800s', '-bench=.', test_path,
         f'-binPath={binpath}',
         f'-cliPath={cli_path}',
         f'-workspace={workspace}',
@@ -448,6 +462,8 @@ if __name__ == '__main__':
     parser_test_go.add_argument('--cli-path', default='redis-cli', help="path of redis-cli to test kvrocks")
     parser_test_go.add_argument('-f', '--filter', default=None,
                                 help="run only tests whose names begin with this prefix")
+    parser_test_go.add_argument('-s', '--suite', default=None,
+                                help="run only tests in this suite (e.g., 'namespace', 'scripting', 'integration')")
     parser_test_go.add_argument('rest', nargs=REMAINDER, help="the rest of arguments to forward to go test")
     parser_test_go.set_defaults(func=test_go)
 
