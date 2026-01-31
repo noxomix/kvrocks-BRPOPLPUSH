@@ -155,10 +155,9 @@ Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
   - [x] `WakeupBlockingConns()` - `vector<pair<Worker*, fd>>` sammeln, Lock lösen, EnableWriteEvent
   - [x] `OnEntryAddedToStream()` - `vector<pair<Worker*, fd>>` sammeln, Lock lösen, EnableWriteEvent
   - [x] `WakeupWaitConnections()` - `vector<tuple<Worker*, fd, replicas>>`, Worker::Reply statt Connection::Reply
-- [ ] **db_job_mu_ globaler Mutex** (server.h:433)
-  - Problem: Ein Tenant's COMPACT (Minuten) blockiert alle anderen DB-Jobs
-  - Option A: Aufteilen in `compaction_mu_`, `bgsave_mu_`, `scan_mu_`
-  - Option B: Per-Namespace Job-Queues
+- [x] **db_job_mu_ globaler Mutex** - COMPACT admin-only (`cmd_server.cc:1603`)
+  - Analyse: COMPACT/BGSAVE/SCAN blockieren sich NICHT gegenseitig (verschiedene Flags)
+  - Lösung: COMPACT zu admin-only (konsistent mit BGSAVE), kein Tenant kann andere blockieren
 - [ ] **works_concurrency_rw_lock_ Full-Sync** (server.h:476)
   - Problem: Full-Sync nimmt exclusive Lock, busy-wait mit 1ms polling
   - Option A: Condition Variable statt busy-wait

@@ -1600,7 +1600,7 @@ REDIS_REGISTER_COMMANDS(
     MakeCmdAttr<CommandHello>("hello", -1, "read-only ok-loading auth", NO_KEY),
     MakeCmdAttr<CommandRestore>("restore", -4, "write", 1, 1, 1),
 
-    MakeCmdAttr<CommandCompact>("compact", 1, "read-only no-script", NO_KEY),
+    MakeCmdAttr<CommandCompact>("compact", 1, "read-only no-script admin", NO_KEY),
     MakeCmdAttr<CommandBGSave>("bgsave", 1, "read-only no-script admin", NO_KEY),
     MakeCmdAttr<CommandLastSave>("lastsave", -1, "read-only admin", NO_KEY),
     MakeCmdAttr<CommandFlushBackup>("flushbackup", 1, "read-only no-script admin", NO_KEY),
