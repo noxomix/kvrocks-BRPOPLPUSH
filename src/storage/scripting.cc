@@ -689,30 +689,31 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   Server *srv = conn->GetServer();
   // Use the worker's private Lua VM when entering the read-only mode
   lua_State *lua = conn->Owner()->Lua();
+  const std::string &ns = conn->GetNamespace();
 
   /* We obtain the script SHA1, then check if this function is already
    * defined into the Lua state */
-  char funcname[2 + 40 + 1] = {};
-  memcpy(funcname, REDIS_LUA_FUNC_SHA_PREFIX, sizeof(REDIS_LUA_FUNC_SHA_PREFIX));
-
+  char sha_buf[41] = {};
   if (!evalsha) {
-    SHA1Hex(funcname + 2, body_or_sha.c_str(), body_or_sha.size());
+    SHA1Hex(sha_buf, body_or_sha.c_str(), body_or_sha.size());
   } else {
     for (int j = 0; j < 40; j++) {
-      funcname[j + 2] = static_cast<char>(tolower(body_or_sha[j]));
+      sha_buf[j] = static_cast<char>(tolower(body_or_sha[j]));
     }
   }
+  std::string sha(sha_buf);
+  std::string funcname = ComposeLuaScriptName(ns, sha);
 
   /* Push the pcall error handler function on the stack. */
   lua_getglobal(lua, "__redis__err__handler");
 
   /* Try to lookup the Lua function */
-  lua_getglobal(lua, funcname);
+  lua_getglobal(lua, funcname.c_str());
   if (lua_isnil(lua, -1)) {
     lua_pop(lua, 1); /* remove the nil from the stack */
     std::string body;
     if (evalsha) {
-      auto s = srv->ScriptGet(funcname + 2, &body);
+      auto s = srv->ScriptGet(ns, sha, &body);
       if (!s.IsOK()) {
         lua_pop(lua, 1); /* remove the error handler from the stack. */
         return {Status::RedisNoScript, redis::errNoMatchingScript};
@@ -721,21 +722,20 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
       body = body_or_sha;
     }
 
-    std::string sha = funcname + 2;
-    auto s = CreateFunction(srv, body, &sha, lua, false);
+    auto s = CreateFunction(srv, body, &sha, lua, false, ns);
     if (!s.IsOK()) {
       lua_pop(lua, 1); /* remove the error handler from the stack. */
       return s;
     }
     /* Now the following is guaranteed to return non nil */
-    lua_getglobal(lua, funcname);
+    lua_getglobal(lua, funcname.c_str());
   }
 
   ScriptRunCtx current_script_run_ctx;
   current_script_run_ctx.conn = conn;
   current_script_run_ctx.ctx = ctx;
   current_script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
-  lua_getglobal(lua, fmt::format(REDIS_LUA_FUNC_SHA_FLAGS, funcname + 2).c_str());
+  lua_getglobal(lua, (funcname + "_flags_").c_str());
   if (!lua_isnil(lua, -1)) {
     // It should be ensured that the conversion is successful
     auto script_flags = lua_tointeger(lua, -1);
@@ -794,8 +794,9 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   return Status::OK();
 }
 
-bool ScriptExists(lua_State *lua, const std::string &sha) {
-  lua_getglobal(lua, (REDIS_LUA_FUNC_SHA_PREFIX + sha).c_str());
+bool ScriptExists(lua_State *lua, const std::string &ns, const std::string &sha) {
+  std::string funcname = ComposeLuaScriptName(ns, sha);
+  lua_getglobal(lua, funcname.c_str());
   auto exit = MakeScopeExit([lua] { lua_pop(lua, 1); });
   return !lua_isnil(lua, -1);
 }
@@ -1596,16 +1597,15 @@ int RedisMathRandomSeed(lua_State *lua) {
  *
  * If 'c' is not NULL, on error the client is informed with an appropriate
  * error describing the nature of the problem and the Lua interpreter error. */
-Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lua_State *lua, bool need_to_store) {
-  char funcname[2 + 40 + 1] = {};
-  memcpy(funcname, REDIS_LUA_FUNC_SHA_PREFIX, sizeof(REDIS_LUA_FUNC_SHA_PREFIX));
-
+Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lua_State *lua, bool need_to_store,
+                      const std::string &ns) {
   if (sha->empty()) {
-    SHA1Hex(funcname + 2, body.c_str(), body.size());
-    *sha = funcname + 2;
-  } else {
-    std::copy(sha->begin(), sha->end(), funcname + 2);
+    char sha_buf[41] = {};
+    SHA1Hex(sha_buf, body.c_str(), body.size());
+    *sha = sha_buf;
   }
+
+  std::string funcname = ComposeLuaScriptName(ns, *sha);
 
   std::string_view lua_code(body);
   // Cache the flags of the current script
@@ -1621,17 +1621,17 @@ Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lu
     script_flags = kScriptAllowCrossSlotKeys;
   }
   lua_pushinteger(lua, static_cast<lua_Integer>(script_flags));
-  lua_setglobal(lua, fmt::format(REDIS_LUA_FUNC_SHA_FLAGS, *sha).c_str());
+  lua_setglobal(lua, (funcname + "_flags_").c_str());
 
   if (luaL_loadbuffer(lua, lua_code.data(), lua_code.size(), "@user_script")) {
     std::string err_msg = lua_tostring(lua, -1);
     lua_pop(lua, 1);
     return {Status::NotOK, "Error while compiling new script: " + err_msg};
   }
-  lua_setglobal(lua, funcname);
+  lua_setglobal(lua, funcname.c_str());
 
   // would store lua function into propagate column family and propagate those scripts to slaves
-  return need_to_store ? srv->ScriptSet(*sha, body) : Status::OK();
+  return need_to_store ? srv->ScriptSet(ns, *sha, body) : Status::OK();
 }
 
 [[nodiscard]] StatusOr<std::string> ExtractLibNameFromShebang(std::string_view shebang) {

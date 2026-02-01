@@ -553,57 +553,80 @@ void Worker::LuaResetNamespace(const std::string &ns) {
   lua_State *lua = Lua();
   std::string ns_prefix = ns + "_";
 
-  // 1. Get REDIS_FUNCTION_LIBRARIES table
+  // Part A: Clean up FUNCTIONs (library-based scripts)
+  // Only if REDIS_FUNCTION_LIBRARIES table exists
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
-  if (!lua_istable(lua, -1)) {
-    lua_pop(lua, 1);
-    return;
+  if (lua_istable(lua, -1)) {
+    // Collect all library keys and function names that match this namespace
+    std::vector<std::string> libs_to_delete;
+    std::vector<std::string> funcs_to_delete;
+
+    lua_pushnil(lua);
+    while (lua_next(lua, -2) != 0) {
+      // Key at -2, value (array of func names) at -1
+      const char *lib_key = lua_tostring(lua, -2);
+      if (lib_key && std::string_view(lib_key).substr(0, ns_prefix.size()) == ns_prefix) {
+        libs_to_delete.emplace_back(lib_key);
+
+        // Iterate through function names in this library's array
+        if (lua_istable(lua, -1)) {
+          size_t len = lua_objlen(lua, -1);
+          for (size_t i = 1; i <= len; ++i) {
+            lua_rawgeti(lua, -1, static_cast<int>(i));
+            const char *func_name = lua_tostring(lua, -1);
+            if (func_name) {
+              // Function globals use ns_prefixed_name: <ns>_<funcname>
+              funcs_to_delete.push_back(ns_prefix + func_name);
+            }
+            lua_pop(lua, 1);
+          }
+        }
+      }
+      lua_pop(lua, 1);  // Pop value, keep key for next iteration
+    }
+
+    // Delete function globals: __redis_registered_<ns>_<func> and __redis_registered_flags_<ns>_<func>
+    for (const auto &ns_prefixed_func : funcs_to_delete) {
+      lua_pushnil(lua);
+      lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + ns_prefixed_func).c_str());
+
+      lua_pushnil(lua);
+      lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_func).c_str());
+    }
+
+    // Delete library entries from REDIS_FUNCTION_LIBRARIES
+    for (const auto &lib : libs_to_delete) {
+      lua_pushnil(lua);
+      lua_setfield(lua, -2, lib.c_str());
+    }
   }
+  lua_pop(lua, 1);  // Pop REDIS_FUNCTION_LIBRARIES table (or nil)
 
-  // 2. Collect all library keys and function names that match this namespace
-  std::vector<std::string> libs_to_delete;
-  std::vector<std::string> funcs_to_delete;
+  // Part B: Clean up EVAL scripts: f_<ns>_<sha> and f_<ns>_<sha>_flags_
+  // This ALWAYS runs, regardless of whether FUNCTION libraries exist
+  std::string script_prefix = std::string(REDIS_LUA_FUNC_SHA_PREFIX) + ns + "_";
+  std::vector<std::string> scripts_to_delete;
 
+  // Iterate _G to find all script globals matching the namespace
+  // Note: Using LUA_GLOBALSINDEX for Lua 5.1 compatibility (LuaJIT)
+  lua_pushvalue(lua, LUA_GLOBALSINDEX);
   lua_pushnil(lua);
   while (lua_next(lua, -2) != 0) {
-    // Key at -2, value (array of func names) at -1
-    const char *lib_key = lua_tostring(lua, -2);
-    if (lib_key && std::string_view(lib_key).substr(0, ns_prefix.size()) == ns_prefix) {
-      libs_to_delete.emplace_back(lib_key);
-
-      // Iterate through function names in this library's array
-      if (lua_istable(lua, -1)) {
-        size_t len = lua_objlen(lua, -1);
-        for (size_t i = 1; i <= len; ++i) {
-          lua_rawgeti(lua, -1, static_cast<int>(i));
-          const char *func_name = lua_tostring(lua, -1);
-          if (func_name) {
-            // Function globals use ns_prefixed_name: <ns>_<funcname>
-            funcs_to_delete.push_back(ns_prefix + func_name);
-          }
-          lua_pop(lua, 1);
-        }
+    if (lua_type(lua, -2) == LUA_TSTRING) {
+      const char *key = lua_tostring(lua, -2);
+      if (key && strncmp(key, script_prefix.c_str(), script_prefix.size()) == 0) {
+        scripts_to_delete.emplace_back(key);
       }
     }
     lua_pop(lua, 1);  // Pop value, keep key for next iteration
   }
+  lua_pop(lua, 1);  // Pop _G
 
-  // 3. Delete function globals: __redis_registered_<ns>_<func> and __redis_registered_flags_<ns>_<func>
-  for (const auto &ns_prefixed_func : funcs_to_delete) {
+  // Delete collected script globals
+  for (const auto &script : scripts_to_delete) {
     lua_pushnil(lua);
-    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + ns_prefixed_func).c_str());
-
-    lua_pushnil(lua);
-    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_func).c_str());
+    lua_setglobal(lua, script.c_str());
   }
-
-  // 4. Delete library entries from REDIS_FUNCTION_LIBRARIES
-  for (const auto &lib : libs_to_delete) {
-    lua_pushnil(lua);
-    lua_setfield(lua, -2, lib.c_str());
-  }
-
-  lua_pop(lua, 1);  // Pop REDIS_FUNCTION_LIBRARIES table
 }
 
 void Worker::MarkNamespaceForReset(const std::string &ns) {

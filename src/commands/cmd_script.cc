@@ -73,21 +73,19 @@ class CommandScript : public Commander {
     }
 
     if (args_.size() == 2 && subcommand_ == "flush") {
-      auto s = srv->ScriptFlush();
+      auto s = srv->ScriptFlush(conn->GetNamespace());
       if (!s) {
         error("Failed to flush scripts: {}", s.Msg());
         return s;
       }
-      s = srv->Propagate(engine::kPropagateScriptCommand, args_);
-      if (!s) {
-        error("Failed to propagate script command: {}", s.Msg());
-        return s;
-      }
+      // Immediately reset current worker's Lua state (like FUNCTION FLUSH)
+      conn->Owner()->LuaResetNamespace(conn->GetNamespace());
+      // No Propagate needed - storage changes are replicated via WAL (like FUNCTION FLUSH)
       *output = redis::RESP_OK;
     } else if (args_.size() >= 3 && subcommand_ == "exists") {
       *output = redis::MultiLen(args_.size() - 2);
       for (size_t j = 2; j < args_.size(); j++) {
-        if (srv->ScriptExists(args_[j]).IsOK()) {
+        if (srv->ScriptExists(conn->GetNamespace(), args_[j]).IsOK()) {
           *output += redis::Integer(1);
         } else {
           *output += redis::Integer(0);
@@ -98,7 +96,7 @@ class CommandScript : public Commander {
       conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
 
       std::string sha;
-      auto s = lua::CreateFunction(srv, args_[2], &sha, conn->Owner()->Lua(), true);
+      auto s = lua::CreateFunction(srv, args_[2], &sha, conn->Owner()->Lua(), true, conn->GetNamespace());
       if (!s.IsOK()) {
         return s;
       }

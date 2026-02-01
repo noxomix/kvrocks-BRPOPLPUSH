@@ -811,8 +811,11 @@ rocksdb::Status Storage::DeleteRange(engine::Context &ctx, Slice begin, Slice en
 }
 
 rocksdb::Status Storage::FlushScripts(engine::Context &ctx, const rocksdb::WriteOptions &options,
-                                      rocksdb::ColumnFamilyHandle *cf_handle) {
-  std::string begin_key = kLuaFuncSHAPrefix, end_key = util::StringNext(kLuaFuncSHAPrefix);
+                                      rocksdb::ColumnFamilyHandle *cf_handle, const rocksdb::Slice &ns) {
+  // Namespace-aware: delete only scripts for this namespace
+  // Key format: <prefix><1-byte ns_len><namespace><sha>
+  std::string begin_key = ComposeFunctionKey(kLuaFuncSHAPrefix, ns, "");
+  std::string end_key = util::StringNext(begin_key);
 
   auto batch = GetWriteBatchBase(ctx.ns);
   auto s = batch->DeleteRange(cf_handle, begin_key, end_key);

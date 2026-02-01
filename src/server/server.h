@@ -347,12 +347,12 @@ class Server {
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,
                   redis::Connection *conn);
 
-  Status ScriptExists(const std::string &sha) const;
-  Status ScriptGet(const std::string &sha, std::string *body) const;
-  Status ScriptSet(const std::string &sha, const std::string &body) const;
+  Status ScriptExists(const rocksdb::Slice &ns, const std::string &sha) const;
+  Status ScriptGet(const rocksdb::Slice &ns, const std::string &sha, std::string *body) const;
+  Status ScriptSet(const rocksdb::Slice &ns, const std::string &sha, const std::string &body) const;
   void ScriptReset();
   void ScriptResetNamespace(const std::string &ns, Worker *exclude = nullptr);
-  Status ScriptFlush();
+  Status ScriptFlush(const std::string &ns);
   uint64_t GetScriptResetGeneration() const { return script_reset_generation_.load(); }
 
   Status FunctionGetCode(const rocksdb::Slice &ns, const std::string &lib, std::string *code) const;

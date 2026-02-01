@@ -283,7 +283,7 @@ class Storage {
                                             rocksdb::ColumnFamilyHandle *cf_handle, Slice begin, Slice end);
   [[nodiscard]] rocksdb::Status DeleteRange(engine::Context &ctx, Slice begin, Slice end);
   [[nodiscard]] rocksdb::Status FlushScripts(engine::Context &ctx, const rocksdb::WriteOptions &options,
-                                             rocksdb::ColumnFamilyHandle *cf_handle);
+                                             rocksdb::ColumnFamilyHandle *cf_handle, const rocksdb::Slice &ns);
   bool WALHasNewData(rocksdb::SequenceNumber seq) { return seq <= LatestSeqNumber(); }
   Status InWALBoundary(rocksdb::SequenceNumber seq);
   Status WriteToPropagateCF(engine::Context &ctx, const std::string &key, const std::string &value);

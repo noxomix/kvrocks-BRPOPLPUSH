@@ -2155,13 +2155,13 @@ StatusOr<std::unique_ptr<redis::Commander>> Server::LookupAndCreateCommand(const
   return std::move(cmd);
 }
 
-Status Server::ScriptExists(const std::string &sha) const {
+Status Server::ScriptExists(const rocksdb::Slice &ns, const std::string &sha) const {
   std::string body;
-  return ScriptGet(sha, &body);
+  return ScriptGet(ns, sha, &body);
 }
 
-Status Server::ScriptGet(const std::string &sha, std::string *body) const {
-  std::string func_name = engine::kLuaFuncSHAPrefix + sha;
+Status Server::ScriptGet(const rocksdb::Slice &ns, const std::string &sha, std::string *body) const {
+  std::string func_name = engine::ComposeFunctionKey(engine::kLuaFuncSHAPrefix, ns, sha);
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
   engine::Context ctx(storage);
   auto s = storage->Get(ctx, ctx.GetReadOptions(), cf, func_name, body);
@@ -2171,8 +2171,8 @@ Status Server::ScriptGet(const std::string &sha, std::string *body) const {
   return Status::OK();
 }
 
-Status Server::ScriptSet(const std::string &sha, const std::string &body) const {
-  std::string func_name = engine::kLuaFuncSHAPrefix + sha;
+Status Server::ScriptSet(const rocksdb::Slice &ns, const std::string &sha, const std::string &body) const {
+  std::string func_name = engine::ComposeFunctionKey(engine::kLuaFuncSHAPrefix, ns, sha);
   engine::Context ctx(storage);
   return storage->WriteToPropagateCF(ctx, func_name, body);
 }
@@ -2227,12 +2227,12 @@ void Server::ScriptResetNamespace(const std::string &ns, Worker *exclude) {
   }
 }
 
-Status Server::ScriptFlush() {
+Status Server::ScriptFlush(const std::string &ns) {
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
   engine::Context ctx(storage);
-  auto s = storage->FlushScripts(ctx, storage->DefaultWriteOptions(), cf);
+  auto s = storage->FlushScripts(ctx, storage->DefaultWriteOptions(), cf, ns);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
-  ScriptReset();
+  ScriptResetNamespace(ns);
   return Status::OK();
 }
 

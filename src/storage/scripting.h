@@ -33,9 +33,13 @@ struct Context;
 }
 
 inline constexpr const char REDIS_LUA_FUNC_SHA_PREFIX[] = "f_";
-inline constexpr const char REDIS_LUA_FUNC_SHA_FLAGS[] = "f_{}_flags_";
 inline constexpr const char REDIS_LUA_REGISTER_FUNC_PREFIX[] = "__redis_registered_";
 inline constexpr const char REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX[] = "__redis_registered_flags_";
+
+// Compose namespace-aware Lua script name: f_<ns>_<sha>
+inline std::string ComposeLuaScriptName(const std::string &ns, const std::string &sha) {
+  return std::string(REDIS_LUA_FUNC_SHA_PREFIX) + ns + "_" + sha;
+}
 inline constexpr const char REDIS_FUNCTION_LIBNAME[] = "REDIS_FUNCTION_LIBNAME";
 inline constexpr const char REDIS_FUNCTION_NEEDSTORE[] = "REDIS_FUNCTION_NEEDSTORE";
 inline constexpr const char REDIS_FUNCTION_LIBRARIES[] = "REDIS_FUNCTION_LIBRARIES";
@@ -62,13 +66,14 @@ int RedisLogCommand(lua_State *lua);
 int RedisRegisterFunction(lua_State *lua);
 int RedisSetResp(lua_State *lua);
 
-Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lua_State *lua, bool need_to_store);
+Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lua_State *lua, bool need_to_store,
+                      const std::string &ns);
 
 Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const std::string &body_or_sha,
                           const std::vector<std::string> &keys, const std::vector<std::string> &argv, bool evalsha,
                           std::string *output, bool read_only = false);
 
-bool ScriptExists(lua_State *lua, const std::string &sha);
+bool ScriptExists(lua_State *lua, const std::string &ns, const std::string &sha);
 
 Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::string &script, bool need_to_store,
                     bool replace, std::string *lib_name);

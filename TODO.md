@@ -115,10 +115,27 @@ Replica gibt während Full-Sync sowieso "LOADING" zurück → kein Noisy-Neighbo
 Full-Sync ist selten (Initial-Sync, Connection-Loss). Optimierung (Condition Variable) nicht nötig.
 
 KONZEPT - EVAL Scripts vs. FUNCTION Isolation:
-EVAL-Scripts: Global by SHA gecached (`f_{sha}`), aber Ausführung namespace-aware (redis.call nutzt conn->GetNamespace()).
+EVAL-Scripts: Per-NS isoliert mit `f_{ns}_{sha}` Storage-Key und Lua-Global.
 FUNCTION: Vollständig per-NS isoliert (`<ns>_<lib>`), LuaResetNamespace() für Cleanup.
-SCRIPT FLUSH: Global - löscht alle Scripts (Noisy Neighbor). Kein Auto-Eviction für ungenutzte Scripts.
-Hybrid-Fix: Scripts als `f_{ns}_{sha}` speichern (Isolation + Kollisionsschutz) + SCRIPT FLUSH admin-only.
+SCRIPT FLUSH/EXISTS/LOAD: Namespace-aware, Admin = default namespace (normaler Tenant).
+LuaResetNamespace() räumt BEIDE auf (FUNCTIONs UND EVAL-Scripts).
+
+LEARNING - LuaResetNamespace Strukturierung:
+Wenn mehrere Lua-Objekt-Typen aufgeräumt werden (FUNCTIONs, EVAL-Scripts), NIEMALS early-return
+nach optionaler Prüfung. Stattdessen: Optionale Cleanups in if-Block wrappen, Pflicht-Cleanups danach.
+Bug-Pattern: `if (!table_exists) return;` überspringt nachfolgende Cleanup-Sektionen.
+
+LEARNING - Immediate Reset bei SCRIPT FLUSH:
+Nach SCRIPT FLUSH muss `LuaResetNamespace()` SOFORT auf dem aktuellen Worker aufgerufen werden
+(wie bei FUNCTION FLUSH), nicht nur lazy-mark. Sonst kann der gleiche Worker das Script noch ausführen.
+
+LEARNING - LuaJIT/Lua 5.1 Kompatibilität:
+`lua_pushglobaltable(lua)` existiert NICHT in Lua 5.1 (LuaJIT). Stattdessen:
+`lua_pushvalue(lua, LUA_GLOBALSINDEX)` für Iteration über globale Variablen.
+
+LEARNING - Replication Tests mit Auth:
+Wenn Master `requirepass` hat, braucht Slave auch `masterauth` in der Config.
+Sonst schlägt WaitForSync fehl weil Slave sich nicht authentifizieren kann.
 
 LEARNING - Blocking-State ist server-lokal:
 Blocking-State (welche Connections warten worauf) ist transient und nicht repliziert.
@@ -199,7 +216,7 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 - [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)
 
 **Niedrige Priorität:**
-- [ ] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` oder nur kCmdAdmin
+- [x] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` (Tests: `script_isolation_test.go`, Replication: `replication_test.go`)
 - [ ] SELECT (Logical Databases) - Workaround mit Sub-Namespaces möglich
 - [x] MONITOR Per-NS Singleton - O(1) statt O(n_workers), Copy-then-Reply, Tests: `monitor_isolation_test.go`
 - [LATER] WATCH globaler Mutex - Per-NS Sharding (nur falls WATCH intensiv genutzt, unwahrscheinlich)

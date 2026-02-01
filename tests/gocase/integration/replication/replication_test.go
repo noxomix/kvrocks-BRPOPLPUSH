@@ -715,3 +715,111 @@ func TestReplicationWatermark(t *testing.T) {
 	// The small command should be processed much faster than 1 second
 	require.Less(t, duration, 1*time.Second, "small command should be processed promptly")
 }
+
+func TestScriptReplicationNamespaceIsolation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	password := "adminpwd"
+
+	// Start master with password
+	master := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer master.Close()
+
+	masterAdmin := master.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, masterAdmin.Close()) }()
+
+	// Start slave with same password + masterauth for replication
+	slave := util.StartServer(t, map[string]string{
+		"requirepass": password,
+		"masterauth":  password,
+	})
+	defer slave.Close()
+
+	slaveAdmin := slave.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, slaveAdmin.Close()) }()
+
+	// Set up replication FIRST (before namespaces)
+	util.SlaveOf(t, slaveAdmin, master)
+	util.WaitForSync(t, slaveAdmin)
+
+	// Create namespaces on BOTH master and slave
+	// Note: Namespaces are stored in config, not replicated via WAL
+	require.NoError(t, masterAdmin.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, masterAdmin.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+	require.NoError(t, slaveAdmin.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, slaveAdmin.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections on master
+	masterNs1 := master.NewClientWithOption(&redis.Options{Password: "token1"})
+	defer func() { require.NoError(t, masterNs1.Close()) }()
+
+	masterNs2 := master.NewClientWithOption(&redis.Options{Password: "token2"})
+	defer func() { require.NoError(t, masterNs2.Close()) }()
+
+	// Tenant connections on slave
+	slaveNs1 := slave.NewClientWithOption(&redis.Options{Password: "token1"})
+	defer func() { require.NoError(t, slaveNs1.Close()) }()
+
+	slaveNs2 := slave.NewClientWithOption(&redis.Options{Password: "token2"})
+	defer func() { require.NoError(t, slaveNs2.Close()) }()
+
+	t.Run("SCRIPT LOAD replicates to correct namespace", func(t *testing.T) {
+		// Load script in ns1 on master
+		sha := masterNs1.ScriptLoad(ctx, "return 'ns1_script'").Val()
+
+		// Wait for replication
+		util.WaitForOffsetSync(t, masterAdmin, slaveAdmin, 5*time.Second)
+
+		// Slave ns1 should see it
+		exists1 := slaveNs1.ScriptExists(ctx, sha).Val()
+		require.Equal(t, []bool{true}, exists1, "slave ns1 should have the script")
+
+		// Slave ns2 should NOT see it
+		exists2 := slaveNs2.ScriptExists(ctx, sha).Val()
+		require.Equal(t, []bool{false}, exists2, "slave ns2 should NOT have ns1's script")
+
+		// Cleanup
+		require.NoError(t, masterNs1.ScriptFlush(ctx).Err())
+		util.WaitForOffsetSync(t, masterAdmin, slaveAdmin, 5*time.Second)
+	})
+
+	t.Run("SCRIPT FLUSH replicates only own namespace", func(t *testing.T) {
+		// Load scripts in both namespaces on master
+		sha1 := masterNs1.ScriptLoad(ctx, "return 1").Val()
+		sha2 := masterNs2.ScriptLoad(ctx, "return 2").Val()
+
+		// Wait for replication
+		util.WaitForOffsetSync(t, masterAdmin, slaveAdmin, 5*time.Second)
+
+		// Both should exist on slave
+		exists1 := slaveNs1.ScriptExists(ctx, sha1).Val()
+		require.Equal(t, []bool{true}, exists1, "slave ns1 should have sha1")
+
+		exists2 := slaveNs2.ScriptExists(ctx, sha2).Val()
+		require.Equal(t, []bool{true}, exists2, "slave ns2 should have sha2")
+
+		// Flush only ns1 on master
+		require.NoError(t, masterNs1.ScriptFlush(ctx).Err())
+
+		// Wait for replication
+		util.WaitForOffsetSync(t, masterAdmin, slaveAdmin, 5*time.Second)
+
+		// Slave ns1 should NOT have sha1 anymore
+		exists1 = slaveNs1.ScriptExists(ctx, sha1).Val()
+		require.Equal(t, []bool{false}, exists1, "slave ns1 should NOT have sha1 after flush")
+
+		// Slave ns2 should STILL have sha2
+		exists2 = slaveNs2.ScriptExists(ctx, sha2).Val()
+		require.Equal(t, []bool{true}, exists2, "slave ns2 should still have sha2")
+
+		// Cleanup
+		require.NoError(t, masterNs2.ScriptFlush(ctx).Err())
+		util.WaitForOffsetSync(t, masterAdmin, slaveAdmin, 5*time.Second)
+	})
+}
