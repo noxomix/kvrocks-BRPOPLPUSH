@@ -286,10 +286,9 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
   - Copy-then-Log Pattern → DumpToLogFile() außerhalb Lock (Konstitution Zeile 77-82)
   - max_entries pro Namespace → keine Entry-Verdrängung zwischen Tenants
   - Tests: `tests/gocase/unit/slowlog/slowlog_test.go` (TestSlowlogNamespaceIsolation)
-- [ ] **SUnsubscribeAll fehlt im Destruktor** - Memory Leak bei Shard PubSub (`redis_connection.cc:56-68`)
-  - Problem: `UnsubscribeAll()` und `PUnsubscribeAll()` werden aufgerufen, aber NICHT `SUnsubscribeAll()`
-  - Impact: Stale Einträge in Shard-PubSub Maps nach Connection-Close
-  - Fix: `SUnsubscribeAll()` nach Zeile 67 hinzufügen
+- [x] **Shard PubSub Admin-Only + Destruktor-Fix** (`cmd_pubsub.cc:268-269`, `redis_connection.cc:68`)
+  - SSUBSCRIBE/SUNSUBSCRIBE jetzt admin-only (Multi-Tenant nicht unterstützt)
+  - SUnsubscribeAll() im Destruktor hinzugefügt (Memory Leak Fix)
 
 **Mittlere Priorität - Information Disclosure (Audit 2026-02-01):**
 - [ ] **ROLE Command** - Gibt Replication-Topologie an alle Tenants (`cmd_server.cc:297-304, 1597`)

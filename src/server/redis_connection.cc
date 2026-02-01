@@ -65,6 +65,7 @@ Connection::~Connection() {
   // unsubscribe all channels and patterns if exists
   UnsubscribeAll();
   PUnsubscribeAll();
+  SUnsubscribeAll();
 }
 
 std::string Connection::ToString() {
