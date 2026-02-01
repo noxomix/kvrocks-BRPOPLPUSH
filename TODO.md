@@ -250,6 +250,14 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
   - Lösung: COMPACT zu admin-only (konsistent mit BGSAVE), kein Tenant kann andere blockieren
 - [x] **works_concurrency_rw_lock_ Full-Sync** - Nicht nötig (siehe Konstitution)
   - Betrifft nur Replica während Full-Sync, gibt sowieso "LOADING" zurück, also voll unnötig.
+- [ ] **LockManager ist GLOBAL - Cross-Tenant Blocking!** (`storage.cc:82`, `lock_manager.h`)
+  - Problem: 65,536 Mutexes für ALLE Namespaces, Hash-Kollisionen zwischen Tenants möglich
+  - Betrifft: ALLE Write-Commands + Blocking Commands (BLPOP, BRPOP, BZPOP, BLMOVE, etc.)
+  - Angriff: Tenant A's Key hasht zu Index X, Tenant B's Key auch → B wartet auf A's Lock
+  - Lösungsoptionen:
+    1. Per-Namespace LockManager: `unordered_map<ns, unique_ptr<LockManager>>` (beste Isolation)
+    2. Namespace-aware Hash: Separater Hash-Bereich pro Namespace (weniger Refactoring)
+  - Dateien: `lock_manager.h`, `storage.h/cc`, `cmd_list.cc`, `cmd_zset.cc`
 
 **Mittlere Priorität - INFO Stats:**
 - [x] `total_connections_received` - Kumulativer Counter (per-NS nach Auth)
@@ -291,9 +299,8 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
   - SUnsubscribeAll() im Destruktor hinzugefügt (Memory Leak Fix)
 
 **Mittlere Priorität - Information Disclosure (Audit 2026-02-01):**
-- [ ] **ROLE Command** - Gibt Replication-Topologie an alle Tenants (`cmd_server.cc:297-304, 1597`)
-  - Problem: Kein `admin` Flag, gibt `master_host`, `master_port`, alle Slave-IPs/Ports zurück
-  - Fix: `kCmdAdmin` Flag hinzufügen in Zeile 1597
+- [x] **ROLE Command** - Admin-only gemacht (`cmd_server.cc:1597`)
+  - Fix: `admin` Flag hinzugefügt - verhindert Tenant-Zugriff auf Replication-Topologie
 - [ ] **HELLO Command** - Gibt globale Config an alle Tenants (`cmd_server.cc:916-931, 1618`)
   - Problem: Gibt `cluster_enabled`, `IsSlave()`, Server-Mode zurück
   - Fix: Sensitive Felder nur für Admin oder Command admin-only machen
@@ -304,11 +311,36 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
     GEPRÜFT: Re-AUTH während Blocking ist kein Problem (Read-Callback ist nullptr).
     GEPRÜFT: Re-AUTH während MULTI ist ein Bug → Task oben angelegt.
 
-    RESETSTAT exisitiert nicht in kvrocks, aber in redis - ggf können wir das irgnedwann mal erweitern. 
-
-    Genau wie Transaktionen namespace aware machen das sie nicht global locken.
+    RESETSTAT exisitiert nicht in kvrocks, aber in redis - ggf können wir das irgnedwann mal erweitern.
 
     Und Lua scripts in transaktionen mappen.
 
     GGf. später ins todo übernehmen:   Und LuaResetNamespace() iteriert jetzt über ALLE Lua-Globals:lua_pushvalue(lua, LUA_GLOBALSINDEX);  // O(n_globals)!.
+
+    ANALYSE - Locking-Mechanismen (2026-02-01):
+    Transaktionen (MULTI/EXEC) sind BEREITS namespace-aware auf 2 Ebenen:
+    1. Command-Level: WorkExclusivityGuard(ns) für EXEC (redis_connection.cc:486-492)
+    2. Storage-Level: ns_txn_states_ Map mit per-NS WriteBatchWithIndex (storage.cc:1025-1080)
+    → Verschiedene Tenants können EXEC parallel ausführen, kein globaler Lock.
+
+    PROBLEM - LockManager ist NICHT namespace-aware (2026-02-01):
+    - LockManager hat 65,536 Mutexes für ALLE Namespaces (storage.cc:82)
+    - ComposeNamespaceKey() hilft NICHT: Hash-Kollisionen zwischen Tenants möglich!
+    - Beispiel: ns1:keyA und ns2:keyB können zum gleichen Mutex hashen
+    - Betrifft ALLE Write-Commands + Blocking Commands (BLPOP, BRPOP, etc.)
+    - → TODO oben angelegt für Per-Namespace LockManager
+
+    Warum nutzen Blocking Commands nicht ns_txn_states_?
+    - ns_txn_states_ ist für WriteBatch-Buffering (MULTI/EXEC)
+    - LockManager ist für Key-Level Atomizität (einzelne Operationen)
+    - Verschiedene Zwecke, aber BEIDE sollten namespace-aware sein
+
+    WATCH: Global watched_key_map_ mit globalem Mutex
+    - Niedrige Priorität da selten genutzt (siehe KONZEPT oben)
+
+    Lua Scripts (EVAL): Werden kCmdExclusive wenn lua_strict_key_accessing=false
+    - Dann namespace-aware via WorkExclusivityGuard(ns)
+
+    Fazit: Transaktionen OK. LockManager ist NICHT OK - TODO erstellt.
+    WATCH ist global aber akzeptabel.
 }

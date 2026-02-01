@@ -1594,7 +1594,7 @@ REDIS_REGISTER_COMMANDS(
     MakeCmdAttr<CommandPing>("ping", -1, "read-only", NO_KEY),
     MakeCmdAttr<CommandSelect>("select", 2, "read-only", NO_KEY),
     MakeCmdAttr<CommandInfo>("info", -1, "read-only ok-loading", NO_KEY),
-    MakeCmdAttr<CommandRole>("role", 1, "read-only ok-loading", NO_KEY),
+    MakeCmdAttr<CommandRole>("role", 1, "read-only ok-loading admin", NO_KEY),
     MakeCmdAttr<CommandConfig>("config", -2, "read-only admin skip-monitor", NO_KEY, GenerateConfigFlag),
     MakeCmdAttr<CommandNamespace>("namespace", -2, "read-only admin skip-monitor", NO_KEY, GenerateNamespaceFlag),
     MakeCmdAttr<CommandKeys>("keys", 2, "read-only slow", NO_KEY),
