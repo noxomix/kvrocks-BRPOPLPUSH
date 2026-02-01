@@ -185,6 +185,11 @@ Worker-Level `ns_cmd_stats_` mit shared_mutex (Map-Lookup) + per-NS mutex (Comma
 `cmdstathist_*` (Latenz-Histogramme mit Buckets) bleibt global und admin-only:
 Memory-Overhead wäre N_namespaces × M_commands × Buckets zu hoch.
 Aggregation bei INFO über alle Worker für den anfragenden Namespace.
+
+LEARNING - PERFLOG vs SLOWLOG Namespace-Handling:
+SLOWLOG ist korrekt namespace-aware mit Filter-Lambda und `*WithFilter()` Methoden.
+PERFLOG fehlt diese Implementierung. Pattern: Admin sieht global, Tenant mit ns_filter.
+Jedes Log-Entry braucht `ns` Feld, Filter bei GET/LEN/RESET.
 }
 
 ---
@@ -251,6 +256,24 @@ Aggregation bei INFO über alle Worker für den anfragenden Namespace.
 - [x] MONITOR Per-NS Singleton - O(1) statt O(n_workers), Copy-then-Reply, Tests: `monitor_isolation_test.go`
 - [LATER] WATCH globaler Mutex - Per-NS Sharding (nur falls WATCH intensiv genutzt, unwahrscheinlich)
 
+**Hohe Priorität - Security (Audit 2026-02-01):**
+- [ ] **PERFLOG Namespace-Isolation** - Analog zu SLOWLOG (`cmd_server.cc:383-419`)
+  - PerfEntry braucht `ns` Feld
+  - Filter-Methoden: `SizeWithFilter()`, `GetLatestEntriesWithFilter()`, `ResetWithFilter()`
+  - Admin sieht alles, Tenant nur eigene
+- [x] **STATS kCmdAdmin** - Globale RocksDB-Statistiken nur für Admin (`cmd_server.cc:1610`)
+
+**Mittlere Priorität - Information Disclosure (Audit 2026-02-01):**
+- [ ] **INFO RocksDB Section** - Admin-only (`server.cc:1316-1441`)
+- [ ] **INFO Replication Section** - Admin-only (`server.cc:1528-1542`)
+- [ ] **INFO CPU Section** - Admin-only (`server.cc:1846-1857`)
+- [ ] **INFO Persistence Section** - Admin-only (`server.cc:1831-1844`)
+- [ ] **Sequence Number in Keyspace** - Admin-only oder entfernen (`server.cc:1870`)
+
+**Niedrige Priorität - Concurrency (Audit 2026-02-01):**
+- [ ] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)
+- [ ] **Connection Counting TOCTOU** - Atomic compare_exchange (`redis_connection.cc:169-177`)
+
 ---
 
 //für mich selber: {
@@ -261,5 +284,6 @@ Aggregation bei INFO über alle Worker für den anfragenden Namespace.
 
     Genau wie Transaktionen namespace aware machen das sie nicht global locken.
 
-    Und Lua scripts in transaktionen mappen.
+    Und Lua scripts in transaktio
+nen mappen.
 }
