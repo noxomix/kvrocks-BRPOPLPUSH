@@ -105,10 +105,10 @@
 ## Offen
 
 ### Hoch - LockManager
-- [ ] **LockManager ist GLOBAL** (`storage.cc:82`, `lock_manager.h`)
-  - 65,536 Mutexes für ALLE Namespaces, Hash-Kollisionen zwischen Tenants
-  - Betrifft: ALLE Write-Commands + Blocking Commands
-  - Lösung: Per-Namespace LockManager oder Namespace-aware Hash
+- [x] **LockManager Hash-Kollisionen** (`storage.cc:82`)
+  - Problem: 65,536 Buckets → 86% Kollision bei 512 Workers
+  - Fix: `lock_mgr_(20)` = 1M Buckets → ~12% Kollision
+  - Hinweis: Hash war bereits namespace-aware (ns_key), nur zu wenige Buckets
 
 ### Mittel - Result-Size-Limits
 - [ ] **Config: `max_elements_in_response`** (0 = unlimited)

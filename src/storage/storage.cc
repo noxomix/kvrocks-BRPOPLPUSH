@@ -79,7 +79,7 @@ Storage::Storage(Config *config)
     : backup_creating_time_secs_(util::GetTimeStamp<std::chrono::seconds>()),
       env_(rocksdb::Env::Default()),
       config_(config),
-      lock_mgr_(16),
+      lock_mgr_(20),  // 1M buckets (2^20) - reduces collision rate from 86% to ~12% at 512 workers
       db_stats_(std::make_unique<DBStats>()) {
   Metadata::InitVersionCounter();
   SetWriteOptions(config->rocks_db.write_options);
