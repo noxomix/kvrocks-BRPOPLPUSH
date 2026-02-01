@@ -159,40 +159,33 @@ func TestInfoStatsNamespaceIsolation(t *testing.T) {
 		require.Greater(t, ns1OutIncrease, ns2OutIncrease, "ns1 output bytes should increase more than ns2")
 	})
 
-	t.Run("Admin sees global stats", func(t *testing.T) {
-		// Get admin stats
+	t.Run("Admin sees only own namespace stats", func(t *testing.T) {
+		// Admin is in default namespace, sees only default namespace stats (not global)
+		// This is consistent with: "Admin = normaler Tenant (default namespace)" for data stats
+
+		// Get admin stats baseline
 		adminInfo, err := adminRdb.Info(ctx, "stats").Result()
 		require.NoError(t, err)
 
 		adminCmds, ok := parseInfoStats(adminInfo, "total_commands_processed")
 		require.True(t, ok)
 
-		adminInBytes, ok := parseInfoStats(adminInfo, "total_net_input_bytes")
-		require.True(t, ok)
-
-		// Execute commands on both namespaces
+		// Execute commands on other namespaces (ns1, ns2)
 		for i := 0; i < 50; i++ {
 			require.NoError(t, ns1Rdb.Ping(ctx).Err())
 			require.NoError(t, ns2Rdb.Ping(ctx).Err())
 		}
 
-		// Get admin stats after
+		// Get admin stats after - should NOT include ns1/ns2 commands
 		adminInfoAfter, err := adminRdb.Info(ctx, "stats").Result()
 		require.NoError(t, err)
 
 		adminCmdsAfter, ok := parseInfoStats(adminInfoAfter, "total_commands_processed")
 		require.True(t, ok)
 
-		adminInBytesAfter, ok := parseInfoStats(adminInfoAfter, "total_net_input_bytes")
-		require.True(t, ok)
-
-		// Admin should see commands from BOTH namespaces (at least 100 PINGs + INFO)
+		// Admin should see only minimal increase (just the INFO commands, not ns1/ns2 PINGs)
 		adminCmdIncrease := adminCmdsAfter - adminCmds
-		require.GreaterOrEqual(t, adminCmdIncrease, int64(100), "admin should see commands from all namespaces")
-
-		// Admin bytes should increase
-		adminBytesIncrease := adminInBytesAfter - adminInBytes
-		require.Greater(t, adminBytesIncrease, int64(0), "admin should see global byte traffic")
+		require.Less(t, adminCmdIncrease, int64(10), "admin should NOT see commands from other namespaces")
 	})
 
 	t.Run("Each namespace only sees own traffic", func(t *testing.T) {

@@ -166,6 +166,12 @@ Namespace. Fix: AUTH braucht `no-multi` Flag.
 AUTH während Blocking (BLPOP etc.) ist KEIN Problem - Read-Callback ist nullptr während
 Blocking, neue Commands werden erst NACH dem Blocking verarbeitet.
 
+KONZEPT - SELECT No-Op bei Multi-Tenant:
+Redis-SELECT ist für Single-Tenant DB-Isolation gedacht. Bei Multi-Tenant haben Tenants eh eigene Namespaces.
+No-Op Stub ist ausreichend: SELECT OK, aber keine echte DB-Wechsel. Tenants können Key-Präfixe nutzen
+wenn sie "DBs" brauchen (`db1:key`, `db5:key`). Komplexität der echten Implementation (2 Namespace-Getter,
+Audit aller GetNamespace-Aufrufe) lohnt sich nicht für Multi-Tenant Use Case.
+
 KONZEPT - WATCH Mutex niedrige Priorität:
 `watched_key_mutex_` ist global, aber WATCH ist in der Praxis sehr selten (<1% der Connections).
 Grund: Moderne Apps nutzen Lua Scripts oder atomare Commands (INCR, HINCRBY, etc.) statt WATCH.
@@ -241,7 +247,7 @@ Aggregation bei INFO über alle Worker für den anfragenden Namespace.
 
 **Niedrige Priorität:**
 - [x] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` (Tests: `script_isolation_test.go`, Replication: `replication_test.go`)
-- [ ] SELECT (Logical Databases) - Workaround mit Sub-Namespaces möglich
+- [x] SELECT (Logical Databases) - Bewusst No-Op gelassen, Tenants nutzen Key-Präfixe statt DBs
 - [x] MONITOR Per-NS Singleton - O(1) statt O(n_workers), Copy-then-Reply, Tests: `monitor_isolation_test.go`
 - [LATER] WATCH globaler Mutex - Per-NS Sharding (nur falls WATCH intensiv genutzt, unwahrscheinlich)
 
