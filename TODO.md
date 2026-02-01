@@ -188,8 +188,15 @@ Aggregation bei INFO über alle Worker für den anfragenden Namespace.
 
 LEARNING - PERFLOG vs SLOWLOG Namespace-Handling:
 SLOWLOG ist korrekt namespace-aware mit Filter-Lambda und `*WithFilter()` Methoden.
-PERFLOG fehlt diese Implementierung. Pattern: Admin sieht global, Tenant mit ns_filter.
+PERFLOG analog implementiert. Pattern: Admin sieht global, Tenant mit ns_filter.
 Jedes Log-Entry braucht `ns` Feld, Filter bei GET/LEN/RESET.
+
+KONZEPT - Log-Entry IDs sind globale Counter (akzeptiert):
+SLOWLOG und PERFLOG haben globale Sequenz-IDs. Tenants sehen nur eigene Einträge,
+aber ID-Lücken verraten indirekt Aktivität anderer Tenants (Side-Channel).
+Beispiel: Tenant sieht ID 100, dann 105 → 4 andere Operationen dazwischen.
+Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
+(3) PERFLOG ist kvrocks-spezifisch - könnte ID entfernen, aber Konsistenz mit SLOWLOG wichtiger.
 }
 
 ---
@@ -257,9 +264,9 @@ Jedes Log-Entry braucht `ns` Feld, Filter bei GET/LEN/RESET.
 - [LATER] WATCH globaler Mutex - Per-NS Sharding (nur falls WATCH intensiv genutzt, unwahrscheinlich)
 
 **Hohe Priorität - Security (Audit 2026-02-01):**
-- [ ] **PERFLOG Namespace-Isolation** - Analog zu SLOWLOG (`cmd_server.cc:383-419`)
-  - PerfEntry braucht `ns` Feld
-  - Filter-Methoden: `SizeWithFilter()`, `GetLatestEntriesWithFilter()`, `ResetWithFilter()`
+- [x] **PERFLOG Namespace-Isolation** - Analog zu SLOWLOG (`cmd_server.cc:402-421`)
+  - PerfEntry hat `ns` Feld
+  - Filter-Methoden implementiert: `SizeWithFilter()`, `GetLatestEntriesWithFilter()`, `ResetWithFilter()`
   - Admin sieht alles, Tenant nur eigene
 - [x] **STATS kCmdAdmin** - Globale RocksDB-Statistiken nur für Admin (`cmd_server.cc:1610`)
 
@@ -273,6 +280,10 @@ Jedes Log-Entry braucht `ns` Feld, Filter bei GET/LEN/RESET.
 **Niedrige Priorität - Concurrency (Audit 2026-02-01):**
 - [ ] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)
 - [ ] **Connection Counting TOCTOU** - Atomic compare_exchange (`redis_connection.cc:169-177`)
+- [ ] **LogCollector shared_mutex** - SLOWLOG/PERFLOG Worker-Blocking (`log_collector.h:84`)
+  - Problem: `std::mutex` blockiert ganze Worker-Threads bei parallelen GET/LEN Anfragen
+  - Fix: `std::shared_mutex` mit `shared_lock` für Reads (Size, GetLatestEntries), `unique_lock` nur für Writes (PushEntry, Reset)
+  - Impact: Niedrig (Lock ist kurz ~50μs), aber spürbar bei koordiniertem Spam
 
 ---
 

@@ -399,16 +399,33 @@ class CommandPerfLog : public Commander {
     return Status::OK();
   }
 
-  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, [[maybe_unused]] Connection *conn,
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
                  std::string *output) override {
     auto perf_log = srv->GetPerfLog();
+    const std::string ns = conn->GetNamespace();
+
+    // Filter function: match entries for this namespace only
+    auto ns_filter = [&ns](const PerfEntry &entry) { return entry.ns == ns; };
+
     if (subcommand_ == "len") {
-      *output = redis::Integer(static_cast<int64_t>(perf_log->Size()));
+      if (conn->IsAdmin()) {
+        *output = redis::Integer(static_cast<int64_t>(perf_log->Size()));
+      } else {
+        *output = redis::Integer(static_cast<int64_t>(perf_log->SizeWithFilter(ns_filter)));
+      }
     } else if (subcommand_ == "reset") {
-      perf_log->Reset();
+      if (conn->IsAdmin()) {
+        perf_log->Reset();
+      } else {
+        perf_log->ResetWithFilter(ns_filter);
+      }
       *output = redis::RESP_OK;
     } else if (subcommand_ == "get") {
-      *output = perf_log->GetLatestEntries(cnt_);
+      if (conn->IsAdmin()) {
+        *output = perf_log->GetLatestEntries(cnt_);
+      } else {
+        *output = perf_log->GetLatestEntriesWithFilter(cnt_, ns_filter);
+      }
     }
     return Status::OK();
   }

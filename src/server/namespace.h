@@ -38,7 +38,10 @@ class Namespace {
   Status Set(const std::string &ns, const std::string &token);
   Status Add(const std::string &ns, const std::string &token);
   Status Del(const std::string &ns);
-  const std::map<std::string, std::string> &List() const { return tokens_; }
+  std::map<std::string, std::string> List() const {
+    std::shared_lock lock(tokens_mu_);
+    return tokens_;
+  }
   Status Rewrite(const std::map<std::string, std::string> &tokens) const;
   bool IsAllowModify() const;
 

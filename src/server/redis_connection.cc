@@ -372,6 +372,7 @@ void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t du
   entry->duration = duration;
   entry->iostats_context = std::move(iostats_context);
   entry->perf_context = std::move(perf_context);
+  entry->ns = GetNamespace();
   srv_->GetPerfLog()->PushEntry(std::move(entry));
 }
 

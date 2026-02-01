@@ -55,6 +55,7 @@ class PerfEntry {
   std::string cmd_name;
   std::string perf_context;
   std::string iostats_context;
+  std::string ns;  // Namespace for tenant isolation
 
   std::string ToRedisString() const;
   void DumpToLogFile(spdlog::level::level_enum) const {};
