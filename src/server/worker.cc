@@ -700,6 +700,62 @@ std::unordered_map<std::string, NamespaceStatsSnapshot> Worker::GetNamespaceStat
   return snapshot;
 }
 
+// Per-namespace command stats with noisy-neighbor prevention
+void Worker::IncrCommandStatForNamespace(const std::string &ns, const std::string &cmd, uint64_t latency) {
+  NamespaceCommandStats *stats = nullptr;
+
+  // Fast path: shared_lock for lookup (parallel with other tenants)
+  {
+    std::shared_lock<std::shared_mutex> lock(ns_cmd_stats_mu_);
+    auto it = ns_cmd_stats_.find(ns);
+    if (it != ns_cmd_stats_.end()) {
+      stats = it->second.get();
+    }
+  }
+
+  // Slow path: namespace not yet known → unique_lock for insert
+  if (!stats) {
+    std::unique_lock<std::shared_mutex> lock(ns_cmd_stats_mu_);
+    // Double-check after lock upgrade
+    auto it = ns_cmd_stats_.find(ns);
+    if (it == ns_cmd_stats_.end()) {
+      ns_cmd_stats_[ns] = std::make_unique<NamespaceCommandStats>();
+      it = ns_cmd_stats_.find(ns);
+    }
+    stats = it->second.get();
+  }
+
+  // Per-NS lock (other tenants not affected)
+  {
+    std::lock_guard<std::mutex> lock(stats->mu);
+    auto &cmd_stat = stats->commands[cmd];
+    cmd_stat.calls.fetch_add(1, std::memory_order_relaxed);
+    cmd_stat.latency.fetch_add(latency, std::memory_order_relaxed);
+  }
+}
+
+std::map<std::string, CommandStatSnapshot> Worker::GetCommandStatsForNamespace(const std::string &ns) const {
+  std::map<std::string, CommandStatSnapshot> result;
+
+  // shared_lock for lookup (parallel with other tenants)
+  std::shared_lock<std::shared_mutex> map_lock(ns_cmd_stats_mu_);
+  auto it = ns_cmd_stats_.find(ns);
+  if (it == ns_cmd_stats_.end()) {
+    return result;
+  }
+
+  // Per-NS lock for snapshot (short, only atomic loads)
+  {
+    std::lock_guard<std::mutex> lock(it->second->mu);
+    for (const auto &[cmd, stat] : it->second->commands) {
+      result[cmd] = {stat.calls.load(std::memory_order_relaxed),
+                     stat.latency.load(std::memory_order_relaxed)};
+    }
+  }
+
+  return result;
+}
+
 int64_t Worker::GetLuaMemorySize() { return (int64_t)lua_gc(lua_, LUA_GCCOUNT, 0) * 1024; }
 
 void Worker::KickoutIdleClients(int timeout) {

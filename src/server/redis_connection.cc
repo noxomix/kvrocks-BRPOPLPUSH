@@ -393,6 +393,12 @@ Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_n
 
   srv_->SlowlogPushEntryIfNeeded(&cmd_tokens, duration, this);
   srv_->stats.IncrLatency(static_cast<uint64_t>(duration), cmd_name);
+
+  // Per-namespace command stats (after latency measurement)
+  if (!ns.empty()) {
+    owner_->IncrCommandStatForNamespace(ns, cmd_name, static_cast<uint64_t>(duration));
+  }
+
   return s;
 }
 

@@ -172,6 +172,13 @@ Grund: Moderne Apps nutzen Lua Scripts oder atomare Commands (INCR, HINCRBY, etc
 Typische Workloads (Caching, Sessions, Queues wie Laravel Queue, Pub/Sub) nutzen kein WATCH.
 Falls `watched_key_size_ == 0` → Early-Exit, kein Lock. Per-Namespace Sharding nur nötig
 falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
+
+LEARNING - cmdstat vs cmdstathist Trennung:
+`cmdstat_*` (calls, usec, usec_per_call) ist per-NS mit Noisy-Neighbor Prevention:
+Worker-Level `ns_cmd_stats_` mit shared_mutex (Map-Lookup) + per-NS mutex (Command-Update).
+`cmdstathist_*` (Latenz-Histogramme mit Buckets) bleibt global und admin-only:
+Memory-Overhead wäre N_namespaces × M_commands × Buckets zu hoch.
+Aggregation bei INFO über alle Worker für den anfragenden Namespace.
 }
 
 ---
@@ -229,7 +236,7 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 **Mittlere Priorität - INFO Stats:**
 - [x] `total_connections_received` - Kumulativer Counter (per-NS nach Auth)
 - [x] `instantaneous_ops_per_sec` - On-Demand + 100ms Cache + Per-NS Mutex (alle 3 Metriken)
-- [ ] `cmdstat_*` - Per-Command Stats (Memory-Overhead bedenken)
+- [x] `cmdstat_*` - Per-Command Stats per-NS, `cmdstathist_*` admin-only (Tests: `client_isolation_test.go`)
 - [x] `used_memory_lua` - Admin-only by design (Lua-VM pro Worker shared, keine per-NS Attribution möglich)
 
 **Niedrige Priorität:**

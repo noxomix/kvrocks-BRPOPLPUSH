@@ -1650,6 +1650,18 @@ NamespaceStatsSnapshot Server::AggregateNamespaceStats(const std::string &ns) {
   return result;
 }
 
+std::map<std::string, CommandStatSnapshot> Server::AggregateCommandStatsForNamespace(const std::string &ns) {
+  std::map<std::string, CommandStatSnapshot> result;
+  for (const auto &t : worker_threads_) {
+    auto worker_stats = t->GetWorker()->GetCommandStatsForNamespace(ns);
+    for (const auto &[cmd, stat] : worker_stats) {
+      result[cmd].calls += stat.calls;
+      result[cmd].latency += stat.latency;
+    }
+  }
+  return result;
+}
+
 NamespaceRates Server::GetInstantaneousRatesForNamespace(const std::string &ns) {
   auto now = util::GetTimeStampMS();
 
@@ -1769,38 +1781,40 @@ Server::InfoEntries Server::GetStatsInfo(const std::string &ns, [[maybe_unused]]
   return entries;
 }
 
-Server::InfoEntries Server::GetCommandsStatsInfo() {
+Server::InfoEntries Server::GetCommandsStatsInfo(const std::string &ns, bool is_admin) {
   InfoEntries entries;
 
-  for (const auto &cmd_stat : stats.commands_stats) {
-    auto calls = cmd_stat.second.calls.load();
-    if (calls == 0) continue;
-
-    auto latency = cmd_stat.second.latency.load();
-    entries.emplace_back("cmdstat_" + cmd_stat.first,
-                         fmt::format("calls={},usec={},usec_per_call={}", calls, latency,
-                                     static_cast<double>(latency) / static_cast<double>(calls)));
+  // cmdstat_* - Per-Namespace (each tenant sees only their own stats)
+  auto cmd_stats = AggregateCommandStatsForNamespace(ns);
+  for (const auto &[cmd, stat] : cmd_stats) {
+    if (stat.calls == 0) continue;
+    entries.emplace_back("cmdstat_" + cmd,
+                         fmt::format("calls={},usec={},usec_per_call={}", stat.calls, stat.latency,
+                                     static_cast<double>(stat.latency) / static_cast<double>(stat.calls)));
   }
 
-  for (const auto &cmd_hist : stats.commands_histogram) {
-    auto command_name = cmd_hist.first;
-    auto calls = stats.commands_histogram[command_name].calls.load();
-    if (calls == 0) continue;
+  // cmdstathist_* - Admin-only (global histogram)
+  if (is_admin) {
+    for (const auto &cmd_hist : stats.commands_histogram) {
+      auto command_name = cmd_hist.first;
+      auto calls = stats.commands_histogram[command_name].calls.load();
+      if (calls == 0) continue;
 
-    auto sum = stats.commands_histogram[command_name].sum.load();
-    std::string result;
-    for (std::size_t i{0}; i < stats.commands_histogram[command_name].buckets.size(); ++i) {
-      auto bucket_value = stats.commands_histogram[command_name].buckets[i]->load();
-      auto bucket_bound = std::numeric_limits<double>::infinity();
-      if (i < stats.bucket_boundaries.size()) {
-        bucket_bound = stats.bucket_boundaries[i];
+      auto sum = stats.commands_histogram[command_name].sum.load();
+      std::string result;
+      for (std::size_t i{0}; i < stats.commands_histogram[command_name].buckets.size(); ++i) {
+        auto bucket_value = stats.commands_histogram[command_name].buckets[i]->load();
+        auto bucket_bound = std::numeric_limits<double>::infinity();
+        if (i < stats.bucket_boundaries.size()) {
+          bucket_bound = stats.bucket_boundaries[i];
+        }
+
+        result.append(fmt::format("{}={},", bucket_bound, bucket_value));
       }
+      result.append(fmt::format("sum={},count={}", sum, calls));
 
-      result.append(fmt::format("{}={},", bucket_bound, bucket_value));
+      entries.emplace_back("cmdstathist_" + command_name, result);
     }
-    result.append(fmt::format("sum={},count={}", sum, calls));
-
-    entries.emplace_back("cmdstathist_" + command_name, result);
   }
 
   return entries;
@@ -1889,7 +1903,7 @@ std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::stri
       {"Stats", [&ns, is_admin](Server *srv) { return srv->GetStatsInfo(ns, is_admin); }},
       {"Replication", &Server::GetReplicationInfo},
       {"CPU", &Server::GetCpuInfo},
-      {"CommandStats", &Server::GetCommandsStatsInfo},
+      {"CommandStats", [&ns, is_admin](Server *srv) { return srv->GetCommandsStatsInfo(ns, is_admin); }},
       {"Cluster", &Server::GetClusterInfo},
       {"Keyspace", [&ns](Server *srv) { return srv->GetKeyspaceInfo(ns); }},
       {"RocksDB", &Server::GetRocksDBInfo},

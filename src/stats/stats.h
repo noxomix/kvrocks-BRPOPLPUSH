@@ -26,6 +26,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -77,6 +78,18 @@ struct NamespaceStatsSnapshot {
   uint64_t in_bytes = 0;
   uint64_t out_bytes = 0;
   uint64_t total_connections = 0;
+};
+
+// Snapshot of CommandStat (non-atomic, for aggregation)
+struct CommandStatSnapshot {
+  uint64_t calls = 0;
+  uint64_t latency = 0;
+};
+
+// Per-namespace command statistics with own mutex (no cross-tenant blocking)
+struct NamespaceCommandStats {
+  mutable std::mutex mu;  // Per-NS mutex - tenants don't block each other
+  std::map<std::string, CommandStat> commands;
 };
 
 class Stats {

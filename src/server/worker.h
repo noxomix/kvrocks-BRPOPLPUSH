@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -100,6 +101,10 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::unordered_map<std::string, NamespaceStatsSnapshot> GetNamespaceStatsSnapshot() const;
   NamespaceStatsSnapshot GetNamespaceStats(const std::string &ns) const;
 
+  // Per-namespace command stats (with noisy-neighbor prevention)
+  void IncrCommandStatForNamespace(const std::string &ns, const std::string &cmd, uint64_t latency);
+  std::map<std::string, CommandStatSnapshot> GetCommandStatsForNamespace(const std::string &ns) const;
+
  private:
   Status listenFD(int fd, uint32_t expected_port, int backlog);
   Status listenTCP(const std::string &host, uint32_t port, int backlog);
@@ -128,6 +133,12 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   // Per-namespace stats for tenant isolation
   mutable std::mutex ns_stats_mu_;
   std::unordered_map<std::string, NamespaceStats> ns_stats_;
+
+  // Per-namespace command stats with noisy-neighbor prevention
+  // shared_mutex for map lookup (parallel reads), unique_lock only for insert
+  // Per-NS mutex inside NamespaceCommandStats - tenants don't block each other
+  mutable std::shared_mutex ns_cmd_stats_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespaceCommandStats>> ns_cmd_stats_;
 };
 
 class WorkerThread {

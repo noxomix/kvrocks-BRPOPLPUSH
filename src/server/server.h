@@ -328,13 +328,14 @@ class Server {
 
   InfoEntries GetStatsInfo(const std::string &ns, bool is_admin);
   NamespaceStatsSnapshot AggregateNamespaceStats(const std::string &ns);
+  std::map<std::string, CommandStatSnapshot> AggregateCommandStatsForNamespace(const std::string &ns);
   NamespaceRates GetInstantaneousRatesForNamespace(const std::string &ns);
   InfoEntries GetServerInfo();
   InfoEntries GetMemoryInfo(redis::Connection *conn);
   InfoEntries GetRocksDBInfo();
   InfoEntries GetClientsInfo(redis::Connection *self);
   InfoEntries GetReplicationInfo();
-  InfoEntries GetCommandsStatsInfo();
+  InfoEntries GetCommandsStatsInfo(const std::string &ns, bool is_admin);
   InfoEntries GetClusterInfo();
   InfoEntries GetPersistenceInfo();
   InfoEntries GetCpuInfo();

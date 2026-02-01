@@ -21,8 +21,11 @@ package namespace
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -862,6 +865,227 @@ func TestInstantaneousOpsPerSecNamespaceIsolation(t *testing.T) {
 	})
 
 	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}
+
+func TestCmdstatNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Helper to parse cmdstat from INFO output
+	parseCmdstat := func(info, cmd string) (calls int64, found bool) {
+		// Format: cmdstat_get:calls=10,usec=50,usec_per_call=5.00
+		prefix := "cmdstat_" + cmd + ":"
+		for _, line := range strings.Split(info, "\r\n") {
+			if strings.HasPrefix(line, prefix) {
+				// Extract calls=N
+				parts := strings.Split(strings.TrimPrefix(line, prefix), ",")
+				for _, part := range parts {
+					if strings.HasPrefix(part, "calls=") {
+						val, err := strconv.ParseInt(strings.TrimPrefix(part, "calls="), 10, 64)
+						if err == nil {
+							return val, true
+						}
+					}
+				}
+			}
+		}
+		return 0, false
+	}
+
+	t.Run("cmdstat per namespace isolation", func(t *testing.T) {
+		// ns1: Execute GET commands
+		for i := 0; i < 10; i++ {
+			ns1Rdb.Get(ctx, "testkey")
+		}
+
+		// ns2: Execute SET commands
+		for i := 0; i < 5; i++ {
+			ns2Rdb.Set(ctx, "testkey", "value", 0)
+		}
+
+		// ns1 should see its GET stats
+		info1 := ns1Rdb.Info(ctx, "commandstats").Val()
+		getCalls, found := parseCmdstat(info1, "get")
+		require.True(t, found, "ns1 should have cmdstat_get")
+		require.GreaterOrEqual(t, getCalls, int64(10), "ns1 should have at least 10 GET calls")
+
+		// ns1 should NOT see ns2's SET stats
+		_, found = parseCmdstat(info1, "set")
+		require.False(t, found, "ns1 should NOT see cmdstat_set from ns2")
+
+		// ns2 should see its SET stats
+		info2 := ns2Rdb.Info(ctx, "commandstats").Val()
+		setCalls, found := parseCmdstat(info2, "set")
+		require.True(t, found, "ns2 should have cmdstat_set")
+		require.GreaterOrEqual(t, setCalls, int64(5), "ns2 should have at least 5 SET calls")
+
+		// ns2 should NOT see ns1's GET stats
+		_, found = parseCmdstat(info2, "get")
+		require.False(t, found, "ns2 should NOT see cmdstat_get from ns1")
+	})
+
+	t.Run("cmdstat includes latency", func(t *testing.T) {
+		info := ns1Rdb.Info(ctx, "commandstats").Val()
+		// Check format: cmdstat_get:calls=N,usec=N,usec_per_call=N.NN
+		require.Contains(t, info, "usec=", "cmdstat should include usec")
+		require.Contains(t, info, "usec_per_call=", "cmdstat should include usec_per_call")
+	})
+
+	t.Run("cmdstathist admin only", func(t *testing.T) {
+		// Tenant should NOT see cmdstathist
+		info1 := ns1Rdb.Info(ctx, "commandstats").Val()
+		require.NotContains(t, info1, "cmdstathist_", "Tenant should NOT see cmdstathist")
+
+		info2 := ns2Rdb.Info(ctx, "commandstats").Val()
+		require.NotContains(t, info2, "cmdstathist_", "Tenant should NOT see cmdstathist")
+
+		// Admin CAN see cmdstathist (if histogram-bucket-boundaries configured)
+		// Note: By default histogram is not configured, so we just verify tenants don't see it
+	})
+
+	t.Run("admin sees only own namespace cmdstat", func(t *testing.T) {
+		// Admin is in default namespace, should see only default namespace stats
+		// Execute some commands as admin
+		for i := 0; i < 3; i++ {
+			adminRdb.Ping(ctx)
+		}
+
+		infoAdmin := adminRdb.Info(ctx, "commandstats").Val()
+		pingCalls, found := parseCmdstat(infoAdmin, "ping")
+		require.True(t, found, "Admin should have cmdstat_ping")
+		require.GreaterOrEqual(t, pingCalls, int64(3), "Admin should have at least 3 PING calls")
+	})
+
+	// Cleanup
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}
+
+func TestCmdstatNoisyNeighborPrevention(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	t.Run("concurrent INFO commandstats does not block other tenants", func(t *testing.T) {
+		const numGoroutines = 10
+		const opsPerGoroutine = 100
+
+		var wg sync.WaitGroup
+		var ns1Latencies, ns2Latencies []time.Duration
+		var mu sync.Mutex
+
+		// ns1: Spam INFO commandstats (potential noisy neighbor)
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rdb := srv.NewClientWithOption(&redis.Options{
+					Password: "token1",
+				})
+				defer rdb.Close()
+
+				for j := 0; j < opsPerGoroutine; j++ {
+					start := time.Now()
+					rdb.Info(ctx, "commandstats")
+					elapsed := time.Since(start)
+
+					mu.Lock()
+					ns1Latencies = append(ns1Latencies, elapsed)
+					mu.Unlock()
+				}
+			}()
+		}
+
+		// ns2: Normal SET/GET operations (should not be affected)
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rdb := srv.NewClientWithOption(&redis.Options{
+					Password: "token2",
+				})
+				defer rdb.Close()
+
+				for j := 0; j < opsPerGoroutine; j++ {
+					start := time.Now()
+					rdb.Set(ctx, fmt.Sprintf("key%d", j), "value", 0)
+					elapsed := time.Since(start)
+
+					mu.Lock()
+					ns2Latencies = append(ns2Latencies, elapsed)
+					mu.Unlock()
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		// Calculate P99 latencies
+		sort.Slice(ns1Latencies, func(i, j int) bool { return ns1Latencies[i] < ns1Latencies[j] })
+		sort.Slice(ns2Latencies, func(i, j int) bool { return ns2Latencies[i] < ns2Latencies[j] })
+
+		p99Idx1 := int(float64(len(ns1Latencies)) * 0.99)
+		p99Idx2 := int(float64(len(ns2Latencies)) * 0.99)
+
+		ns1P99 := ns1Latencies[p99Idx1]
+		ns2P99 := ns2Latencies[p99Idx2]
+
+		t.Logf("ns1 (INFO spam) P99: %v", ns1P99)
+		t.Logf("ns2 (SET ops) P99: %v", ns2P99)
+
+		// ns2's P99 should be reasonable (< 100ms) even under ns1's INFO spam
+		require.Less(t, ns2P99, 100*time.Millisecond,
+			"ns2 P99 latency should be < 100ms even with ns1 spamming INFO commandstats")
+
+		// ns2's P99 should not be significantly worse than ns1's
+		// Allow 10x difference max (INFO is more expensive than SET)
+		require.Less(t, ns2P99, ns1P99*10,
+			"ns2 should not be blocked by ns1's INFO spam")
+	})
+
+	// Cleanup
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
 }
