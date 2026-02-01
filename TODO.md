@@ -220,7 +220,7 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 - [x] `total_connections_received` - Kumulativer Counter (per-NS nach Auth)
 - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
 - [ ] `cmdstat_*` - Per-Command Stats (Memory-Overhead bedenken)
-- [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)
+- [x] `used_memory_lua` - Admin-only by design (Lua-VM pro Worker shared, keine per-NS Attribution möglich)
 
 **Niedrige Priorität:**
 - [x] SCRIPT FLUSH Namespace-Isolation - Scripts als `f_{ns}_{sha}` (Tests: `script_isolation_test.go`, Replication: `replication_test.go`)
