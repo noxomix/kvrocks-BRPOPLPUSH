@@ -40,6 +40,33 @@
 - FUNCTION: `<ns>_<lib>`, LuaResetNamespace() für Cleanup
 - `lua_pushvalue(lua, LUA_GLOBALSINDEX)` statt `lua_pushglobaltable` (Lua 5.1)
 
+### Transaktionen & Atomizität
+
+**MULTI/EXEC:**
+- Pro Namespace nur 1 EXEC gleichzeitig (`WorkExclusivityGuard(ns)`)
+- Andere Tenants können parallel EXEC ausführen
+- Worker blockiert während EXEC (kurz, nur Ausführungsdauer)
+- Commands werden in `ns_txn_states_[ns].batch` (WriteBatch) gesammelt
+- **Kein Rollback bei Fehlern** während EXEC (Redis-Design)
+
+**EVAL/FCALL:**
+- Default: `lua_strict_key_accessing=false` → EVAL ist `kCmdExclusive`
+- Pro Namespace nur 1 EVAL gleichzeitig
+- Worker blockiert während EVAL (synchrone Ausführung)
+- **Standalone EVAL:** Kein WriteBatch, jeder `redis.call()` committed sofort
+- **EVAL in MULTI:** Nutzt MULTI's WriteBatch, ist transaktional
+
+**Verschachtelung:**
+- EVAL in MULTI: ✅ Erlaubt, nutzt WriteBatch
+- MULTI in EVAL: ❌ Nicht erlaubt (EXEC hat `exclusive` Flag)
+- EVAL in EVAL: ❌ Nicht erlaubt (`no-script` Flag)
+- FCALL in EVAL: ❌ Nicht erlaubt (`no-script` Flag)
+
+**Kein Rollback (Redis-Verhalten):**
+- Fehler während EXEC führen NICHT zu Rollback
+- Bereits ausgeführte Commands + erfolgreiche Teile bleiben committed
+- Nur DISCARD (vor EXEC) verwirft alles
+
 ---
 
 ## Erledigt
@@ -110,13 +137,38 @@
   - Fix: `lock_mgr_(20)` = 1M Buckets → ~12% Kollision
   - Hinweis: Hash war bereits namespace-aware (ns_key), nur zu wenige Buckets
 
-### Mittel - Result-Size-Limits
-- [ ] **Config: `max_elements_in_response`** (0 = unlimited)
-  - HGETALL/HKEYS/HVALS, SMEMBERS, LRANGE, ZRANGE, KEYS
-  - Pattern: `if (limit > 0 && result.size() > limit) return Error;`
+### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
+
+**Problem:** Diese Commands blockieren einen Worker während der gesamten Iteration.
+Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
+
+**Lösung:** Config `max_elements_in_response` (0 = unlimited, default)
+**Pattern:** `if (limit > 0 && result.size() > limit) return Error;`
+
+- [ ] **Hash O(n):** HGETALL, HKEYS, HVALS (`cmd_hash.cc`)
+- [ ] **Set O(n):** SMEMBERS (`cmd_set.cc`)
+- [ ] **Set O(n*m):** SINTER, SUNION, SDIFF, SINTERSTORE, SUNIONSTORE, SDIFFSTORE (`cmd_set.cc`)
+- [ ] **ZSet O(n*k):** ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE (`cmd_zset.cc`)
+- [ ] **List O(n):** LRANGE, LINSERT, LREM (`cmd_list.cc`)
+- [ ] **ZSet O(n):** ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE (`cmd_zset.cc`)
+- [ ] **Keys O(n):** KEYS (`cmd_server.cc`)
+
+**Bereits geschützt:**
+- [x] SORT - Hat `SORT_LENGTH_LIMIT = 512` (`redis_db.h:39`)
+- [x] XRANGE/XREVRANGE - Hat COUNT Option
+- [x] GEORADIUS/GEOSEARCH - Hat COUNT Option
+- [x] EVAL/FCALL - Namespace-aware via `WorkExclusivityGuard(ns)` (kein Cross-Tenant-Problem)
 
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
+- [ ] **Lua Timeout** - Self-DoS möglich (Endlosschleife blockiert eigenen NS permanent)
+- [ ] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
+  - Neue Commands: `EVAL_TX`, `EVALSHA_TX`, `FCALL_TX` (analog zu `_RO` Suffix)
+  - Standalone: Eigenes `BeginTxn`/`CommitTxn`, bei Fehler `DiscardTxn`
+  - In MULTI: Nutzt MULTI's WriteBatch (kein eigenes Rollback)
+  - Redis-kompatibel: EVAL/FCALL bleiben unverändert (kein Rollback)
+  - Aufwand: ~20 Zeilen in `scripting.cc`, ~20 Zeilen in `cmd_function.cc`
+  - Dateien: `cmd_script.cc`, `scripting.cc`, `cmd_function.cc`, `storage.cc`
 
 ---
 
@@ -125,14 +177,11 @@
 ```
 GEPRÜFT: Re-AUTH während Blocking ist kein Problem (Read-Callback nullptr)
 GEPRÜFT: Re-AUTH während MULTI ist Bug → AUTH hat no-multi Flag
-FAZIT: Transaktionen OK. LockManager ist NICHT OK - TODO erstellt. WATCH global aber akzeptabel.
+FAZIT: Transaktionen OK. LockManager OK (1M Buckets). WATCH global aber akzeptabel.
 
 TODO später:
 - RESETSTAT existiert nicht in kvrocks (in Redis schon)
-- Lua scripts in Transaktionen mappen
 - LuaResetNamespace() iteriert über ALLE Globals - O(n_globals)
-- Lua Scripts (EVAL) werden kCmdExclusive wenn lua_strict_key_accessing=false
-  → Dann namespace-aware via WorkExclusivityGuard(ns)
 ```
 
 ### Ideen
