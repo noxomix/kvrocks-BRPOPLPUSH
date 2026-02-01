@@ -1089,3 +1089,78 @@ func TestCmdstatNoisyNeighborPrevention(t *testing.T) {
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
 }
+
+func TestInfoAdminOnlySections(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespace
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+
+	// Tenant connection
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	// Admin-only sections that expose infrastructure details
+	adminOnlySections := []string{"RocksDB", "Replication", "CPU", "Persistence"}
+
+	t.Run("Tenant cannot see admin-only INFO sections", func(t *testing.T) {
+		// Request all sections
+		info := ns1Rdb.Info(ctx).Val()
+
+		for _, section := range adminOnlySections {
+			require.NotContains(t, info, "# "+section,
+				"Tenant should NOT see # %s section", section)
+		}
+
+		// Explicitly request admin-only sections - should return empty or not contain the section
+		for _, section := range adminOnlySections {
+			sectionInfo := ns1Rdb.Info(ctx, strings.ToLower(section)).Val()
+			require.NotContains(t, sectionInfo, "# "+section,
+				"Tenant should NOT see # %s even when explicitly requested", section)
+		}
+	})
+
+	t.Run("Admin can see all INFO sections", func(t *testing.T) {
+		info := adminRdb.Info(ctx).Val()
+
+		for _, section := range adminOnlySections {
+			require.Contains(t, info, "# "+section,
+				"Admin should see # %s section", section)
+		}
+	})
+
+	t.Run("Tenant cannot see sequence in Keyspace", func(t *testing.T) {
+		// Write some data to create sequence activity
+		require.NoError(t, ns1Rdb.Set(ctx, "testkey", "value", 0).Err())
+
+		info := ns1Rdb.Info(ctx, "keyspace").Val()
+
+		// Tenant should see keyspace info but NOT sequence
+		require.Contains(t, info, "# Keyspace", "Tenant should see Keyspace section")
+		require.NotContains(t, info, "sequence:", "Tenant should NOT see sequence number")
+	})
+
+	t.Run("Admin can see sequence in Keyspace", func(t *testing.T) {
+		info := adminRdb.Info(ctx, "keyspace").Val()
+
+		require.Contains(t, info, "# Keyspace", "Admin should see Keyspace section")
+		require.Contains(t, info, "sequence:", "Admin should see sequence number")
+	})
+
+	// Cleanup
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+}

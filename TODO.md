@@ -295,6 +295,7 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
 
     Genau wie Transaktionen namespace aware machen das sie nicht global locken.
 
-    Und Lua scripts in transaktio
-nen mappen.
+    Und Lua scripts in transaktionen mappen.
+
+    GGf. später ins todo übernehmen:   Und LuaResetNamespace() iteriert jetzt über ALLE Lua-Globals:lua_pushvalue(lua, LUA_GLOBALSINDEX);  // O(n_globals)!.
 }
