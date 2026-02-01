@@ -28,7 +28,14 @@ und wird nur global gezählt. Das ist korrekt und kein Bug.
 
 LEARNING - Aggregation optimieren:
 Bei Cross-Worker Aggregation (z.B. INFO stats) nicht alle Daten von allen Workern holen und dann filtern.
-Stattdessen: Gezielt nur die benötigten Daten anfragen (z.B. `GetNamespaceStats(ns)` statt `GetAllStats()`).
+Stattdessen: Gezielt nur die benötigten Daten anfragen
+(z.B. `GetNamespaceStats(ns)` statt `GetNamespaceStatsSnapshot()` - O(1) vs O(n_namespaces)).
+
+LEARNING - Connection-Zählung nach Auth:
+`total_connections_received` wird pro Namespace gezählt, aber erst NACH erfolgreicher
+Authentifizierung (in SetNamespace()). Grund: Vor AUTH ist der Namespace unbekannt.
+Flag `connection_counted_` in Connection verhindert doppeltes Zählen bei Re-AUTH oder
+RESET→AUTH. Jede Connection zählt genau einmal für den ersten authentifizierten Namespace.
 
 KONZEPT - Blocking vs. Locking:
 - **Blocking** (`blocked_clients`): Connection WARTET auf externes Event (BLPOP wartet auf Daten, XREAD BLOCK, WAIT).
@@ -210,7 +217,7 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
   - Betrifft nur Replica während Full-Sync, gibt sowieso "LOADING" zurück, also voll unnötig.
 
 **Mittlere Priorität - INFO Stats:**
-- [ ] `total_connections_received` - Kumulativer Counter
+- [x] `total_connections_received` - Kumulativer Counter (per-NS nach Auth)
 - [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
 - [ ] `cmdstat_*` - Per-Command Stats (Memory-Overhead bedenken)
 - [ ] `used_memory_lua` - Architektonisch schwierig (Lua-VM pro Worker shared)

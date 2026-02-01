@@ -69,12 +69,14 @@ struct NamespaceStats {
   std::atomic<uint64_t> total_calls{0};
   std::atomic<uint64_t> in_bytes{0};
   std::atomic<uint64_t> out_bytes{0};
+  std::atomic<uint64_t> total_connections{0};
 };
 
 struct NamespaceStatsSnapshot {
   uint64_t total_calls = 0;
   uint64_t in_bytes = 0;
   uint64_t out_bytes = 0;
+  uint64_t total_connections = 0;
 };
 
 class Stats {

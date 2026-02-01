@@ -155,7 +155,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   void BecomeAdmin() { is_admin_ = true; }
   void BecomeUser() { is_admin_ = false; }
   const std::string& GetNamespace() const { return ns_; }
-  void SetNamespace(std::string ns) { ns_ = std::move(ns); }
+  void SetNamespace(std::string ns);
 
   void NeedFreeBufferEvent(bool need_free = true) { need_free_bev_ = need_free; }
   void NeedNotFreeBufferEvent() { NeedFreeBufferEvent(false); }
@@ -197,6 +197,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   uint64_t id_ = 0;
   std::atomic<int> flags_ = 0;
   std::string ns_;  // Empty before AUTH, set via SetNamespace() after successful auth
+  bool connection_counted_ = false;  // Prevents double-counting on Re-AUTH or RESET→AUTH
   std::string name_;
   std::string ip_;
   std::string announce_ip_;

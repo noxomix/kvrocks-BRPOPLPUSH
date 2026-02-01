@@ -166,6 +166,16 @@ void Connection::SetAddr(std::string ip, uint32_t port) {
   addr_ = ip_ + ":" + std::to_string(port_);
 }
 
+void Connection::SetNamespace(std::string ns) {
+  // Count only on first authentication (ns_ was empty, new ns is not empty)
+  // connection_counted_ prevents double-counting on Re-AUTH or RESET→AUTH
+  if (!connection_counted_ && !ns.empty() && ns_.empty()) {
+    owner_->IncrConnectionsForNamespace(ns);
+    connection_counted_ = true;
+  }
+  ns_ = std::move(ns);
+}
+
 uint64_t Connection::GetAge() const { return static_cast<uint64_t>(util::GetTimeStamp() - create_time_); }
 
 void Connection::SetLastInteraction() { last_interaction_ = util::GetTimeStamp(); }

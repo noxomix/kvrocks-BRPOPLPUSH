@@ -96,6 +96,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void IncrCallsForNamespace(const std::string &ns);
   void IncrInboundBytesForNamespace(const std::string &ns, uint64_t bytes);
   void IncrOutboundBytesForNamespace(const std::string &ns, uint64_t bytes);
+  void IncrConnectionsForNamespace(const std::string &ns);
   std::unordered_map<std::string, NamespaceStatsSnapshot> GetNamespaceStatsSnapshot() const;
   NamespaceStatsSnapshot GetNamespaceStats(const std::string &ns) const;
 

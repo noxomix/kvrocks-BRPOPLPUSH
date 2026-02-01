@@ -1635,33 +1635,25 @@ int64_t Server::GetLastBgsaveTime() {
 NamespaceStatsSnapshot Server::AggregateNamespaceStats(const std::string &ns) {
   NamespaceStatsSnapshot result;
   for (const auto &t : worker_threads_) {
-    auto worker_stats = t->GetWorker()->GetNamespaceStatsSnapshot();
-    auto it = worker_stats.find(ns);
-    if (it != worker_stats.end()) {
-      result.total_calls += it->second.total_calls;
-      result.in_bytes += it->second.in_bytes;
-      result.out_bytes += it->second.out_bytes;
-    }
+    // Optimization: Only fetch stats for requested namespace, not entire map
+    auto worker_stats = t->GetWorker()->GetNamespaceStats(ns);
+    result.total_calls += worker_stats.total_calls;
+    result.in_bytes += worker_stats.in_bytes;
+    result.out_bytes += worker_stats.out_bytes;
+    result.total_connections += worker_stats.total_connections;
   }
   return result;
 }
 
-Server::InfoEntries Server::GetStatsInfo(const std::string &ns, bool is_admin) {
+Server::InfoEntries Server::GetStatsInfo(const std::string &ns, [[maybe_unused]] bool is_admin) {
   Server::InfoEntries entries;
-  entries.emplace_back("total_connections_received", total_clients_.load());
 
-  if (is_admin) {
-    // Admin: global stats
-    entries.emplace_back("total_commands_processed", stats.total_calls.load());
-    entries.emplace_back("total_net_input_bytes", stats.in_bytes.load());
-    entries.emplace_back("total_net_output_bytes", stats.out_bytes.load());
-  } else {
-    // Tenant: namespace-specific stats
-    auto ns_stats = AggregateNamespaceStats(ns);
-    entries.emplace_back("total_commands_processed", ns_stats.total_calls);
-    entries.emplace_back("total_net_input_bytes", ns_stats.in_bytes);
-    entries.emplace_back("total_net_output_bytes", ns_stats.out_bytes);
-  }
+  // All users (including admin) see only their own namespace stats
+  auto ns_stats = AggregateNamespaceStats(ns);
+  entries.emplace_back("total_connections_received", ns_stats.total_connections);
+  entries.emplace_back("total_commands_processed", ns_stats.total_calls);
+  entries.emplace_back("total_net_input_bytes", ns_stats.in_bytes);
+  entries.emplace_back("total_net_output_bytes", ns_stats.out_bytes);
 
   entries.emplace_back("instantaneous_ops_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_COMMAND));
   entries.emplace_back("instantaneous_input_kbps",
