@@ -1650,6 +1650,84 @@ NamespaceStatsSnapshot Server::AggregateNamespaceStats(const std::string &ns) {
   return result;
 }
 
+NamespaceRates Server::GetInstantaneousRatesForNamespace(const std::string &ns) {
+  auto now = util::GetTimeStampMS();
+
+  // FAST PATH: Cache Hit mit shared_lock (parallel für ALLE Tenants!)
+  {
+    std::shared_lock<std::shared_mutex> lock(ns_rate_mu_);
+    auto it = ns_rate_trackers_.find(ns);
+    if (it != ns_rate_trackers_.end()) {
+      if (now < it->second->cache_valid_until.load(std::memory_order_acquire)) {
+        // Cache gültig - lock-free read der atomics (kein per-NS lock nötig!)
+        return {
+            it->second->cached_ops_rate.load(std::memory_order_relaxed),
+            it->second->cached_in_rate.load(std::memory_order_relaxed),
+            it->second->cached_out_rate.load(std::memory_order_relaxed)};
+      }
+    }
+  }
+
+  // SLOW PATH: Cache Miss - erst Map-Eintrag holen/erstellen
+  NamespaceRateData *data = nullptr;
+  {
+    std::shared_lock<std::shared_mutex> lock(ns_rate_mu_);
+    auto it = ns_rate_trackers_.find(ns);
+    if (it != ns_rate_trackers_.end()) {
+      data = it->second.get();
+    }
+  }
+
+  // Falls nicht vorhanden: Erstellen (seltener Fall - nur bei erstem INFO pro NS)
+  if (!data) {
+    std::unique_lock<std::shared_mutex> lock(ns_rate_mu_);
+    // Double-check nach Lock-Upgrade
+    auto it = ns_rate_trackers_.find(ns);
+    if (it == ns_rate_trackers_.end()) {
+      ns_rate_trackers_[ns] = std::make_unique<NamespaceRateData>();
+    }
+    data = ns_rate_trackers_[ns].get();
+  }
+
+  // PER-NS LOCK: Nur DIESER Namespace ist blockiert, andere laufen parallel!
+  std::lock_guard<std::mutex> ns_lock(data->mu);
+
+  // Double-check nach per-NS Lock (anderer Thread könnte Rate schon berechnet haben)
+  if (now < data->cache_valid_until.load(std::memory_order_acquire)) {
+    return {
+        data->cached_ops_rate.load(std::memory_order_relaxed),
+        data->cached_in_rate.load(std::memory_order_relaxed),
+        data->cached_out_rate.load(std::memory_order_relaxed)};
+  }
+
+  // Stats aggregieren (O(n_workers), ~8µs)
+  auto ns_stats = AggregateNamespaceStats(ns);
+
+  // Rates berechnen
+  uint64_t elapsed = now - data->last_sample_time_ms;
+  if (elapsed > 0 && data->last_sample_time_ms > 0) {
+    uint64_t ops_delta = ns_stats.total_calls - data->last_total_calls;
+    uint64_t in_delta = ns_stats.in_bytes - data->last_in_bytes;
+    uint64_t out_delta = ns_stats.out_bytes - data->last_out_bytes;
+
+    data->cached_ops_rate.store((ops_delta * 1000) / elapsed, std::memory_order_relaxed);
+    data->cached_in_rate.store((in_delta * 1000) / elapsed, std::memory_order_relaxed);
+    data->cached_out_rate.store((out_delta * 1000) / elapsed, std::memory_order_relaxed);
+  }
+
+  // Tracker aktualisieren
+  data->last_sample_time_ms = now;
+  data->last_total_calls = ns_stats.total_calls;
+  data->last_in_bytes = ns_stats.in_bytes;
+  data->last_out_bytes = ns_stats.out_bytes;
+  data->cache_valid_until.store(now + 100, std::memory_order_release);  // 100ms Cache
+
+  return {
+      data->cached_ops_rate.load(std::memory_order_relaxed),
+      data->cached_in_rate.load(std::memory_order_relaxed),
+      data->cached_out_rate.load(std::memory_order_relaxed)};
+}
+
 Server::InfoEntries Server::GetStatsInfo(const std::string &ns, [[maybe_unused]] bool is_admin) {
   Server::InfoEntries entries;
 
@@ -1660,11 +1738,11 @@ Server::InfoEntries Server::GetStatsInfo(const std::string &ns, [[maybe_unused]]
   entries.emplace_back("total_net_input_bytes", ns_stats.in_bytes);
   entries.emplace_back("total_net_output_bytes", ns_stats.out_bytes);
 
-  entries.emplace_back("instantaneous_ops_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_COMMAND));
-  entries.emplace_back("instantaneous_input_kbps",
-                       static_cast<float>(stats.GetInstantaneousMetric(STATS_METRIC_NET_INPUT) / 1024));
-  entries.emplace_back("instantaneous_output_kbps",
-                       static_cast<float>(stats.GetInstantaneousMetric(STATS_METRIC_NET_OUTPUT) / 1024));
+  // Per-namespace instantaneous rates (on-demand calculation with 100ms cache)
+  auto rates = GetInstantaneousRatesForNamespace(ns);
+  entries.emplace_back("instantaneous_ops_per_sec", rates.ops_per_sec);
+  entries.emplace_back("instantaneous_input_kbps", static_cast<float>(rates.in_bytes_per_sec) / 1024.0f);
+  entries.emplace_back("instantaneous_output_kbps", static_cast<float>(rates.out_bytes_per_sec) / 1024.0f);
   entries.emplace_back("sync_full", stats.fullsync_count.load());
   entries.emplace_back("sync_partial_ok", stats.psync_ok_count.load());
   entries.emplace_back("sync_partial_err", stats.psync_err_count.load());

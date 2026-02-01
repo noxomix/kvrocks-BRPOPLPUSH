@@ -700,3 +700,168 @@ func TestTotalConnectionsReceivedNamespaceIsolation(t *testing.T) {
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
 }
+
+func TestInstantaneousOpsPerSecNamespaceIsolation(t *testing.T) {
+	password := "adminpwd"
+	srv := util.StartServer(t, map[string]string{
+		"requirepass": password,
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	// Admin connection
+	adminRdb := srv.NewClientWithOption(&redis.Options{
+		Password: password,
+	})
+	defer func() { require.NoError(t, adminRdb.Close()) }()
+
+	// Create namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
+
+	// Tenant connections
+	ns1Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token1",
+	})
+	defer func() { require.NoError(t, ns1Rdb.Close()) }()
+
+	ns2Rdb := srv.NewClientWithOption(&redis.Options{
+		Password: "token2",
+	})
+	defer func() { require.NoError(t, ns2Rdb.Close()) }()
+
+	// Helper to parse INFO output
+	parseInfoValue := func(info, key string) string {
+		for _, line := range strings.Split(info, "\r\n") {
+			if strings.HasPrefix(line, key+":") {
+				return strings.TrimPrefix(line, key+":")
+			}
+		}
+		return ""
+	}
+
+	t.Run("instantaneous_ops_per_sec is per-namespace", func(t *testing.T) {
+		// First INFO call establishes the baseline sample (returns 0, but creates sample)
+		ns1Rdb.Info(ctx, "stats")
+		ns2Rdb.Info(ctx, "stats")
+
+		// Wait for cache to expire
+		time.Sleep(150 * time.Millisecond)
+
+		// Generate traffic on ns1 only
+		for i := 0; i < 500; i++ {
+			ns1Rdb.Ping(ctx)
+		}
+
+		// Wait for cache to expire so next INFO calculates new rate
+		time.Sleep(150 * time.Millisecond)
+
+		// ns1 should have non-zero ops/sec (delta from baseline)
+		info := ns1Rdb.Info(ctx, "stats").Val()
+		ns1OpsStr := parseInfoValue(info, "instantaneous_ops_per_sec")
+		ns1Ops, err := strconv.Atoi(ns1OpsStr)
+		require.NoError(t, err)
+		require.Greater(t, ns1Ops, 0, "ns1 should have non-zero instantaneous_ops_per_sec after traffic")
+
+		// ns2 should have low/zero ops/sec (only INFO commands, no PING traffic)
+		info = ns2Rdb.Info(ctx, "stats").Val()
+		ns2OpsStr := parseInfoValue(info, "instantaneous_ops_per_sec")
+		ns2Ops, err := strconv.Atoi(ns2OpsStr)
+		require.NoError(t, err)
+		// ns2 might have some ops from the INFO command itself, but should be much lower than ns1
+		require.Less(t, ns2Ops, ns1Ops, "ns2 should have fewer ops than ns1")
+	})
+
+	t.Run("instantaneous_input/output_kbps is per-namespace", func(t *testing.T) {
+		// First INFO call establishes the baseline sample
+		ns1Rdb.Info(ctx, "stats")
+		ns2Rdb.Info(ctx, "stats")
+
+		// Wait for cache to expire
+		time.Sleep(150 * time.Millisecond)
+
+		// Generate data traffic on ns1
+		largeValue := strings.Repeat("x", 10000) // 10KB value
+		for i := 0; i < 50; i++ {
+			ns1Rdb.Set(ctx, "largekey", largeValue, 0)
+		}
+
+		// Wait for cache to expire
+		time.Sleep(150 * time.Millisecond)
+
+		// ns1 should have non-zero input kbps
+		info := ns1Rdb.Info(ctx, "stats").Val()
+		ns1InputStr := parseInfoValue(info, "instantaneous_input_kbps")
+		// Parse as float (may have decimals)
+		var ns1Input float64
+		_, err := strconv.ParseFloat(ns1InputStr, 64)
+		if err == nil {
+			ns1Input, _ = strconv.ParseFloat(ns1InputStr, 64)
+		}
+		require.Greater(t, ns1Input, 0.0, "ns1 should have non-zero instantaneous_input_kbps after data traffic")
+
+		// ns2 should have lower input kbps
+		info = ns2Rdb.Info(ctx, "stats").Val()
+		ns2InputStr := parseInfoValue(info, "instantaneous_input_kbps")
+		var ns2Input float64
+		_, err = strconv.ParseFloat(ns2InputStr, 64)
+		if err == nil {
+			ns2Input, _ = strconv.ParseFloat(ns2InputStr, 64)
+		}
+		require.Less(t, ns2Input, ns1Input, "ns2 should have lower input kbps than ns1")
+	})
+
+	t.Run("rates are independent between namespaces", func(t *testing.T) {
+		// First INFO call establishes baseline
+		ns1Rdb.Info(ctx, "stats")
+		ns2Rdb.Info(ctx, "stats")
+
+		// Wait for cache to expire
+		time.Sleep(150 * time.Millisecond)
+
+		// Generate traffic ONLY on ns2
+		for i := 0; i < 500; i++ {
+			ns2Rdb.Ping(ctx)
+		}
+
+		time.Sleep(150 * time.Millisecond)
+
+		// ns2 should now have higher ops than ns1
+		info := ns2Rdb.Info(ctx, "stats").Val()
+		ns2OpsStr := parseInfoValue(info, "instantaneous_ops_per_sec")
+		ns2Ops, _ := strconv.Atoi(ns2OpsStr)
+
+		info = ns1Rdb.Info(ctx, "stats").Val()
+		ns1OpsStr := parseInfoValue(info, "instantaneous_ops_per_sec")
+		ns1Ops, _ := strconv.Atoi(ns1OpsStr)
+
+		// ns2 should have more ops (we just generated traffic there)
+		// ns1 should have decayed or low ops (no recent traffic)
+		require.Greater(t, ns2Ops, 0, "ns2 should have non-zero ops after traffic")
+		require.GreaterOrEqual(t, ns2Ops, ns1Ops, "ns2 should have >= ops than ns1 after generating traffic on ns2")
+	})
+
+	t.Run("first INFO returns zero ops (no previous sample)", func(t *testing.T) {
+		// Create a new namespace to test first-call behavior
+		require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns3", "token3").Err())
+
+		ns3Rdb := srv.NewClientWithOption(&redis.Options{
+			Password: "token3",
+		})
+		defer ns3Rdb.Close()
+
+		// First INFO should return 0 ops (no previous sample to calculate delta)
+		info := ns3Rdb.Info(ctx, "stats").Val()
+		ns3OpsStr := parseInfoValue(info, "instantaneous_ops_per_sec")
+		ns3Ops, _ := strconv.Atoi(ns3OpsStr)
+		require.Equal(t, 0, ns3Ops, "First INFO should return 0 ops (no previous sample)")
+
+		// Cleanup
+		require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns3").Err())
+	})
+
+	// Cleanup namespaces
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns1").Err())
+	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "DEL", "ns2").Err())
+}

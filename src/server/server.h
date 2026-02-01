@@ -128,6 +128,27 @@ struct NamespaceMonitors {
   std::unordered_map<int, Worker *> clients;  // fd -> Worker*
 };
 
+// Per-namespace rate data for instantaneous metrics (ops/sec, kbps)
+// On-demand calculation with 100ms cache, consistent with blocking/pubsub/monitor pattern
+struct NamespaceRateData {
+  std::mutex mu;  // PER-NS Mutex for tenant isolation
+  uint64_t last_sample_time_ms = 0;
+  uint64_t last_total_calls = 0;
+  uint64_t last_in_bytes = 0;
+  uint64_t last_out_bytes = 0;
+  std::atomic<uint64_t> cached_ops_rate{0};
+  std::atomic<uint64_t> cached_in_rate{0};
+  std::atomic<uint64_t> cached_out_rate{0};
+  std::atomic<uint64_t> cache_valid_until{0};
+};
+
+// Result struct for instantaneous rate metrics
+struct NamespaceRates {
+  uint64_t ops_per_sec = 0;
+  uint64_t in_bytes_per_sec = 0;
+  uint64_t out_bytes_per_sec = 0;
+};
+
 // CURSOR_DICT_SIZE must be 2^n where n <= 16
 constexpr const size_t CURSOR_DICT_SIZE = 1024 * 16;
 static_assert((CURSOR_DICT_SIZE & (CURSOR_DICT_SIZE - 1)) == 0, "CURSOR_DICT_SIZE must be 2^n");
@@ -307,6 +328,7 @@ class Server {
 
   InfoEntries GetStatsInfo(const std::string &ns, bool is_admin);
   NamespaceStatsSnapshot AggregateNamespaceStats(const std::string &ns);
+  NamespaceRates GetInstantaneousRatesForNamespace(const std::string &ns);
   InfoEntries GetServerInfo();
   InfoEntries GetMemoryInfo(redis::Connection *conn);
   InfoEntries GetRocksDBInfo();
@@ -472,6 +494,10 @@ class Server {
   // Per-namespace monitor clients for tenant isolation (O(1) instead of O(n_workers))
   mutable std::shared_mutex monitor_namespaces_mu_;
   std::unordered_map<std::string, std::unique_ptr<NamespaceMonitors>> monitor_namespaces_;
+
+  // Per-namespace rate tracking for instantaneous metrics (on-demand with 100ms cache)
+  mutable std::shared_mutex ns_rate_mu_;
+  std::unordered_map<std::string, std::unique_ptr<NamespaceRateData>> ns_rate_trackers_;
 
   std::atomic<int> blocked_clients_{0};
 

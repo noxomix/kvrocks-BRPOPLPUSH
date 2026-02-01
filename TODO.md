@@ -37,6 +37,16 @@ Authentifizierung (in SetNamespace()). Grund: Vor AUTH ist der Namespace unbekan
 Flag `connection_counted_` in Connection verhindert doppeltes Zählen bei Re-AUTH oder
 RESET→AUTH. Jede Connection zählt genau einmal für den ersten authentifizierten Namespace.
 
+LEARNING - On-Demand Rate mit Per-NS Mutex:
+Für per-Namespace Rate-Metriken (instantaneous_ops/input_kbps/output_kbps):
+1. NICHT im Cron sampeln → skaliert nicht mit O(n_namespaces)
+2. On-Demand bei INFO berechnen, 100ms cachen
+3. Pattern gemäß Konstitution: `unordered_map<ns, unique_ptr<NamespaceRateData>>`
+   - shared_mutex für Map-Zugriff (Cache-Hits parallel)
+   - Per-NS mutex für Rate-Berechnung (Tenants blockieren sich NICHT)
+4. Fast Path: shared_lock + atomic read (keine per-NS Lock)
+5. Slow Path: shared_lock + per-NS Lock + Aggregation
+
 KONZEPT - Blocking vs. Locking:
 - **Blocking** (`blocked_clients`): Connection WARTET auf externes Event (BLPOP wartet auf Daten, XREAD BLOCK, WAIT).
   Connection ist pausiert, verarbeitet keine Commands bis Event eintritt oder Timeout.
@@ -218,7 +228,7 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 
 **Mittlere Priorität - INFO Stats:**
 - [x] `total_connections_received` - Kumulativer Counter (per-NS nach Auth)
-- [ ] `instantaneous_ops_per_sec` - Rate-Berechnung
+- [x] `instantaneous_ops_per_sec` - On-Demand + 100ms Cache + Per-NS Mutex (alle 3 Metriken)
 - [ ] `cmdstat_*` - Per-Command Stats (Memory-Overhead bedenken)
 - [x] `used_memory_lua` - Admin-only by design (Lua-VM pro Worker shared, keine per-NS Attribution möglich)
 
@@ -233,4 +243,10 @@ falls Tenants WATCH intensiv nutzen (unwahrscheinlich).
 //für mich selber: {
     GEPRÜFT: Re-AUTH während Blocking ist kein Problem (Read-Callback ist nullptr).
     GEPRÜFT: Re-AUTH während MULTI ist ein Bug → Task oben angelegt.
+
+    RESETSTAT exisitiert nicht in kvrocks, aber in redis - ggf können wir das irgnedwann mal erweitern. 
+
+    Genau wie Transaktionen namespace aware machen das sie nicht global locken.
+
+    Und Lua scripts in transaktionen mappen.
 }
