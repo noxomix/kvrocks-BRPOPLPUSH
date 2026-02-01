@@ -35,6 +35,7 @@
 #include <jsoncons/json.hpp>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <tuple>
 #include <utility>
@@ -1856,7 +1857,7 @@ Server::InfoEntries Server::GetCpuInfo() {  // NOLINT(readability-convert-member
   return entries;
 }
 
-Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
+Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns, bool is_admin) {
   InfoEntries entries;
   if (is_loading_) return entries;
 
@@ -1867,7 +1868,10 @@ Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
   entries.emplace_back("last_dbsize_scan_timestamp", last_dbsize_scan_timestamp);
   entries.emplace_back("db0", fmt::format("keys={},expires={},avg_ttl={},expired={}", stats.n_key, stats.n_expires,
                                           stats.avg_ttl, stats.n_expired));
-  entries.emplace_back("sequence", storage->GetDB()->GetLatestSequenceNumber());
+  // Global sequence number reveals write activity across all namespaces - admin only
+  if (is_admin) {
+    entries.emplace_back("sequence", storage->GetDB()->GetLatestSequenceNumber());
+  }
   entries.emplace_back("used_db_size", storage->GetTotalSize(ns));
   entries.emplace_back("max_db_size", config_->max_db_size * GiB);
   double used_percent = config_->max_db_size ? static_cast<double>(storage->GetTotalSize(ns) * 100) /
@@ -1895,6 +1899,10 @@ Server::InfoEntries Server::GetKeyspaceInfo(const std::string &ns) {
 std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::string> &sections) {
   std::string ns = conn->GetNamespace();
   bool is_admin = conn->IsAdmin();
+
+  // Sections that expose internal infrastructure details (network topology, storage internals, system metrics)
+  static const std::set<std::string> admin_only_sections = {"RocksDB", "Replication", "CPU", "Persistence"};
+
   std::vector<std::pair<std::string, std::function<InfoEntries(Server *)>>> info_funcs = {
       {"Server", &Server::GetServerInfo},
       {"Clients", [conn](Server *srv) { return srv->GetClientsInfo(conn); }},
@@ -1905,7 +1913,7 @@ std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::stri
       {"CPU", &Server::GetCpuInfo},
       {"CommandStats", [&ns, is_admin](Server *srv) { return srv->GetCommandsStatsInfo(ns, is_admin); }},
       {"Cluster", &Server::GetClusterInfo},
-      {"Keyspace", [&ns](Server *srv) { return srv->GetKeyspaceInfo(ns); }},
+      {"Keyspace", [&ns, is_admin](Server *srv) { return srv->GetKeyspaceInfo(ns, is_admin); }},
       {"RocksDB", &Server::GetRocksDBInfo},
   };
 
@@ -1915,6 +1923,9 @@ std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::stri
 
   bool first = true;
   for (const auto &[sec, fn] : info_funcs) {
+    // Skip admin-only sections for non-admin users
+    if (!is_admin && admin_only_sections.count(sec)) continue;
+
     if (all || util::FindICase(sections.begin(), sections.end(), sec) != sections.end()) {
       if (first)
         first = false;

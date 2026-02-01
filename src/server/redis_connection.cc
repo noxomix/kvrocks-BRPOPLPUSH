@@ -168,10 +168,12 @@ void Connection::SetAddr(std::string ip, uint32_t port) {
 
 void Connection::SetNamespace(std::string ns) {
   // Count only on first authentication (ns_ was empty, new ns is not empty)
-  // connection_counted_ prevents double-counting on Re-AUTH or RESET→AUTH
-  if (!connection_counted_ && !ns.empty() && ns_.empty()) {
-    owner_->IncrConnectionsForNamespace(ns);
-    connection_counted_ = true;
+  // Atomic compare_exchange prevents TOCTOU race on connection_counted_
+  if (!ns.empty() && ns_.empty()) {
+    bool expected = false;
+    if (connection_counted_.compare_exchange_strong(expected, true)) {
+      owner_->IncrConnectionsForNamespace(ns);
+    }
   }
   ns_ = std::move(ns);
 }

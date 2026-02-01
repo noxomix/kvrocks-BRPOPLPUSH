@@ -278,10 +278,10 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
 - [ ] **Sequence Number in Keyspace** - Admin-only oder entfernen (`server.cc:1870`)
 
 **Niedrige Priorität - Concurrency (Audit 2026-02-01):**
-- [ ] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)
+- [x] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)ja
 - [ ] **Connection Counting TOCTOU** - Atomic compare_exchange (`redis_connection.cc:169-177`)
 - [ ] **LogCollector shared_mutex** - SLOWLOG/PERFLOG Worker-Blocking (`log_collector.h:84`)
-  - Problem: `std::mutex` blockiert ganze Worker-Threads bei parallelen GET/LEN Anfragen
+  - Problem: `std::mutex` blockiert ganze Worker-Threads bei parallelen GET/LEN Anfragenja
   - Fix: `std::shared_mutex` mit `shared_lock` für Reads (Size, GetLatestEntries), `unique_lock` nur für Writes (PushEntry, Reset)
   - Impact: Niedrig (Lock ist kurz ~50μs), aber spürbar bei koordiniertem Spam
 

@@ -22,6 +22,7 @@
 
 #include <event2/buffer.h>
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <set>
@@ -197,7 +198,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   uint64_t id_ = 0;
   std::atomic<int> flags_ = 0;
   std::string ns_;  // Empty before AUTH, set via SetNamespace() after successful auth
-  bool connection_counted_ = false;  // Prevents double-counting on Re-AUTH or RESET→AUTH
+  std::atomic<bool> connection_counted_{false};  // Atomic to prevent TOCTOU race
   std::string name_;
   std::string ip_;
   std::string announce_ip_;

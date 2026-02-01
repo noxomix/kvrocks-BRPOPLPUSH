@@ -339,7 +339,7 @@ class Server {
   InfoEntries GetClusterInfo();
   InfoEntries GetPersistenceInfo();
   InfoEntries GetCpuInfo();
-  InfoEntries GetKeyspaceInfo(const std::string &ns);
+  InfoEntries GetKeyspaceInfo(const std::string &ns, bool is_admin);
 
   std::string GetInfo(redis::Connection *conn, const std::vector<std::string> &sections);
   std::string GetRocksDBStatsJson() const;

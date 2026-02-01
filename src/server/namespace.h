@@ -48,7 +48,7 @@ class Namespace {
  private:
   engine::Storage *storage_;
 
-  std::shared_mutex tokens_mu_;
+  mutable std::shared_mutex tokens_mu_;
   // mapping from token to namespace name
   std::map<std::string, std::string> tokens_;
 
