@@ -1501,20 +1501,25 @@ Server::InfoEntries Server::GetClientsInfo(redis::Connection *self) {
   return entries;
 }
 
-Server::InfoEntries Server::GetMemoryInfo() {
+Server::InfoEntries Server::GetMemoryInfo(redis::Connection *conn) {
   int64_t rss = Stats::GetMemoryRSS();
-  int64_t memory_lua = 0;
-  for (auto &wt : worker_threads_) {
-    memory_lua += wt->GetWorker()->GetLuaMemorySize();
-  }
   std::string used_memory_rss_human = util::BytesToHuman(rss);
-  std::string used_memory_lua_human = util::BytesToHuman(memory_lua);
 
   InfoEntries entries;
   entries.emplace_back("used_memory_rss", rss);
   entries.emplace_back("used_memory_rss_human", used_memory_rss_human);
-  entries.emplace_back("used_memory_lua", memory_lua);
-  entries.emplace_back("used_memory_lua_human", used_memory_lua_human);
+
+  // Lua memory only for admin (Lua VM is shared per worker, not per namespace)
+  if (conn->IsAdmin()) {
+    int64_t memory_lua = 0;
+    for (auto &wt : worker_threads_) {
+      memory_lua += wt->GetWorker()->GetLuaMemorySize();
+    }
+    std::string used_memory_lua_human = util::BytesToHuman(memory_lua);
+    entries.emplace_back("used_memory_lua", memory_lua);
+    entries.emplace_back("used_memory_lua_human", used_memory_lua_human);
+  }
+
   entries.emplace_back("used_memory_startup", memory_startup_use_.load(std::memory_order_relaxed));
   entries.emplace_back("mem_allocator", memory_profiler.AllocatorName());
   return entries;
@@ -1801,7 +1806,7 @@ std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::stri
   std::vector<std::pair<std::string, std::function<InfoEntries(Server *)>>> info_funcs = {
       {"Server", &Server::GetServerInfo},
       {"Clients", [conn](Server *srv) { return srv->GetClientsInfo(conn); }},
-      {"Memory", &Server::GetMemoryInfo},
+      {"Memory", [conn](Server *srv) { return srv->GetMemoryInfo(conn); }},
       {"Persistence", &Server::GetPersistenceInfo},
       {"Stats", [&ns, is_admin](Server *srv) { return srv->GetStatsInfo(ns, is_admin); }},
       {"Replication", &Server::GetReplicationInfo},

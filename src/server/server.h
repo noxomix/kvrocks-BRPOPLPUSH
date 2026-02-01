@@ -308,7 +308,7 @@ class Server {
   InfoEntries GetStatsInfo(const std::string &ns, bool is_admin);
   NamespaceStatsSnapshot AggregateNamespaceStats(const std::string &ns);
   InfoEntries GetServerInfo();
-  InfoEntries GetMemoryInfo();
+  InfoEntries GetMemoryInfo(redis::Connection *conn);
   InfoEntries GetRocksDBInfo();
   InfoEntries GetClientsInfo(redis::Connection *self);
   InfoEntries GetReplicationInfo();
