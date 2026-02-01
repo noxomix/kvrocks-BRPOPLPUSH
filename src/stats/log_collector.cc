@@ -21,7 +21,10 @@
 #include "log_collector.h"
 
 #include <algorithm>
+#include <optional>
+#include <shared_mutex>
 #include <string>
+#include <vector>
 
 #include "server/redis_reply.h"
 #include "time_util.h"
@@ -66,113 +69,219 @@ std::string PerfEntry::ToRedisString() const {
   return output;
 }
 
+// GetOrCreateNsLog: Fast path with shared_lock, slow path with unique_lock
+// Pattern from Konstitution Zeile 102-105
+template <class T>
+NamespaceLogData<T> *LogCollector<T>::GetOrCreateNsLog(const std::string &ns) {
+  // Fast path: shared_lock for lookup (most common case)
+  {
+    std::shared_lock<std::shared_mutex> read_lock(ns_map_mu_);
+    auto it = ns_logs_.find(ns);
+    if (it != ns_logs_.end()) {
+      return it->second.get();
+    }
+  }
+
+  // Slow path: unique_lock for create (rare)
+  std::unique_lock<std::shared_mutex> write_lock(ns_map_mu_);
+  // Double-check after lock upgrade (another thread might have created it)
+  auto it = ns_logs_.find(ns);
+  if (it != ns_logs_.end()) {
+    return it->second.get();
+  }
+
+  auto [inserted_it, _] = ns_logs_.emplace(ns, std::make_unique<NamespaceLogData<T>>());
+  return inserted_it->second.get();
+}
+
 template <class T>
 LogCollector<T>::~LogCollector() {
   Reset();
 }
 
+// Size: Sum of all namespace sizes (for admin)
 template <class T>
 ssize_t LogCollector<T>::Size() {
-  std::lock_guard<std::mutex> guard(mu_);
-  return static_cast<ssize_t>(entries_.size());
+  std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+  ssize_t total = 0;
+  for (const auto &[ns, ns_log] : ns_logs_) {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+    total += static_cast<ssize_t>(ns_log->entries_.size());
+  }
+  return total;
 }
 
+// Reset: Clear all namespaces (for admin)
 template <class T>
 void LogCollector<T>::Reset() {
-  std::lock_guard<std::mutex> guard(mu_);
-  while (!entries_.empty()) {
-    entries_.pop_front();
+  std::unique_lock<std::shared_mutex> map_lock(ns_map_mu_);
+  for (auto &[ns, ns_log] : ns_logs_) {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+    ns_log->entries_.clear();
   }
 }
 
+// SetMaxEntries: Update global config, then trim all namespaces
 template <class T>
 void LogCollector<T>::SetMaxEntries(int64_t max_entries) {
-  std::lock_guard<std::mutex> guard(mu_);
-  while (max_entries > 0 && static_cast<int64_t>(entries_.size()) > max_entries) {
-    entries_.pop_back();
+  max_entries_per_ns_.store(max_entries);
+
+  // Trim all existing namespaces
+  std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+  for (auto &[ns, ns_log] : ns_logs_) {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+    while (max_entries > 0 && static_cast<int64_t>(ns_log->entries_.size()) > max_entries) {
+      ns_log->entries_.pop_back();
+    }
   }
-  max_entries_ = max_entries;
 }
 
+// SetDumpToLogfileLevel: Atomic update (no lock needed)
 template <class T>
 void LogCollector<T>::SetDumpToLogfileLevel(spdlog::level::level_enum level) {
-  std::lock_guard<std::mutex> guard(mu_);
-  dump_to_logfile_level_ = level;
+  dump_to_logfile_level_.store(level);
 }
 
+// PushEntry: Route to namespace-specific deque
+// Pattern: Copy-then-Log (Konstitution Zeile 77-82)
 template <class T>
 void LogCollector<T>::PushEntry(std::unique_ptr<T> &&entry) {
-  std::lock_guard<std::mutex> guard(mu_);
-  entry->id = ++id_;
-  entry->time = util::GetTimeStamp();
-  if (max_entries_ > 0 && !entries_.empty() && entries_.size() >= static_cast<size_t>(max_entries_)) {
-    entries_.pop_back();
+  const std::string &ns = entry->ns;
+  NamespaceLogData<T> *ns_log = GetOrCreateNsLog(ns);
+
+  spdlog::level::level_enum dump_level = dump_to_logfile_level_.load();
+  int64_t max_entries = max_entries_per_ns_.load();
+  std::optional<T> entry_copy;
+
+  {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);  // Only lock own namespace!
+    entry->id = ++(ns_log->id_);
+    entry->time = util::GetTimeStamp();
+
+    // Copy entry for logging BEFORE move (only if logging enabled)
+    if (dump_level != spdlog::level::off) {
+      entry_copy.emplace(*entry);
+    }
+
+    // Evict oldest if at capacity
+    if (max_entries > 0 && !ns_log->entries_.empty() &&
+        ns_log->entries_.size() >= static_cast<size_t>(max_entries)) {
+      ns_log->entries_.pop_back();
+    }
+    ns_log->entries_.push_front(std::move(entry));
+  }  // NS lock released here
+
+  // Log OUTSIDE lock - no blocking for other threads during disk I/O
+  if (entry_copy) {
+    entry_copy->DumpToLogFile(dump_level);
   }
-  if (dump_to_logfile_level_ != spdlog::level::off) {
-    entry->DumpToLogFile(dump_to_logfile_level_);
-  }
-  entries_.push_front(std::move(entry));
 }
 
+// GetLatestEntries: Merge all namespaces sorted by time (for admin)
+// Pattern: Copy-then-Reply (Konstitution Zeile 77-82) - copy data under lock, then process
 template <class T>
 std::string LogCollector<T>::GetLatestEntries(int64_t cnt) {
-  size_t n = 0;
-  std::string output;
+  std::vector<T> all_entries;  // COPIES, not pointers - safe after lock release
 
-  std::lock_guard<std::mutex> guard(mu_);
-  if (cnt > 0) {
-    n = std::min(entries_.size(), static_cast<size_t>(cnt));
-  } else {
-    n = entries_.size();
+  {
+    std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+    for (const auto &[ns, ns_log] : ns_logs_) {
+      std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+      for (const auto &entry : ns_log->entries_) {
+        all_entries.push_back(*entry);  // Copy under lock
+      }
+    }
   }
+
+  // Sort by time descending (newest first) - safe, working on copies
+  std::sort(all_entries.begin(), all_entries.end(),
+            [](const T &a, const T &b) { return a.time > b.time; });
+
+  size_t n = (cnt > 0) ? std::min(all_entries.size(), static_cast<size_t>(cnt)) : all_entries.size();
+
+  std::string output;
   output.append(redis::MultiLen(n));
-  for (const auto &entry : entries_) {
-    output.append(entry->ToRedisString());
-    if (--n == 0) break;
+  for (size_t i = 0; i < n; i++) {
+    output.append(all_entries[i].ToRedisString());
   }
   return output;
 }
 
+// SizeWithFilter: Count entries matching filter across all namespaces
 template <class T>
 ssize_t LogCollector<T>::SizeWithFilter(const std::function<bool(const T &)> &filter) {
-  std::lock_guard<std::mutex> guard(mu_);
-  if (!filter) return static_cast<ssize_t>(entries_.size());
+  std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+
+  if (!filter) {
+    ssize_t total = 0;
+    for (const auto &[ns, ns_log] : ns_logs_) {
+      std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+      total += static_cast<ssize_t>(ns_log->entries_.size());
+    }
+    return total;
+  }
+
   ssize_t count = 0;
-  for (const auto &entry : entries_) {
-    if (filter(*entry)) count++;
+  for (const auto &[ns, ns_log] : ns_logs_) {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+    for (const auto &entry : ns_log->entries_) {
+      if (filter(*entry)) count++;
+    }
   }
   return count;
 }
 
+// ResetWithFilter: Remove entries matching filter across all namespaces
 template <class T>
 void LogCollector<T>::ResetWithFilter(const std::function<bool(const T &)> &filter) {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+
   if (!filter) {
-    while (!entries_.empty()) entries_.pop_front();
+    // No filter = clear all (same as Reset but with shared_lock on map)
+    for (auto &[ns, ns_log] : ns_logs_) {
+      std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+      ns_log->entries_.clear();
+    }
     return;
   }
-  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                [&filter](const auto &entry) { return filter(*entry); }),
-                 entries_.end());
+
+  for (auto &[ns, ns_log] : ns_logs_) {
+    std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+    ns_log->entries_.erase(
+        std::remove_if(ns_log->entries_.begin(), ns_log->entries_.end(),
+                       [&filter](const auto &entry) { return filter(*entry); }),
+        ns_log->entries_.end());
+  }
 }
 
+// GetLatestEntriesWithFilter: Get entries matching filter, sorted by time
+// Pattern: Copy-then-Reply (Konstitution Zeile 77-82) - copy data under lock, then process
 template <class T>
 std::string LogCollector<T>::GetLatestEntriesWithFilter(int64_t cnt, const std::function<bool(const T &)> &filter) {
-  std::lock_guard<std::mutex> guard(mu_);
+  std::vector<T> filtered;  // COPIES, not pointers - safe after lock release
 
-  std::vector<const T *> filtered;
-  for (const auto &entry : entries_) {
-    if (!filter || filter(*entry)) {
-      filtered.push_back(entry.get());
+  {
+    std::shared_lock<std::shared_mutex> map_lock(ns_map_mu_);
+    for (const auto &[ns, ns_log] : ns_logs_) {
+      std::lock_guard<std::mutex> ns_lock(ns_log->mu_);
+      for (const auto &entry : ns_log->entries_) {
+        if (!filter || filter(*entry)) {
+          filtered.push_back(*entry);  // Copy under lock
+        }
+      }
     }
   }
+
+  // Sort by time descending (newest first) - safe, working on copies
+  std::sort(filtered.begin(), filtered.end(),
+            [](const T &a, const T &b) { return a.time > b.time; });
 
   size_t n = (cnt > 0) ? std::min(filtered.size(), static_cast<size_t>(cnt)) : filtered.size();
 
   std::string output;
   output.append(redis::MultiLen(n));
   for (size_t i = 0; i < n; i++) {
-    output.append(filtered[i]->ToRedisString());
+    output.append(filtered[i].ToRedisString());
   }
   return output;
 }

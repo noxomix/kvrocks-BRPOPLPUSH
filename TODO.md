@@ -271,19 +271,33 @@ Akzeptiert weil: (1) Redis SLOWLOG hat gleiches Verhalten, (2) geringes Risiko,
 - [x] **STATS kCmdAdmin** - Globale RocksDB-Statistiken nur für Admin (`cmd_server.cc:1610`)
 
 **Mittlere Priorität - Information Disclosure (Audit 2026-02-01):**
-- [ ] **INFO RocksDB Section** - Admin-only (`server.cc:1316-1441`)
-- [ ] **INFO Replication Section** - Admin-only (`server.cc:1528-1542`)
-- [ ] **INFO CPU Section** - Admin-only (`server.cc:1846-1857`)
-- [ ] **INFO Persistence Section** - Admin-only (`server.cc:1831-1844`)
-- [ ] **Sequence Number in Keyspace** - Admin-only oder entfernen (`server.cc:1870`)
+- [x] **INFO RocksDB Section** - Admin-only (`server.cc:1316-1441`)
+- [x] **INFO Replication Section** - Admin-only (`server.cc:1528-1542`)
+- [x] **INFO CPU Section** - Admin-only (`server.cc:1846-1857`)
+- [x] **INFO Persistence Section** - Admin-only (`server.cc:1831-1844`)
+- [x] **Sequence Number in Keyspace** - Admin-only (`server.cc:1870`)
 
-**Niedrige Priorität - Concurrency (Audit 2026-02-01):**
-- [x] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)ja
+**Hohe Priorität - Concurrency (Audit 2026-02-01):**
+- [x] **Namespace::List() Race Condition** - Kopie statt Referenz zurückgeben (`namespace.h:41`)
 - [x] **Connection Counting TOCTOU** - Atomic compare_exchange (`redis_connection.cc:169-177`)
-- [ ] **LogCollector shared_mutex** - SLOWLOG/PERFLOG Worker-Blocking (`log_collector.h:84`)
-  - Problem: `std::mutex` blockiert ganze Worker-Threads bei parallelen GET/LEN Anfragenja
-  - Fix: `std::shared_mutex` mit `shared_lock` für Reads (Size, GetLatestEntries), `unique_lock` nur für Writes (PushEntry, Reset)
-  - Impact: Niedrig (Lock ist kurz ~50μs), aber spürbar bei koordiniertem Spam
+- [x] **LogCollector Noisy-Neighbor** - SLOWLOG/PERFLOG blockiert ALLE Tenants (`log_collector.cc`) ✅ GEFIXT
+  - Fix: Per-Namespace Pattern implementiert (Konstitution Zeile 67-70)
+  - Jeder Tenant hat eigene deque + eigenen Mutex → keine gegenseitige Blockade
+  - Copy-then-Log Pattern → DumpToLogFile() außerhalb Lock (Konstitution Zeile 77-82)
+  - max_entries pro Namespace → keine Entry-Verdrängung zwischen Tenants
+  - Tests: `tests/gocase/unit/slowlog/slowlog_test.go` (TestSlowlogNamespaceIsolation)
+- [ ] **SUnsubscribeAll fehlt im Destruktor** - Memory Leak bei Shard PubSub (`redis_connection.cc:56-68`)
+  - Problem: `UnsubscribeAll()` und `PUnsubscribeAll()` werden aufgerufen, aber NICHT `SUnsubscribeAll()`
+  - Impact: Stale Einträge in Shard-PubSub Maps nach Connection-Close
+  - Fix: `SUnsubscribeAll()` nach Zeile 67 hinzufügen
+
+**Mittlere Priorität - Information Disclosure (Audit 2026-02-01):**
+- [ ] **ROLE Command** - Gibt Replication-Topologie an alle Tenants (`cmd_server.cc:297-304, 1597`)
+  - Problem: Kein `admin` Flag, gibt `master_host`, `master_port`, alle Slave-IPs/Ports zurück
+  - Fix: `kCmdAdmin` Flag hinzufügen in Zeile 1597
+- [ ] **HELLO Command** - Gibt globale Config an alle Tenants (`cmd_server.cc:916-931, 1618`)
+  - Problem: Gibt `cluster_enabled`, `IsSlave()`, Server-Mode zurück
+  - Fix: Sensitive Felder nur für Admin oder Command admin-only machen
 
 ---
 
