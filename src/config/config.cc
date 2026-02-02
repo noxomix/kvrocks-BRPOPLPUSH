@@ -164,6 +164,7 @@ Config::Config() {
       {"tls-replication", true, new YesNoField(&tls_replication, false)},
 #endif
       {"workers", false, new IntField(&workers, 8, 1, 8192)},
+      {"acceptor-threads", true, new IntField(&acceptor_threads, 1, 1, 16)},
       {"timeout", false, new IntField(&timeout, 0, 0, INT_MAX)},
       {"tcp-backlog", true, new IntField(&backlog, 511, 0, INT_MAX)},
       {"maxclients", false, new IntField(&maxclients, 10240, 0, INT_MAX)},

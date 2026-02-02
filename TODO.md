@@ -181,15 +181,24 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
 - [ ] **Lua Timeout** - `lua-time-limit` Config + `SCRIPT KILL` Command (namespace-aware)
-- [ ] **Lua Timeout/Kill - Accept-Dispatch Plan (keeps Redis port)**
+- [x] **Lua Timeout/Kill - Accept-Dispatch Architecture (Phase 1 DONE)**
   - Ziel: SCRIPT KILL immer erreichbar, auch wenn Worker in lua_pcall blockiert
   - Konzept: 1..N Accept-Threads nehmen Verbindungen an und verteilen FD an Worker
   - Worker-Auswahl: round-robin, aber Worker mit `lua_script_running_` ueberspringen (fallback auf any)
-  - Worker: thread-safe FD-Queue + eventfd/pipe wakeup; Connection/bufferevent wird im Worker-Thread gebaut
-  - Listener: TCP/TLS nur im Acceptor, kein SO_REUSEPORT in Workern (Unix-Socket optional weiter auf Worker0)
-  - Config: optional `acceptor-threads` (default 1)
-  - Tests: Go script_timeout_test wird stabil (kein i/o timeout); evtl. neue test fuer Kill waehrend Lua-Loop
-  - Grobe LoC: Worker (120-180), Server/Acceptor (150-250), Config (20-40), Tests (50-100)
+  - **Phase 1 - Worker-Seite (DONE):**
+    - [x] `PendingConnection` struct in worker.h
+    - [x] Dispatch-Queue + eventfd in Worker
+    - [x] `DispatchConnection()` - thread-safe, wakeup via eventfd
+    - [x] `onDispatchEvent()` - batch processing
+    - [x] `createConnectionFromDispatch()` - Connection aus dispatched FD
+  - **Phase 1 - Acceptor-Seite (DONE):**
+    - [x] `StartAcceptors()`, `AcceptorLoop()`, `SelectWorker()` in server.cc
+    - [x] TCP-Listen aus Worker-Konstruktor entfernen (nur Unix-Socket Worker0)
+    - [x] `acceptor-threads` Config (1-16, default 1)
+    - [x] Graceful Shutdown: Threads erst joinen, dann FDs schließen
+    - [x] systemd socket_fd: dup() für sauberes Shutdown
+  - **Phase 2 (Later):** `IsLuaRunning()` Check, SCRIPT KILL, lua_sethook
+  - **Phase 3 (Later):** SNI -> Tenant Mapping
 - [ ] **Per-NS Heavy-Command Budget (verhindert Noisy-Neighbor durch O(n)/Lua)**
   - Idee: neuer Flag `kCmdHeavy` (oder reuse `kCmdSlow`) + Config `max-heavy-per-namespace`
   - Check in `Connection::ExecuteCommands` vor Ausfuehrung:

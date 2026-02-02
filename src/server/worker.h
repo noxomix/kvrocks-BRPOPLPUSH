@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -49,6 +50,14 @@ class Server;
 struct ClientCounts {
   int connected = 0;
   int monitor = 0;
+};
+
+// Connection dispatched from Acceptor thread to Worker
+// Extensible for future features (SNI routing, peer address, etc.)
+struct PendingConnection {
+  int fd;
+  bool is_tls;
+  // Phase 3: std::string sni_hostname;
 };
 
 class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
@@ -81,6 +90,10 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
   Status ListenUnixSocket(const std::string &path, int perm, int backlog);
 
+  // Accept-Dispatch: Called by Acceptor thread to dispatch a new connection to this Worker
+  // Thread-safe: Uses mutex + eventfd to wake up Worker's event loop
+  void DispatchConnection(PendingConnection conn);
+
   void TimerCB(int, int16_t events);
 
   lua_State *Lua() { return lua_; }
@@ -112,6 +125,11 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void newUnixSocketConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen);
   redis::Connection *removeConnection(int fd);
 
+  // Accept-Dispatch: eventfd callback when Acceptor dispatches connections
+  void onDispatchEvent(int fd, int16_t events);
+  // Create connection from dispatched fd (refactored from newTCPConnection)
+  void createConnectionFromDispatch(const PendingConnection &pc);
+
   event_base *base_;
   UniqueEvent timer_;
   std::thread::id tid_;
@@ -139,6 +157,12 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   // Per-NS mutex inside NamespaceCommandStats - tenants don't block each other
   mutable std::shared_mutex ns_cmd_stats_mu_;
   std::unordered_map<std::string, std::unique_ptr<NamespaceCommandStats>> ns_cmd_stats_;
+
+  // Accept-Dispatch: Queue for connections dispatched from Acceptor threads
+  std::queue<PendingConnection> pending_conns_;
+  std::mutex pending_conns_mu_;
+  int dispatch_fd_{-1};            // eventfd for wakeup from Acceptor
+  UniqueEvent dispatch_event_;     // libevent event for dispatch_fd_
 };
 
 class WorkerThread {

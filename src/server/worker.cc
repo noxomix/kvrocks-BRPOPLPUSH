@@ -44,6 +44,10 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
+
 #include <algorithm>
 #include <utility>
 
@@ -52,31 +56,26 @@
 #include "server.h"
 #include "storage/scripting.h"
 
-Worker::Worker(Server *srv, Config *config) : srv(srv), base_(event_base_new()) {
+Worker::Worker(Server *srv, [[maybe_unused]] Config *config) : srv(srv), base_(event_base_new()) {
   if (!base_) throw std::runtime_error{"event base failed to be created"};
 
   timer_.reset(NewEvent(base_, -1, EV_PERSIST));
   timeval tm = {10, 0};
   evtimer_add(timer_.get(), &tm);
 
-  if (config->socket_fd != -1) {
-    if (const Status s = listenFD(config->socket_fd, config->port, config->backlog); !s.IsOK()) {
-      error("[worker] Failed to listen to socket with fd: {}, Error: {}", config->socket_fd, s.Msg());
-      exit(1);
-    }
-  } else {
-    const uint32_t ports[3] = {config->port, config->tls_port, 0};
-
-    for (const uint32_t *port = ports; *port; ++port) {
-      for (const auto &bind : config->binds) {
-        if (const Status s = listenTCP(bind, *port, config->backlog); !s.IsOK()) {
-          error("[worker] Failed to listen on: {}:{}, Error: {}", bind, *port, s.Msg());
-          exit(1);
-        }
-        info("[worker] Listening on: {}:{}", bind, *port);
-      }
-    }
+  // Accept-Dispatch: Create eventfd for wakeup when Acceptor dispatches connections
+  dispatch_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (dispatch_fd_ < 0) {
+    throw std::runtime_error{"eventfd creation failed: " + std::string(strerror(errno))};
   }
+  dispatch_event_.reset(event_new(base_, dispatch_fd_, EV_READ | EV_PERSIST,
+                                  EventCallbackFunc<&Worker::onDispatchEvent>, this));
+  event_add(dispatch_event_.get(), nullptr);
+
+  // NOTE: TCP listening is handled by Acceptor threads now (Accept-Dispatch architecture)
+  // Workers only handle dispatched connections via eventfd
+  // Unix socket listening for Worker0 is handled separately via ListenUnixSocket()
+
   lua_ = lua::CreateState();
 }
 
@@ -87,6 +86,13 @@ Worker::~Worker() {
   }
 
   timer_.reset();
+  dispatch_event_.reset();
+
+  // Close dispatch eventfd
+  if (dispatch_fd_ >= 0) {
+    close(dispatch_fd_);
+  }
+
   if (rate_limit_group_) {
     bufferevent_rate_limit_group_free(rate_limit_group_);
   }
@@ -782,6 +788,131 @@ void Worker::KickoutIdleClients(int timeout) {
 
   for (const auto &conn : to_be_killed_conns) {
     FreeConnectionByID(conn.first, conn.second);
+  }
+}
+
+// Accept-Dispatch: Called by Acceptor thread to dispatch a new connection to this Worker
+// Thread-safe: Adds to queue and wakes up Worker's event loop via eventfd
+void Worker::DispatchConnection(PendingConnection conn) {
+  // Don't dispatch to terminated workers
+  if (is_terminated_.load()) {
+    warn("[worker] Dropping connection fd={} - worker terminated", conn.fd);
+    close(conn.fd);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(pending_conns_mu_);
+    pending_conns_.push(std::move(conn));
+  }
+  // Wake up the event loop via eventfd
+  uint64_t val = 1;
+  if (write(dispatch_fd_, &val, sizeof(val)) < 0) {
+    error("[worker] Failed to write to eventfd: {}", strerror(errno));
+  }
+}
+
+// Accept-Dispatch: Event callback when Acceptor dispatches connections
+void Worker::onDispatchEvent(int, int16_t) {
+  // Clear the eventfd
+  uint64_t val;
+  if (read(dispatch_fd_, &val, sizeof(val)) < 0 && errno != EAGAIN) {
+    error("[worker] Failed to read from eventfd: {}", strerror(errno));
+  }
+
+  // Process all pending connections (batch processing for efficiency)
+  std::vector<PendingConnection> conns;
+  {
+    std::lock_guard<std::mutex> lock(pending_conns_mu_);
+    while (!pending_conns_.empty()) {
+      conns.push_back(std::move(pending_conns_.front()));
+      pending_conns_.pop();
+    }
+  }
+
+  for (auto &pc : conns) {
+    createConnectionFromDispatch(pc);
+  }
+}
+
+// Accept-Dispatch: Create connection from dispatched fd
+// Similar to newTCPConnection but uses is_tls flag instead of port check
+void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
+  debug("[worker] Dispatched connection: fd={} is_tls={} thread #{}", pc.fd, pc.is_tls, fmt::streamed(tid_));
+
+  auto s = util::SockSetTcpKeepalive(pc.fd, 120);
+  if (!s.IsOK()) {
+    error("[worker] Failed to set tcp-keepalive on socket. Error: {}", s.Msg());
+    evutil_closesocket(pc.fd);
+    return;
+  }
+
+  s = util::SockSetTcpNoDelay(pc.fd, 1);
+  if (!s.IsOK()) {
+    error("[worker] Failed to set tcp-nodelay on socket. Error: {}", s.Msg());
+    evutil_closesocket(pc.fd);
+    return;
+  }
+
+  auto ev_thread_safe_flags =
+      BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS | BEV_OPT_CLOSE_ON_FREE;
+
+  bufferevent *bev = nullptr;
+  ssl_st *ssl = nullptr;
+#ifdef ENABLE_OPENSSL
+  if (pc.is_tls) {
+    ssl = SSL_new(srv->ssl_ctx.get());
+    if (!ssl) {
+      error("[worker] Failed to construct SSL structure for new connection: {}", fmt::streamed(SSLErrors{}));
+      evutil_closesocket(pc.fd);
+      return;
+    }
+    bev = bufferevent_openssl_socket_new(base_, pc.fd, ssl, BUFFEREVENT_SSL_ACCEPTING, ev_thread_safe_flags);
+  } else {
+    bev = bufferevent_socket_new(base_, pc.fd, ev_thread_safe_flags);
+  }
+#else
+  bev = bufferevent_socket_new(base_, pc.fd, ev_thread_safe_flags);
+#endif
+  if (!bev) {
+    auto socket_err = evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR());
+#ifdef ENABLE_OPENSSL
+    error("[worker] Failed to construct socket for new connection: {}, SSL error: {}", socket_err,
+          fmt::streamed(SSLErrors{}));
+    if (ssl) SSL_free(ssl);
+#else
+    error("[worker] Failed to construct socket for new connection: {}", socket_err);
+#endif
+    evutil_closesocket(pc.fd);
+    return;
+  }
+#ifdef ENABLE_OPENSSL
+  if (pc.is_tls) {
+    bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
+  }
+#endif
+  auto conn = new redis::Connection(bev, this);
+  conn->SetCB(bev);
+  bufferevent_enable(bev, EV_READ);
+
+  s = AddConnection(conn);
+  if (!s.IsOK()) {
+    std::string err_msg = redis::Error({Status::NotOK, s.Msg()});
+    s = util::SockSend(pc.fd, err_msg, ssl);
+    if (!s.IsOK()) {
+      warn("[worker] Failed to send error response to socket: {}", s.Msg());
+    }
+    conn->Close();
+    return;
+  }
+
+  if (auto s = util::GetPeerAddr(pc.fd)) {
+    auto [ip, port] = std::move(*s);
+    conn->SetAddr(ip, port);
+  }
+
+  if (rate_limit_group_) {
+    bufferevent_add_to_rate_limit_group(bev, rate_limit_group_);
   }
 }
 

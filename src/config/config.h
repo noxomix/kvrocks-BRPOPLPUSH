@@ -105,6 +105,7 @@ struct Config {
   bool tls_replication = false;
 
   int workers = 0;
+  int acceptor_threads = 1;  // Number of acceptor threads for TCP connections
   int timeout = 0;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;

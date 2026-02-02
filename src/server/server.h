@@ -541,4 +541,17 @@ class Server {
   std::atomic<uint16_t> cursor_counter_ = {0};
   using CursorDictType = std::array<CursorDictElement, CURSOR_DICT_SIZE>;
   std::unique_ptr<CursorDictType> cursor_dict_;
+
+  // Accept-Dispatch architecture: Acceptor threads handle TCP accept(),
+  // dispatch FDs to Workers via eventfd for processing
+  std::vector<std::thread> acceptor_threads_;
+  std::vector<int> listen_fds_;       // TCP listen sockets
+  std::vector<int> tls_listen_fds_;   // TLS listen sockets (separate)
+  std::atomic<size_t> next_worker_{0};       // Round-robin counter for worker selection
+  std::atomic<bool> acceptor_stop_{false};   // Signal to stop acceptor threads
+
+  Status StartAcceptors();
+  void StopAcceptors();
+  void AcceptorLoop(int listen_fd, bool is_tls);
+  Worker *SelectWorker();
 };

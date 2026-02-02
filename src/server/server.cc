@@ -20,9 +20,15 @@
 
 #include "server.h"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <rocksdb/convenience.h>
 #include <rocksdb/statistics.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 
@@ -199,6 +205,12 @@ Status Server::Start() {
     slot_import = std::make_unique<SlotImport>(this);
   }
 
+  // Start acceptor threads BEFORE workers (they handle TCP listen)
+  auto acceptor_status = StartAcceptors();
+  if (!acceptor_status.IsOK()) {
+    return acceptor_status.Prefixed("failed to start acceptors");
+  }
+
   for (const auto &worker : worker_threads_) {
     worker->Start();
   }
@@ -251,6 +263,9 @@ Status Server::Start() {
 
 void Server::Stop() {
   stop_ = true;
+
+  // Stop acceptors first (no new connections)
+  StopAcceptors();
 
   slaveof_mu_.lock();
   if (replication_thread_) replication_thread_->Stop();
@@ -2703,4 +2718,220 @@ AuthResult Server::AuthenticateUser(const std::string &user_password, std::strin
   }
   *ns = kDefaultNamespace;
   return AuthResult::IS_ADMIN;
+}
+
+// Accept-Dispatch Architecture Implementation
+// Acceptor threads handle TCP accept(), dispatch FDs to Workers via eventfd
+
+// Helper function to create a listen socket for a given host:port
+static StatusOr<int> CreateListenSocket(const std::string &host, uint32_t port, int backlog) {
+  bool ipv6_used = strchr(host.data(), ':');
+
+  addrinfo hints = {};
+  hints.ai_family = ipv6_used ? AF_INET6 : AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  addrinfo *srv_info = nullptr;
+  if (int rv = getaddrinfo(host.data(), std::to_string(port).c_str(), &hints, &srv_info); rv != 0) {
+    return {Status::NotOK, gai_strerror(rv)};
+  }
+
+  int fd = -1;
+  for (auto p = srv_info; p != nullptr; p = p->ai_next) {
+    fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd == -1) continue;
+
+    int sock_opt = 1;
+    if (ipv6_used && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &sock_opt, sizeof(sock_opt)) == -1) {
+      close(fd);
+      freeaddrinfo(srv_info);
+      return {Status::NotOK, fmt::format("setsockopt IPV6_V6ONLY failed: {}", strerror(errno))};
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &sock_opt, sizeof(sock_opt)) < 0) {
+      close(fd);
+      freeaddrinfo(srv_info);
+      return {Status::NotOK, fmt::format("setsockopt SO_REUSEADDR failed: {}", strerror(errno))};
+    }
+
+    // SO_REUSEPORT for kernel load-balancing across multiple acceptor threads
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &sock_opt, sizeof(sock_opt)) < 0) {
+      close(fd);
+      freeaddrinfo(srv_info);
+      return {Status::NotOK, fmt::format("setsockopt SO_REUSEPORT failed: {}", strerror(errno))};
+    }
+
+    if (bind(fd, p->ai_addr, p->ai_addrlen)) {
+      close(fd);
+      freeaddrinfo(srv_info);
+      return {Status::NotOK, fmt::format("bind failed: {}", strerror(errno))};
+    }
+
+    if (listen(fd, backlog) < 0) {
+      close(fd);
+      freeaddrinfo(srv_info);
+      return {Status::NotOK, fmt::format("listen failed: {}", strerror(errno))};
+    }
+
+    // Make socket non-blocking for poll-based accept loop
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    break;  // Successfully created socket
+  }
+
+  freeaddrinfo(srv_info);
+  if (fd == -1) {
+    return {Status::NotOK, "failed to create socket for any address"};
+  }
+  return fd;
+}
+
+Status Server::StartAcceptors() {
+  // Create listen sockets for each bind address and port
+  // With SO_REUSEPORT, each acceptor thread gets its own socket for kernel load balancing
+  for (int i = 0; i < config_->acceptor_threads; i++) {
+    for (const auto &bind_addr : config_->binds) {
+      // TCP port
+      if (config_->port > 0) {
+        auto fd_or = CreateListenSocket(bind_addr, config_->port, config_->backlog);
+        if (!fd_or.IsOK()) {
+          return fd_or.ToStatus().Prefixed(fmt::format("failed to listen on {}:{}", bind_addr, config_->port));
+        }
+        int fd = *fd_or;
+        listen_fds_.push_back(fd);
+        auto acceptor_thread = GET_OR_RET(util::CreateThread(
+            "acceptor", [this, fd] { AcceptorLoop(fd, /*is_tls=*/false); }));
+        acceptor_threads_.push_back(std::move(acceptor_thread));
+        info("[acceptor] Listening on {}:{}", bind_addr, config_->port);
+      }
+
+#ifdef ENABLE_OPENSSL
+      // TLS port (if configured)
+      if (config_->tls_port > 0) {
+        auto tls_fd_or = CreateListenSocket(bind_addr, config_->tls_port, config_->backlog);
+        if (!tls_fd_or.IsOK()) {
+          return tls_fd_or.ToStatus().Prefixed(fmt::format("failed to listen on {}:{} (TLS)", bind_addr, config_->tls_port));
+        }
+        int tls_fd = *tls_fd_or;
+        tls_listen_fds_.push_back(tls_fd);
+        auto acceptor_thread = GET_OR_RET(util::CreateThread(
+            "acceptor-tls", [this, tls_fd] { AcceptorLoop(tls_fd, /*is_tls=*/true); }));
+        acceptor_threads_.push_back(std::move(acceptor_thread));
+        info("[acceptor] Listening on {}:{} (TLS)", bind_addr, config_->tls_port);
+      }
+#endif
+    }
+  }
+
+  // Handle systemd socket activation
+  if (config_->socket_fd >= 0) {
+    // Duplicate the FD so we don't close systemd's original on shutdown
+    int fd = dup(config_->socket_fd);
+    if (fd < 0) {
+      return {Status::NotOK, fmt::format("dup(socket_fd) failed: {}", strerror(errno))};
+    }
+    // Make the socket non-blocking
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    listen_fds_.push_back(fd);
+    auto acceptor_thread = GET_OR_RET(util::CreateThread(
+        "acceptor-sd", [this, fd] { AcceptorLoop(fd, /*is_tls=*/false); }));
+    acceptor_threads_.push_back(std::move(acceptor_thread));
+    info("[acceptor] Using systemd socket fd={} (dup'd from {})", fd, config_->socket_fd);
+  }
+
+  info("[acceptor] Started {} acceptor threads", acceptor_threads_.size());
+  return Status::OK();
+}
+
+void Server::StopAcceptors() {
+  acceptor_stop_.store(true);
+
+  // FIRST: Join all acceptor threads (they exit via stop_ flag + poll timeout)
+  // This ensures no thread is using the FDs when we close them
+  for (auto &t : acceptor_threads_) {
+    if (auto s = util::ThreadJoin(t); !s) {
+      warn("[acceptor] Failed to join acceptor thread: {}", s.Msg());
+    }
+  }
+
+  // THEN: Close listen sockets (safe, no threads active anymore)
+  for (int fd : listen_fds_) {
+    close(fd);
+  }
+  for (int fd : tls_listen_fds_) {
+    close(fd);
+  }
+
+  acceptor_threads_.clear();
+  listen_fds_.clear();
+  tls_listen_fds_.clear();
+  info("[acceptor] All acceptor threads stopped");
+}
+
+void Server::AcceptorLoop(int listen_fd, bool is_tls) {
+  struct pollfd pfd;
+  pfd.fd = listen_fd;
+  pfd.events = POLLIN;
+
+  while (!acceptor_stop_.load()) {
+    // Poll with 100ms timeout to check stop flag periodically
+    int ret = poll(&pfd, 1, 100);
+    if (ret < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EBADF) break;  // Socket closed during shutdown - normal
+      error("[acceptor] poll() failed: {}", strerror(errno));
+      break;
+    }
+    if (ret == 0) continue;  // Timeout, check stop flag
+
+    if (!(pfd.revents & POLLIN)) continue;
+
+    // Accept new connections
+    while (!acceptor_stop_.load()) {
+      sockaddr_storage addr;
+      socklen_t addrlen = sizeof(addr);
+      int fd = accept4(listen_fd, reinterpret_cast<sockaddr *>(&addr), &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      if (fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;  // No more pending connections
+        }
+        if (errno == EINTR) continue;
+        if (errno == EMFILE || errno == ENFILE) {
+          // Too many open files, back off
+          warn("[acceptor] accept() failed (too many open files): {}", strerror(errno));
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          break;
+        }
+        // Socket may have been closed for shutdown
+        if (acceptor_stop_.load()) break;
+        error("[acceptor] accept() failed: {}", strerror(errno));
+        continue;
+      }
+
+      // Select a worker and dispatch the connection
+      Worker *worker = SelectWorker();
+      if (worker == nullptr) {
+        error("[acceptor] No workers available, closing connection");
+        close(fd);
+        continue;
+      }
+
+      PendingConnection pc;
+      pc.fd = fd;
+      pc.is_tls = is_tls;
+      worker->DispatchConnection(std::move(pc));
+    }
+  }
+}
+
+Worker *Server::SelectWorker() {
+  if (worker_threads_.empty()) return nullptr;
+
+  // Phase 1: Simple round-robin
+  // Phase 2: Add IsLuaRunning() check to skip workers running Lua scripts
+  size_t idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % worker_threads_.size();
+  return worker_threads_[idx]->GetWorker();
 }
