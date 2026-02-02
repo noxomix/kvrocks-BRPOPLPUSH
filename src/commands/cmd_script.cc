@@ -102,6 +102,14 @@ class CommandScript : public Commander {
       }
 
       *output = redis::BulkString(sha);
+    } else if (args_.size() == 2 && subcommand_ == "kill") {
+      info("[DEBUG] SCRIPT KILL Execute called, ns={}", conn->GetNamespace());
+      auto s = srv->KillLuaScript(conn->GetNamespace());
+      info("[DEBUG] SCRIPT KILL KillLuaScript returned: {}", s.Msg());
+      if (!s.IsOK()) {
+        return s;
+      }
+      *output = redis::RESP_OK;
     } else {
       return {Status::NotOK, "Unknown SCRIPT subcommand or wrong number of arguments"};
     }
@@ -119,10 +127,20 @@ CommandKeyRange GetScriptEvalKeyRange(const std::vector<std::string> &args) {
 }
 
 uint64_t GenerateScriptFlags(uint64_t flags, const std::vector<std::string> &args) {
-  if (args.size() >= 2 && (util::EqualICase(args[1], "load") || util::EqualICase(args[1], "flush"))) {
-    return flags | kCmdWrite;
+  if (args.size() >= 2) {
+    if (util::EqualICase(args[1], "flush")) {
+      // FLUSH needs exclusive + write
+      return flags | kCmdWrite | kCmdExclusive;
+    }
+    if (util::EqualICase(args[1], "load")) {
+      return flags | kCmdWrite;
+    }
+    if (util::EqualICase(args[1], "kill")) {
+      // KILL must bypass locks to run while EVAL holds exclusive lock
+      return flags | kCmdNoLock;
+    }
+    // EXISTS doesn't need any special flags
   }
-
   return flags;
 }
 
@@ -141,6 +159,6 @@ REDIS_REGISTER_COMMANDS(
                                 GenerateEvalFlags),
     MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange),
     MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange),
-    MakeCmdAttr<CommandScript>("script", -2, "exclusive no-script skip-monitor", NO_KEY, GenerateScriptFlags), )
+    MakeCmdAttr<CommandScript>("script", -2, "no-script skip-monitor", NO_KEY, GenerateScriptFlags), )
 
 }  // namespace redis

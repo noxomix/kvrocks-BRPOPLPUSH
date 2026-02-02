@@ -89,6 +89,8 @@ enum CommandFlags : uint64_t {
   kCmdAdmin = 1ULL << 11,
   // "skip-monitor" flag, for commands that should skip monitor feed
   kCmdSkipMonitor = 1ULL << 12,
+  // "no-lock" flag, for commands that bypass work locks (e.g., SCRIPT KILL)
+  kCmdNoLock = 1ULL << 13,
 };
 
 enum class CommandCategory : uint8_t {

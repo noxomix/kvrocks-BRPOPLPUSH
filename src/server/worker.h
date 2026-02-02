@@ -111,6 +111,20 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void CheckAndResetIfNeeded(const std::string &ns);
   int64_t GetLuaMemorySize();
 
+  // Lua script timeout support
+  void StartLuaScript(const std::string &ns, uint64_t start_ms) {
+    lua_script_ns_ = ns;
+    lua_script_start_ms_.store(start_ms, std::memory_order_relaxed);
+    lua_script_kill_requested_.store(false, std::memory_order_relaxed);
+    lua_script_running_.store(true, std::memory_order_release);
+  }
+  void StopLuaScript() { lua_script_running_.store(false, std::memory_order_release); }
+  bool IsLuaScriptRunning() const { return lua_script_running_.load(std::memory_order_acquire); }
+  bool IsLuaScriptKillRequested() const { return lua_script_kill_requested_.load(std::memory_order_acquire); }
+  uint64_t GetLuaScriptStartMs() const { return lua_script_start_ms_.load(std::memory_order_relaxed); }
+  std::string GetLuaScriptNs() const { return lua_script_ns_; }  // Copy for thread-safety
+  void RequestLuaScriptKill() { lua_script_kill_requested_.store(true, std::memory_order_release); }
+
   std::map<int, redis::Connection *> GetConnections() const { return conns_; }
   Server *srv;
 
@@ -152,6 +166,12 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::atomic<lua_State *> lua_;
   std::atomic<bool> is_terminated_ = false;
   std::atomic<WorkerState> state_{WorkerState::kRunning};
+
+  // Lua script timeout state
+  std::atomic<bool> lua_script_running_{false};
+  std::atomic<bool> lua_script_kill_requested_{false};
+  std::atomic<uint64_t> lua_script_start_ms_{0};
+  std::string lua_script_ns_;  // Protected by lua_script_running_ memory ordering
 
   // Async script reset support
   std::mutex ns_reset_mutex_;

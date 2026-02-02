@@ -113,7 +113,7 @@ void Worker::TimerCB(int, [[maybe_unused]] int16_t events) {
 void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[maybe_unused]] sockaddr *address,
                               [[maybe_unused]] int socklen) {
   int local_port = util::GetLocalPort(fd);  // NOLINT
-  debug("[worker] New connection: fd={} from port: {} thread #{}", fd, local_port, fmt::streamed(tid_));
+  info("[DEBUG] New connection: fd={} from port: {} thread #{}", fd, local_port, fmt::streamed(tid_));
 
   auto s = util::SockSetTcpKeepalive(fd, 120);
   if (!s.IsOK()) {

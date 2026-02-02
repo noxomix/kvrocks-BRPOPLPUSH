@@ -172,6 +172,10 @@
 - [ ] **GetConnections() Data-Race** → Resize nutzt `Worker::GetConnections()` ohne Lock
 - [ ] **Worker Destruktor UB** → iteriert `conns_` und löscht gleichzeitig (Shutdown/Resize)
 - [ ] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` lesen `Connection`-Felder ohne Atomics/Lock
+- [ ] **DBScan Map Race** → `db_scan_infos_` read ohne Lock (`GetLatestKeyNumStats/GetLastScanTime`)
+- [ ] **BGSAVE/Compact Flags Race** → `is_bgsave_in_progress_`, `db_compacting_`, `last_bgsave_*` read ohne Lock (INFO)
+- [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
+- [ ] **TLS Repl SSL Race** → `SSL_read` (worker) + `SSL_write` (feed thread) auf gleicher SSL*
 
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 

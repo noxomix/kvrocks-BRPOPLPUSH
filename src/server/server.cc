@@ -2405,6 +2405,26 @@ Status Server::ExecPropagatedCommand(const std::vector<std::string> &tokens) {
   return Status::OK();
 }
 
+Status Server::KillLuaScript(const std::string &ns) {
+  info("[DEBUG] KillLuaScript called for ns={}", ns);
+  bool found = false;
+  for (const auto &wt : worker_threads_) {
+    auto *w = wt->GetWorker();
+    info("[DEBUG] Worker: running={} script_ns={}", w->IsLuaScriptRunning(), w->GetLuaScriptNs());
+    if (w->IsLuaScriptRunning() && w->GetLuaScriptNs() == ns) {
+      w->RequestLuaScriptKill();
+      found = true;
+      info("[DEBUG] Requested kill for worker");
+    }
+  }
+  if (!found) {
+    info("[DEBUG] No scripts found");
+    return {Status::NotOK, "No scripts in execution right now."};
+  }
+  info("[DEBUG] Kill requested, returning OK");
+  return Status::OK();
+}
+
 // AdjustOpenFilesLimit only try best to raise the max open files according to
 // the max clients and RocksDB open file configuration. It also reserves a number
 // of file descriptors(128) for extra operations of persistence, listening sockets,
