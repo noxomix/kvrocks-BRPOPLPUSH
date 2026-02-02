@@ -19,6 +19,19 @@
 - **Copy-then-Reply:** Empfänger unter Lock kopieren, Lock lösen, dann I/O
 - **Nur `(Worker*, fd)` kopieren**, nie `Connection*` (Use-After-Free nach Lock-Release)
 
+### Work Guards (Command-Level Locking)
+- **`kCmdExclusive`** → `WorkExclusivityGuard(ns)` = `unique_lock<shared_mutex>`
+- **Normale Commands** → `WorkConcurrencyGuard(ns)` = `shared_lock<shared_mutex>`
+- **`unique_lock` blockiert `shared_lock`!** Deshalb wartet non-exclusive auf exclusive
+- **`kCmdNoLock`** → Kein Guard, für Commands die nur Atomics setzen (SCRIPT KILL)
+- SCRIPT KILL muss `kCmdNoLock` haben, sonst Deadlock mit laufendem EVAL
+
+### Worker-Blocking vs Lock-Blocking
+- **Lock-Blocking:** Command wartet auf Lock, Worker kann andere Connections bedienen
+- **Event-Loop-Blocking:** `lua_pcall` blockiert Worker komplett, keine anderen Connections
+- Deshalb: SCRIPT KILL auf **anderem Worker** muss möglich sein (kCmdNoLock)
+- Connections werden round-robin auf Workers verteilt (8 default)
+
 ### Aggregation & Stats
 - On-Demand bei INFO, 100ms cachen, nicht im Cron sampeln
 - `GetNamespaceStats(ns)` statt `GetNamespaceStatsSnapshot()` (O(1) vs O(n))
@@ -39,6 +52,12 @@
 - EVAL: `f_{ns}_{sha}` Storage-Key
 - FUNCTION: `<ns>_<lib>`, LuaResetNamespace() für Cleanup
 - `lua_pushvalue(lua, LUA_GLOBALSINDEX)` statt `lua_pushglobaltable` (Lua 5.1)
+- **lua_sethook:** `LUA_MASKCOUNT` alle 100k Instruktionen → prüft Timeout/Kill
+- Hook feuert nur zwischen Lua-Instruktionen, nicht während `redis.call()`
+- `luaL_error()` im Hook → longjmp, wird von `lua_pcall` gefangen
+- **Timeout/Kill Limitierungen:** Hook greift nur in Lua-Bytecode, nicht während C++ in `redis.call()` läuft
+- **SCRIPT KILL:** setzt nur Worker-Flag; funktioniert nur wenn Kill-Command auf anderem Worker läuft
+- **SO_REUSEPORT Risiko:** beide Connections koennen auf demselben Worker landen → SCRIPT KILL haengt (Go-Test: i/o timeout)
 
 ### Transaktionen & Atomizität
 
@@ -161,7 +180,25 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
-- [ ] **Lua Timeout** - Self-DoS möglich (Endlosschleife blockiert eigenen NS permanent)
+- [ ] **Lua Timeout** - `lua-time-limit` Config + `SCRIPT KILL` Command (namespace-aware)
+- [ ] **Lua Timeout/Kill - Accept-Dispatch Plan (keeps Redis port)**
+  - Ziel: SCRIPT KILL immer erreichbar, auch wenn Worker in lua_pcall blockiert
+  - Konzept: 1..N Accept-Threads nehmen Verbindungen an und verteilen FD an Worker
+  - Worker-Auswahl: round-robin, aber Worker mit `lua_script_running_` ueberspringen (fallback auf any)
+  - Worker: thread-safe FD-Queue + eventfd/pipe wakeup; Connection/bufferevent wird im Worker-Thread gebaut
+  - Listener: TCP/TLS nur im Acceptor, kein SO_REUSEPORT in Workern (Unix-Socket optional weiter auf Worker0)
+  - Config: optional `acceptor-threads` (default 1)
+  - Tests: Go script_timeout_test wird stabil (kein i/o timeout); evtl. neue test fuer Kill waehrend Lua-Loop
+  - Grobe LoC: Worker (120-180), Server/Acceptor (150-250), Config (20-40), Tests (50-100)
+- [ ] **Per-NS Heavy-Command Budget (verhindert Noisy-Neighbor durch O(n)/Lua)**
+  - Idee: neuer Flag `kCmdHeavy` (oder reuse `kCmdSlow`) + Config `max-heavy-per-namespace`
+  - Check in `Connection::ExecuteCommands` vor Ausfuehrung:
+    - wenn heavy und counter(ns) >= limit → `BUSY/TRYAGAIN` (oder custom error)
+    - sonst counter++ und per ScopeExit counter--
+  - Heavy-Kandidaten: O(n)/O(n*m) Commands aus TODO (HGETALL, SMEMBERS, LRANGE, KEYS, Z*RANGE, SINTER/UNION/DIFF, Z*UNION/INTER/DIFF), plus EVAL/FCALL (Lua)
+  - Multi/EXEC: Budget beim EXEC verbrauchen (nicht beim Queue)
+  - Ziel: ein Tenant kann nicht alle Worker mit langen Commands blockieren
+- [ ] **Lua Key-Level Locking** - Wie DragonflyDB: Nur deklarierte Keys locken statt ganzen Namespacep
 - [ ] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
   - Neue Commands: `EVAL_TX`, `EVALSHA_TX`, `FCALL_TX` (analog zu `_RO` Suffix)
   - Standalone: Eigenes `BeginTxn`/`CommitTxn`, bei Fehler `DiscardTxn`
