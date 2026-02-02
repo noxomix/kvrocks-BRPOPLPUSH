@@ -198,6 +198,7 @@ struct Config {
   bool skip_block_cache_deallocation_on_close = false;
 
   bool lua_strict_key_accessing = false;
+  int lua_time_limit = 5000;  // ms, 0 = unlimited
 
   std::vector<double> histogram_bucket_boundaries;
 

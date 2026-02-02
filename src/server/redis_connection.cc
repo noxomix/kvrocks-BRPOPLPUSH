@@ -484,6 +484,8 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     // so that different namespaces can execute exclusive commands in parallel.
     if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
       // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
+    } else if (cmd_flags & kCmdNoLock) {
+      // No lock needed - command only sets atomic flags (e.g., SCRIPT KILL)
     } else if (cmd_flags & kCmdExclusive) {
       // Use namespace-specific lock if namespace is set, otherwise use global lock
       if (!ns_.empty()) {

@@ -31,6 +31,7 @@
 
 #include "commands/commander.h"
 #include "commands/error_constants.h"
+#include "common/time_util.h"
 #include "db_util.h"
 #include "fmt/format.h"
 #include "lua.h"
@@ -40,6 +41,7 @@
 #include "server/redis_connection.h"
 #include "server/redis_reply.h"
 #include "server/server.h"
+#include "server/worker.h"
 #include "sha1.h"
 #include "storage/storage.h"
 #include "string_util.h"
@@ -57,6 +59,29 @@ enum {
   LL_NOTICE,
   LL_WARNING,
 };
+
+// Lua hook for script timeout and SCRIPT KILL detection
+void LuaTimeoutHook(lua_State *lua, lua_Debug *) {
+  auto *ctx = lua::GetFromRegistry<lua::ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  if (!ctx || !ctx->conn) return;
+
+  auto *worker = ctx->conn->Owner();
+
+  // Check if kill was requested
+  if (worker->IsLuaScriptKillRequested()) {
+    luaL_error(lua, "Script killed by SCRIPT KILL");
+    return;
+  }
+
+  // Check timeout
+  int limit = ctx->conn->GetServer()->GetConfig()->lua_time_limit;
+  if (limit > 0) {
+    uint64_t elapsed = util::GetTimeStampMS() - worker->GetLuaScriptStartMs();
+    if (elapsed > static_cast<uint64_t>(limit)) {
+      luaL_error(lua, "Script timed out");
+    }
+  }
+}
 
 namespace lua {
 
@@ -448,9 +473,20 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
   // save keys on registry the to perform key touching check
   SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
 
+  // Setup timeout/kill hook (always needed for SCRIPT KILL)
+  auto *worker = conn->Owner();
+  worker->StartLuaScript(ns, util::GetTimeStampMS());
+  lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
+
   PushArray(lua, keys);
   PushArray(lua, argv);
-  if (lua_pcall(lua, 2, 1, -4)) {
+  int pcall_result = lua_pcall(lua, 2, 1, -4);
+
+  // Cleanup timeout hook
+  lua_sethook(lua, nullptr, 0, 0);
+  worker->StopLuaScript();
+
+  if (pcall_result) {
     std::string err_msg = lua_tostring(lua, -1);
     lua_pop(lua, 2);
     return {Status::NotOK, fmt::format("Error while running function `{}`: {}", name, err_msg)};
@@ -759,7 +795,18 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   // save keys on registry the to perform key touching check
   SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
 
-  if (lua_pcall(lua, 0, 1, -2)) {
+  // Setup timeout/kill hook (always needed for SCRIPT KILL)
+  auto *worker = conn->Owner();
+  worker->StartLuaScript(ns, util::GetTimeStampMS());
+  lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
+
+  int pcall_result = lua_pcall(lua, 0, 1, -2);
+
+  // Cleanup timeout hook
+  lua_sethook(lua, nullptr, 0, 0);
+  worker->StopLuaScript();
+
+  if (pcall_result) {
     auto msg = fmt::format("running script (call to {}): {}", funcname, lua_tostring(lua, -1));
     *output = redis::Error({Status::NotOK, msg});
     lua_pop(lua, 2);

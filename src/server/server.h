@@ -385,6 +385,7 @@ class Server {
 
   Status Propagate(const std::string &channel, const std::vector<std::string> &tokens) const;
   Status ExecPropagatedCommand(const std::vector<std::string> &tokens);
+  Status KillLuaScript(const std::string &ns);
 
   LogCollector<PerfEntry> *GetPerfLog() { return &perf_log_; }
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
