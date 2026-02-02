@@ -201,13 +201,12 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
-- [ ] **Lua Timeout** - `lua-time-limit` Config + `SCRIPT KILL` Command (namespace-aware)
 - [x] **Accept-Dispatch Hardening (Race/FD-Leak)**
   - Worker-Snapshot (RCU) statt direktem `worker_threads_` Zugriff
   - StopAccepting + Queue-Drain (keine geparkten FDs)
   - `acceptor-queue-limit` (bounded pending queue)
   - Start-Reihenfolge: Workers vor Acceptors
-- [x] **Lua Timeout/Kill - Accept-Dispatch Architecture (Phase 1 DONE)**
+- [x] **Lua Timeout/Kill - Accept-Dispatch Architecture (Phase 1+2 DONE)**
   - Ziel: SCRIPT KILL immer erreichbar, auch wenn Worker in lua_pcall blockiert
   - Konzept: 1..N Accept-Threads nehmen Verbindungen an und verteilen FD an Worker
   - Worker-Auswahl: round-robin, aber Worker mit `lua_script_running_` ueberspringen (fallback auf any)
@@ -223,7 +222,12 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
     - [x] `acceptor-threads` Config (1-16, default 1)
     - [x] Graceful Shutdown: Threads erst joinen, dann FDs schließen
     - [x] systemd socket_fd: dup() für sauberes Shutdown
-  - **Phase 2 (Later):** `IsLuaRunning()` Check, SCRIPT KILL, lua_sethook
+  - **Phase 2 - Lua-Aware Routing (DONE):**
+    - [x] `SelectWorker()` prüft `IsLuaScriptRunning()` und überspringt blockierte Worker
+    - [x] `lua_sethook` + `LuaTimeoutHook` für Timeout/Kill Detection
+    - [x] `SCRIPT KILL` Command mit `kCmdNoLock` Flag
+    - [x] `lua_time_limit` Config (Default 5000ms)
+    - **Limitierung:** SCRIPT KILL funktioniert nur von NEUER Connection (bestehende Connection auf blockiertem Worker kann nichts senden)
   - **Phase 3 (Later):** SNI -> Tenant Mapping
 - [ ] **Per-NS Heavy-Command Budget (verhindert Noisy-Neighbor durch O(n)/Lua)**
   - Idee: neuer Flag `kCmdHeavy` (oder reuse `kCmdSlow`) + Config `max-heavy-per-namespace`
