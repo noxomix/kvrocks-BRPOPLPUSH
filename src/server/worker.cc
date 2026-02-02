@@ -80,6 +80,7 @@ Worker::Worker(Server *srv, [[maybe_unused]] Config *config) : srv(srv), base_(e
 }
 
 Worker::~Worker() {
+  DrainPendingConnections();
   // All connections (including monitors) are now in conns_
   for (const auto &iter : conns_) {
     iter.second->Close();
@@ -315,9 +316,12 @@ void Worker::Run(std::thread::id tid) {
     error("[worker] Failed to run server, err: {}", strerror(errno));
   }
   is_terminated_ = true;
+  state_.store(WorkerState::kStopped, std::memory_order_release);
 }
 
 void Worker::Stop(uint32_t wait_seconds) {
+  StopAccepting();
+  DrainPendingConnections();
   for (const auto &lev : listen_events_) {
     // It's unnecessary to close the listener fd since we have set the LEV_OPT_CLOSE_ON_FREE flag
     evconnlistener_free(lev);
@@ -795,15 +799,28 @@ void Worker::KickoutIdleClients(int timeout) {
 // Thread-safe: Adds to queue and wakes up Worker's event loop via eventfd
 void Worker::DispatchConnection(PendingConnection conn) {
   // Don't dispatch to terminated workers
-  if (is_terminated_.load()) {
-    warn("[worker] Dropping connection fd={} - worker terminated", conn.fd);
+  if (!IsAccepting() || is_terminated_.load(std::memory_order_acquire)) {
+    debug("[worker] Dropping connection fd={} - worker not accepting", conn.fd);
     close(conn.fd);
     return;
   }
 
+  size_t limit = srv->GetConfig()->acceptor_queue_limit;
+  bool drop = false;
   {
     std::lock_guard<std::mutex> lock(pending_conns_mu_);
-    pending_conns_.push(std::move(conn));
+    if (!IsAccepting() || is_terminated_.load(std::memory_order_acquire)) {
+      drop = true;
+    } else if (limit > 0 && pending_conns_.size() >= limit) {
+      drop = true;
+    } else {
+      pending_conns_.push(std::move(conn));
+    }
+  }
+
+  if (drop) {
+    close(conn.fd);
+    return;
   }
   // Wake up the event loop via eventfd
   uint64_t val = 1;
@@ -831,7 +848,23 @@ void Worker::onDispatchEvent(int, int16_t) {
   }
 
   for (auto &pc : conns) {
+    if (!IsAccepting() || is_terminated_.load(std::memory_order_acquire)) {
+      close(pc.fd);
+      continue;
+    }
     createConnectionFromDispatch(pc);
+  }
+}
+
+void Worker::DrainPendingConnections() {
+  std::queue<PendingConnection> pending;
+  {
+    std::lock_guard<std::mutex> lock(pending_conns_mu_);
+    std::swap(pending, pending_conns_);
+  }
+  while (!pending.empty()) {
+    close(pending.front().fd);
+    pending.pop();
   }
 }
 

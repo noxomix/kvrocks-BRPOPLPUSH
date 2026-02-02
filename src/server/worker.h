@@ -60,6 +60,12 @@ struct PendingConnection {
   // Phase 3: std::string sni_hostname;
 };
 
+enum class WorkerState : uint8_t {
+  kRunning = 0,
+  kStopping = 1,
+  kStopped = 2,
+};
+
 class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
  public:
   Worker(Server *srv, Config *config);
@@ -71,6 +77,8 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void Stop(uint32_t wait_seconds);
   void Run(std::thread::id tid);
   bool IsTerminated() const { return is_terminated_; }
+  bool IsAccepting() const { return state_.load(std::memory_order_acquire) == WorkerState::kRunning; }
+  void StopAccepting() { state_.store(WorkerState::kStopping, std::memory_order_release); }
 
   void MigrateConnection(Worker *target, redis::Connection *conn);
   void DetachConnection(redis::Connection *conn);
@@ -129,6 +137,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void onDispatchEvent(int fd, int16_t events);
   // Create connection from dispatched fd (refactored from newTCPConnection)
   void createConnectionFromDispatch(const PendingConnection &pc);
+  void DrainPendingConnections();
 
   event_base *base_;
   UniqueEvent timer_;
@@ -142,6 +151,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   struct ev_token_bucket_cfg *rate_limit_group_cfg_ = nullptr;
   std::atomic<lua_State *> lua_;
   std::atomic<bool> is_terminated_ = false;
+  std::atomic<WorkerState> state_{WorkerState::kRunning};
 
   // Async script reset support
   std::mutex ns_reset_mutex_;
@@ -167,13 +177,14 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
 class WorkerThread {
  public:
-  explicit WorkerThread(std::unique_ptr<Worker> worker) : worker_(std::move(worker)) {}
+  explicit WorkerThread(std::shared_ptr<Worker> worker) : worker_(std::move(worker)) {}
   ~WorkerThread() = default;
   WorkerThread(const WorkerThread &) = delete;
   WorkerThread(WorkerThread &&) = delete;
   WorkerThread &operator=(const WorkerThread &) = delete;
 
   Worker *GetWorker() { return worker_.get(); }
+  std::shared_ptr<Worker> GetWorkerShared() { return worker_; }
   void Start();
   void Stop(uint32_t wait_seconds);
   void Join();
@@ -181,5 +192,5 @@ class WorkerThread {
 
  private:
   std::thread t_;
-  std::unique_ptr<Worker> worker_;
+  std::shared_ptr<Worker> worker_;
 };

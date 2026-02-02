@@ -523,6 +523,8 @@ class Server {
   std::thread compaction_checker_thread_;
   TaskRunner task_runner_;
   std::vector<std::unique_ptr<WorkerThread>> worker_threads_;
+  mutable std::mutex worker_threads_mu_;
+  std::shared_ptr<std::vector<std::shared_ptr<Worker>>> worker_snapshot_;
   std::unique_ptr<ReplicationThread> replication_thread_;
   tbb::concurrent_queue<std::unique_ptr<WorkerThread>> recycle_worker_threads_;
 
@@ -553,5 +555,7 @@ class Server {
   Status StartAcceptors();
   void StopAcceptors();
   void AcceptorLoop(int listen_fd, bool is_tls);
-  Worker *SelectWorker();
+  std::shared_ptr<Worker> SelectWorker();
+  std::shared_ptr<std::vector<std::shared_ptr<Worker>>> GetWorkerSnapshot() const;
+  void PublishWorkerSnapshot();
 };

@@ -106,6 +106,7 @@ struct Config {
 
   int workers = 0;
   int acceptor_threads = 1;  // Number of acceptor threads for TCP connections
+  int acceptor_queue_limit = 4096;  // Per-worker pending connection queue limit (0 = unlimited)
   int timeout = 0;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;

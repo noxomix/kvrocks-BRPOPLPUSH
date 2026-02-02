@@ -109,7 +109,7 @@ Server::Server(engine::Storage *storage, Config *config)
   pubsub_shard_channels_.resize(config->cluster_enabled ? HASH_SLOTS_SIZE : 1);
 
   for (int i = 0; i < config->workers; i++) {
-    auto worker = std::make_unique<Worker>(this, config);
+    auto worker = std::make_shared<Worker>(this, config);
     // multiple workers can't listen to the same unix socket, so
     // listen unix socket only from a single worker - the first one
     if (!config->unixsocket.empty() && i == 0) {
@@ -122,6 +122,7 @@ Server::Server(engine::Storage *storage, Config *config)
     }
     worker_threads_.emplace_back(std::make_unique<WorkerThread>(std::move(worker)));
   }
+  PublishWorkerSnapshot();
 
   AdjustOpenFilesLimit();
   slow_log_.SetMaxEntries(config->slowlog_max_len);
@@ -205,14 +206,20 @@ Status Server::Start() {
     slot_import = std::make_unique<SlotImport>(this);
   }
 
-  // Start acceptor threads BEFORE workers (they handle TCP listen)
-  auto acceptor_status = StartAcceptors();
-  if (!acceptor_status.IsOK()) {
-    return acceptor_status.Prefixed("failed to start acceptors");
-  }
-
   for (const auto &worker : worker_threads_) {
     worker->Start();
+  }
+
+  // Start acceptor threads AFTER workers are ready
+  auto acceptor_status = StartAcceptors();
+  if (!acceptor_status.IsOK()) {
+    for (const auto &worker : worker_threads_) {
+      worker->Stop(0 /* immediately terminate */);
+    }
+    for (const auto &worker : worker_threads_) {
+      worker->Join();
+    }
+    return acceptor_status.Prefixed("failed to start acceptors");
   }
 
   if (auto s = task_runner_.Start(); !s) {
@@ -1505,10 +1512,12 @@ Server::InfoEntries Server::GetClientsInfo(redis::Connection *self) {
 
   // Count clients per namespace (admin sees all, tenants see only their own)
   int connected = 0, monitor = 0;
-  for (const auto &t : worker_threads_) {
-    auto counts = t->GetWorker()->GetClientCounts(self);
-    connected += counts.connected;
-    monitor += counts.monitor;
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      auto counts = worker->GetClientCounts(self);
+      connected += counts.connected;
+      monitor += counts.monitor;
+    }
   }
 
   entries.emplace_back("connected_clients", connected);
@@ -1528,8 +1537,10 @@ Server::InfoEntries Server::GetMemoryInfo(redis::Connection *conn) {
   // Lua memory only for admin (Lua VM is shared per worker, not per namespace)
   if (conn->IsAdmin()) {
     int64_t memory_lua = 0;
-    for (auto &wt : worker_threads_) {
-      memory_lua += wt->GetWorker()->GetLuaMemorySize();
+    if (auto snapshot = GetWorkerSnapshot()) {
+      for (auto &worker : *snapshot) {
+        memory_lua += worker->GetLuaMemorySize();
+      }
     }
     std::string used_memory_lua_human = util::BytesToHuman(memory_lua);
     entries.emplace_back("used_memory_lua", memory_lua);
@@ -1655,24 +1666,28 @@ int64_t Server::GetLastBgsaveTime() {
 
 NamespaceStatsSnapshot Server::AggregateNamespaceStats(const std::string &ns) {
   NamespaceStatsSnapshot result;
-  for (const auto &t : worker_threads_) {
-    // Optimization: Only fetch stats for requested namespace, not entire map
-    auto worker_stats = t->GetWorker()->GetNamespaceStats(ns);
-    result.total_calls += worker_stats.total_calls;
-    result.in_bytes += worker_stats.in_bytes;
-    result.out_bytes += worker_stats.out_bytes;
-    result.total_connections += worker_stats.total_connections;
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      // Optimization: Only fetch stats for requested namespace, not entire map
+      auto worker_stats = worker->GetNamespaceStats(ns);
+      result.total_calls += worker_stats.total_calls;
+      result.in_bytes += worker_stats.in_bytes;
+      result.out_bytes += worker_stats.out_bytes;
+      result.total_connections += worker_stats.total_connections;
+    }
   }
   return result;
 }
 
 std::map<std::string, CommandStatSnapshot> Server::AggregateCommandStatsForNamespace(const std::string &ns) {
   std::map<std::string, CommandStatSnapshot> result;
-  for (const auto &t : worker_threads_) {
-    auto worker_stats = t->GetWorker()->GetCommandStatsForNamespace(ns);
-    for (const auto &[cmd, stat] : worker_stats) {
-      result[cmd].calls += stat.calls;
-      result[cmd].latency += stat.latency;
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      auto worker_stats = worker->GetCommandStatsForNamespace(ns);
+      for (const auto &[cmd, stat] : worker_stats) {
+        result[cmd].calls += stat.calls;
+        result[cmd].latency += stat.latency;
+      }
     }
   }
   return result;
@@ -2196,8 +2211,10 @@ void Server::SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint
 
 std::string Server::GetClientsStr(redis::Connection *self) {
   std::string clients;
-  for (const auto &t : worker_threads_) {
-    clients.append(t->GetWorker()->GetClientsStr(self));
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      clients.append(worker->GetClientsStr(self));
+    }
   }
 
   // Slave connections are only visible to admin
@@ -2216,10 +2233,12 @@ void Server::KillClient(int64_t *killed, const std::string &addr, uint64_t id, u
   *killed = 0;
 
   // Normal clients and pubsub clients
-  for (const auto &t : worker_threads_) {
-    int64_t killed_in_worker = 0;
-    t->GetWorker()->KillClient(conn, id, addr, type, skipme, &killed_in_worker);
-    *killed += killed_in_worker;
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      int64_t killed_in_worker = 0;
+      worker->KillClient(conn, id, addr, type, skipme, &killed_in_worker);
+      *killed += killed_in_worker;
+    }
   }
 
   // Slave clients (only admin can kill these)
@@ -2334,10 +2353,11 @@ void Server::ScriptReset() {
 void Server::ScriptResetNamespace(const std::string &ns, Worker *exclude) {
   // Mark namespace for reset on all workers - they will reset lazily
   // Exclude the current worker if specified (it already did the operation)
-  for (auto &wt : worker_threads_) {
-    auto *worker = wt->GetWorker();
-    if (worker != exclude) {
-      worker->MarkNamespaceForReset(ns);
+  if (auto snapshot = GetWorkerSnapshot()) {
+    for (const auto &worker : *snapshot) {
+      if (worker.get() != exclude) {
+        worker->MarkNamespaceForReset(ns);
+      }
     }
   }
 }
@@ -2451,6 +2471,7 @@ void Server::AdjustOpenFilesLimit() {
 }
 
 void Server::AdjustWorkerThreads() {
+  std::lock_guard<std::mutex> guard(worker_threads_mu_);
   auto new_worker_threads = static_cast<size_t>(config_->workers);
   if (new_worker_threads == worker_threads_.size()) {
     return;
@@ -2460,17 +2481,19 @@ void Server::AdjustWorkerThreads() {
     delta = new_worker_threads - worker_threads_.size();
     increaseWorkerThreads(delta);
     info("[server] Increase worker threads from {} to {}", worker_threads_.size(), new_worker_threads);
+    PublishWorkerSnapshot();
     return;
   }
 
   delta = worker_threads_.size() - new_worker_threads;
   info("[server] Decrease worker threads from {} to {}", worker_threads_.size(), new_worker_threads);
   decreaseWorkerThreads(delta);
+  PublishWorkerSnapshot();
 }
 
 void Server::increaseWorkerThreads(size_t delta) {
   for (size_t i = 0; i < delta; i++) {
-    auto worker = std::make_unique<Worker>(this, config_);
+    auto worker = std::make_shared<Worker>(this, config_);
     auto worker_thread = std::make_unique<WorkerThread>(std::move(worker));
     worker_thread->Start();
     worker_threads_.emplace_back(std::move(worker_thread));
@@ -2490,6 +2513,7 @@ void Server::decreaseWorkerThreads(size_t delta) {
     // Migrate connections to other workers before stopping the worker,
     // we use round-robin to choose the target worker here.
     auto connections = worker_thread->GetWorker()->GetConnections();
+    worker_thread->GetWorker()->StopAccepting();
     for (const auto &iter : connections) {
       auto target_worker = worker_threads_[iter.first % remain_worker_threads]->GetWorker();
       worker_thread->GetWorker()->MigrateConnection(target_worker, iter.second);
@@ -2906,32 +2930,53 @@ void Server::AcceptorLoop(int listen_fd, bool is_tls) {
           break;
         }
         // Socket may have been closed for shutdown
-        if (acceptor_stop_.load()) break;
-        error("[acceptor] accept() failed: {}", strerror(errno));
-        continue;
-      }
-
-      // Select a worker and dispatch the connection
-      Worker *worker = SelectWorker();
-      if (worker == nullptr) {
-        error("[acceptor] No workers available, closing connection");
-        close(fd);
-        continue;
-      }
-
-      PendingConnection pc;
-      pc.fd = fd;
-      pc.is_tls = is_tls;
-      worker->DispatchConnection(std::move(pc));
+      if (acceptor_stop_.load()) break;
+      error("[acceptor] accept() failed: {}", strerror(errno));
+      continue;
     }
+
+    // Select a worker and dispatch the connection
+    auto worker = SelectWorker();
+    if (!worker) {
+      error("[acceptor] No workers available, closing connection");
+      close(fd);
+      continue;
+    }
+
+    PendingConnection pc;
+    pc.fd = fd;
+    pc.is_tls = is_tls;
+    worker->DispatchConnection(std::move(pc));
+  }
   }
 }
 
-Worker *Server::SelectWorker() {
-  if (worker_threads_.empty()) return nullptr;
+std::shared_ptr<std::vector<std::shared_ptr<Worker>>> Server::GetWorkerSnapshot() const {
+  return std::atomic_load_explicit(&worker_snapshot_, std::memory_order_acquire);
+}
+
+void Server::PublishWorkerSnapshot() {
+  auto snapshot = std::make_shared<std::vector<std::shared_ptr<Worker>>>();
+  snapshot->reserve(worker_threads_.size());
+  for (const auto &wt : worker_threads_) {
+    snapshot->push_back(wt->GetWorkerShared());
+  }
+  std::atomic_store_explicit(&worker_snapshot_, std::move(snapshot), std::memory_order_release);
+}
+
+std::shared_ptr<Worker> Server::SelectWorker() {
+  auto snapshot = GetWorkerSnapshot();
+  if (!snapshot || snapshot->empty()) return nullptr;
 
   // Phase 1: Simple round-robin
   // Phase 2: Add IsLuaRunning() check to skip workers running Lua scripts
-  size_t idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % worker_threads_.size();
-  return worker_threads_[idx]->GetWorker();
+  const size_t size = snapshot->size();
+  size_t idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % size;
+  for (size_t i = 0; i < size; i++) {
+    auto &worker = (*snapshot)[(idx + i) % size];
+    if (worker->IsAccepting()) {
+      return worker;
+    }
+  }
+  return nullptr;
 }

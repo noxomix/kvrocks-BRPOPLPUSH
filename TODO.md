@@ -32,6 +32,18 @@
 - Deshalb: SCRIPT KILL auf **anderem Worker** muss möglich sein (kCmdNoLock)
 - Connections werden round-robin auf Workers verteilt (8 default)
 
+### Accept-Dispatch Safety (Prod-Ready)
+- **Worker-Snapshot (RCU):** Acceptors lesen nur Snapshot, kein direkter Zugriff auf `worker_threads_`
+- **Resize-Safe:** `CONFIG SET workers` darf nie Acceptors/UAF triggern
+- **Worker-State:** `Running/Stopping/Stopped`, Dispatch nur wenn `Running`
+- **Pending-Queue bounded:** `acceptor-queue-limit` verhindert FD/RAM-Exhaustion
+- **Stop/Resize:** `StopAccepting()` + Queue-Drain → keine geparkten FDs
+- **Start-Reihenfolge:** Workers starten vor Acceptors
+
+### Known Risks (WONTFIX / selten genutzt)
+- **Connection-Migration:** TOCTOU/UAF-Risiko bei `MigrateConnection()` (nicht production-ready, wenig genutzt)
+- **Resize während Last:** nutzt Migration → gleiches Risiko; daher nicht als stabiler Prod-Feature bewerben
+
 ### Aggregation & Stats
 - On-Demand bei INFO, 100ms cachen, nicht im Cron sampeln
 - `GetNamespaceStats(ns)` statt `GetNamespaceStatsSnapshot()` (O(1) vs O(n))
@@ -156,6 +168,11 @@
   - Fix: `lock_mgr_(20)` = 1M Buckets → ~12% Kollision
   - Hinweis: Hash war bereits namespace-aware (ns_key), nur zu wenige Buckets
 
+### Hoch - Concurrency
+- [ ] **GetConnections() Data-Race** → Resize nutzt `Worker::GetConnections()` ohne Lock
+- [ ] **Worker Destruktor UB** → iteriert `conns_` und löscht gleichzeitig (Shutdown/Resize)
+- [ ] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` lesen `Connection`-Felder ohne Atomics/Lock
+
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 
 **Problem:** Diese Commands blockieren einen Worker während der gesamten Iteration.
@@ -181,6 +198,11 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
 - [ ] **Lua Timeout** - `lua-time-limit` Config + `SCRIPT KILL` Command (namespace-aware)
+- [x] **Accept-Dispatch Hardening (Race/FD-Leak)**
+  - Worker-Snapshot (RCU) statt direktem `worker_threads_` Zugriff
+  - StopAccepting + Queue-Drain (keine geparkten FDs)
+  - `acceptor-queue-limit` (bounded pending queue)
+  - Start-Reihenfolge: Workers vor Acceptors
 - [x] **Lua Timeout/Kill - Accept-Dispatch Architecture (Phase 1 DONE)**
   - Ziel: SCRIPT KILL immer erreichbar, auch wenn Worker in lua_pcall blockiert
   - Konzept: 1..N Accept-Threads nehmen Verbindungen an und verteilen FD an Worker
