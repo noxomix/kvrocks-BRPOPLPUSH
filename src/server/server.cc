@@ -2988,15 +2988,24 @@ std::shared_ptr<Worker> Server::SelectWorker() {
   auto snapshot = GetWorkerSnapshot();
   if (!snapshot || snapshot->empty()) return nullptr;
 
-  // Phase 1: Simple round-robin
-  // Phase 2: Add IsLuaRunning() check to skip workers running Lua scripts
   const size_t size = snapshot->size();
   size_t idx = next_worker_.fetch_add(1, std::memory_order_relaxed) % size;
+
+  // Phase 2: Prefer workers NOT running Lua scripts
+  for (size_t i = 0; i < size; i++) {
+    auto &worker = (*snapshot)[(idx + i) % size];
+    if (worker->IsAccepting() && !worker->IsLuaScriptRunning()) {
+      return worker;
+    }
+  }
+
+  // Fallback: All workers running Lua, return any accepting worker
   for (size_t i = 0; i < size; i++) {
     auto &worker = (*snapshot)[(idx + i) % size];
     if (worker->IsAccepting()) {
       return worker;
     }
   }
+
   return nullptr;
 }

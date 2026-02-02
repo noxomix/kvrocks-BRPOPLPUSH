@@ -97,9 +97,7 @@ func TestScriptKill(t *testing.T) {
 
 	ctx := context.Background()
 	rdb := srv.NewClient()
-	rdb2 := srv.NewClient()
 	defer func() { require.NoError(t, rdb.Close()) }()
-	defer func() { require.NoError(t, rdb2.Close()) }()
 
 	t.Run("SCRIPT KILL aborts running script", func(t *testing.T) {
 		errCh := make(chan error, 1)
@@ -112,9 +110,15 @@ func TestScriptKill(t *testing.T) {
 		// Wait for script to start
 		time.Sleep(100 * time.Millisecond)
 
+		// Create kill connection AFTER script started using raw TCP
+		// Phase 2: New connections are routed to non-blocked workers
+		// Using TCPClient to ensure a fresh TCP connection (not pooled)
+		tc := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc.Close()) }()
+
 		// Kill from another connection
-		err := rdb2.Do(ctx, "SCRIPT", "KILL").Err()
-		require.NoError(t, err)
+		require.NoError(t, tc.WriteArgs("SCRIPT", "KILL"))
+		tc.MustRead(t, "+OK")
 
 		// Original script should error
 		select {
@@ -146,9 +150,14 @@ func TestScriptKill(t *testing.T) {
 
 		time.Sleep(100 * time.Millisecond)
 
+		// Create kill connection AFTER script started using raw TCP
+		// Phase 2: New connections are routed to non-blocked workers
+		tc := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc.Close()) }()
+
 		// Kill
-		err = rdb2.Do(ctx, "SCRIPT", "KILL").Err()
-		require.NoError(t, err)
+		require.NoError(t, tc.WriteArgs("SCRIPT", "KILL"))
+		tc.MustRead(t, "+OK")
 
 		select {
 		case err := <-errCh:
@@ -182,13 +191,9 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns1", "token1").Err())
 	require.NoError(t, adminRdb.Do(ctx, "NAMESPACE", "ADD", "ns2", "token2").Err())
 
-	// Tenant connections
+	// Tenant connections (only the script-running ones, kill connections created later)
 	ns1Rdb := srv.NewClientWithOption(&redis.Options{Password: "token1"})
-	ns1Rdb2 := srv.NewClientWithOption(&redis.Options{Password: "token1"})
-	ns2Rdb := srv.NewClientWithOption(&redis.Options{Password: "token2"})
 	defer func() { require.NoError(t, ns1Rdb.Close()) }()
-	defer func() { require.NoError(t, ns1Rdb2.Close()) }()
-	defer func() { require.NoError(t, ns2Rdb.Close()) }()
 
 	t.Run("SCRIPT KILL only affects own namespace", func(t *testing.T) {
 		errCh := make(chan error, 1)
@@ -199,15 +204,29 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 		}()
 		time.Sleep(100 * time.Millisecond)
 
+		// Create kill connections AFTER script started using raw TCP
+		// Phase 2: New connections are routed to non-blocked workers
+		tc1 := srv.NewTCPClient()
+		tc2 := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc1.Close()) }()
+		defer func() { require.NoError(t, tc2.Close()) }()
+
+		// AUTH as ns1 and ns2
+		require.NoError(t, tc1.WriteArgs("AUTH", "token1"))
+		tc1.MustRead(t, "+OK")
+		require.NoError(t, tc2.WriteArgs("AUTH", "token2"))
+		tc2.MustRead(t, "+OK")
+
 		// ns2 tries to kill - should fail (no script in ns2)
-		err := ns2Rdb.Do(ctx, "SCRIPT", "KILL").Err()
-		require.Error(t, err)
-		require.True(t, strings.Contains(err.Error(), "No scripts"),
-			"ns2 should not see ns1's script, got: %v", err)
+		require.NoError(t, tc2.WriteArgs("SCRIPT", "KILL"))
+		line, err := tc2.ReadLine()
+		require.NoError(t, err)
+		require.True(t, strings.HasPrefix(line, "-") && strings.Contains(line, "No scripts"),
+			"ns2 should not see ns1's script, got: %v", line)
 
 		// ns1 kills its own script
-		err = ns1Rdb2.Do(ctx, "SCRIPT", "KILL").Err()
-		require.NoError(t, err)
+		require.NoError(t, tc1.WriteArgs("SCRIPT", "KILL"))
+		tc1.MustRead(t, "+OK")
 
 		// ns1's script should be killed
 		select {
@@ -233,18 +252,30 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 
 		time.Sleep(50 * time.Millisecond) // Let ns1 script start
 
+		// Create ns2 connection AFTER script started using raw TCP
+		// Phase 2: New connections are routed to non-blocked workers
+		tc := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc.Close()) }()
+
+		// AUTH as ns2
+		require.NoError(t, tc.WriteArgs("AUTH", "token2"))
+		tc.MustRead(t, "+OK")
+
 		// ns2 should be able to run commands immediately
 		start := time.Now()
-		result, err := ns2Rdb.Ping(ctx).Result()
+		require.NoError(t, tc.WriteArgs("PING"))
+		tc.MustRead(t, "+PONG")
 		elapsed := time.Since(start)
 
-		require.NoError(t, err)
-		require.Equal(t, "PONG", result)
 		require.True(t, elapsed < 100*time.Millisecond,
 			"ns2 should respond immediately, took: %v", elapsed)
 
-		// Kill ns1's script to clean up
-		ns1Rdb2.Do(ctx, "SCRIPT", "KILL")
+		// Create kill connection for cleanup using raw TCP
+		tcKill := srv.NewTCPClient()
+		defer func() { require.NoError(t, tcKill.Close()) }()
+		require.NoError(t, tcKill.WriteArgs("AUTH", "token1"))
+		tcKill.MustRead(t, "+OK")
+		require.NoError(t, tcKill.WriteArgs("SCRIPT", "KILL"))
 
 		// Wait for cleanup
 		select {
@@ -255,6 +286,12 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 	})
 
 	t.Run("Parallel scripts in different namespaces", func(t *testing.T) {
+		// Create fresh connections for this test
+		ns1RdbParallel := srv.NewClientWithOption(&redis.Options{Password: "token1"})
+		ns2RdbParallel := srv.NewClientWithOption(&redis.Options{Password: "token2"})
+		defer func() { require.NoError(t, ns1RdbParallel.Close()) }()
+		defer func() { require.NoError(t, ns2RdbParallel.Close()) }()
+
 		// Both namespaces run scripts in parallel
 		var wg sync.WaitGroup
 		results := make([]string, 2)
@@ -263,7 +300,7 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			r, err := ns1Rdb.Eval(ctx, "return 'ns1_result'", []string{}).Result()
+			r, err := ns1RdbParallel.Eval(ctx, "return 'ns1_result'", []string{}).Result()
 			if err == nil {
 				results[0] = r.(string)
 			}
@@ -271,7 +308,7 @@ func TestScriptTimeoutMultiTenant(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			r, err := ns2Rdb.Eval(ctx, "return 'ns2_result'", []string{}).Result()
+			r, err := ns2RdbParallel.Eval(ctx, "return 'ns2_result'", []string{}).Result()
 			if err == nil {
 				results[1] = r.(string)
 			}
