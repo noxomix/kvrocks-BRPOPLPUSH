@@ -177,6 +177,16 @@
 - [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
 - [ ] **TLS Repl SSL Race** → `SSL_read` (worker) + `SSL_write` (feed thread) auf gleicher SSL*
 
+### Hoch - FairScheduler (SNI)
+- [x] **UAF Risk:** `CleanupInactiveSNIs()` loescht `SNIState` waehrend `SelectWorker()` mit rohem Pointer arbeitet
+- [x] **Clamp-UB:** `active_snis > total_workers` kann `max < min` erzeugen (`std::clamp` UB)
+- [x] **Counter-Leak:** `active_connections`/`active_sni_count_` steigt, wenn SelectWorker scheitert oder FD geschlossen wird
+- [x] **Empty-SNI Leak:** leeres Scheduling-Key zaehlt hoch, `OnConnectionClosed()` dekrementiert nicht
+
+### Mittel - FairScheduler (SNI)
+- [ ] **Rebalance Drift:** `preferred_workers` bleibt nach Aenderungen von `active_sni_count_`/Worker-Count stale
+- [ ] **Per-SNI Mutex Contention:** `SelectFromPreferred()` lockt pro Accept (hot SNI kann bottlenecken)
+
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 
 **Problem:** Diese Commands blockieren einen Worker während der gesamten Iteration.
@@ -228,7 +238,19 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
     - [x] `SCRIPT KILL` Command mit `kCmdNoLock` Flag
     - [x] `lua_time_limit` Config (Default 5000ms)
     - **Limitierung:** SCRIPT KILL funktioniert nur von NEUER Connection (bestehende Connection auf blockiertem Worker kann nichts senden)
-  - **Phase 3 (Later):** SNI -> Tenant Mapping
+  - **Phase 3 - SNI-basiertes Fair Scheduling (DONE):**
+    - [x] Config-Optionen in `config.h/cc`:
+      - `sni-connections-per-worker` (Default: 10) - Konzentration
+      - `sni-min-workers` (Default: 2) - Minimum pro SNI
+      - `sni-max-workers-percent` (Default: 0 = auto) - Maximum
+      - `sni-overdraft-percent` (Default: 30) - Überziehung im Burst
+    - [x] `FairScheduler` Klasse (`fair_scheduler.h/cc`)
+    - [x] SNI-Extraktion aus TLS ClientHello (`tls_util.h/cc`)
+    - [x] `SelectWorker(sni)` mit Fair Share + Konzentration + Overdraft
+    - [x] Connection Tracking (`OnConnectionClosed()`)
+    - [x] `CleanupInactiveSNIs()` in Server::cron() eingehängt
+    - [ ] Go-Tests für Fair Scheduling
+    - Details: siehe `SCHEDULE.md`
 - [ ] **Per-NS Heavy-Command Budget (verhindert Noisy-Neighbor durch O(n)/Lua)**
   - Idee: neuer Flag `kCmdHeavy` (oder reuse `kCmdSlow`) + Config `max-heavy-per-namespace`
   - Check in `Connection::ExecuteCommands` vor Ausfuehrung:

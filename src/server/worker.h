@@ -57,7 +57,7 @@ struct ClientCounts {
 struct PendingConnection {
   int fd;
   bool is_tls;
-  // Phase 3: std::string sni_hostname;
+  std::string sni;  // SNI hostname or peer IP for fair scheduling
 };
 
 enum class WorkerState : uint8_t {

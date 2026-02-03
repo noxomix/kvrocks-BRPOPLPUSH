@@ -124,6 +124,9 @@ Server::Server(engine::Storage *storage, Config *config)
   }
   PublishWorkerSnapshot();
 
+  // Initialize SNI-based fair scheduler (Phase 3)
+  fair_scheduler_ = std::make_unique<FairScheduler>(this);
+
   AdjustOpenFilesLimit();
   slow_log_.SetMaxEntries(config->slowlog_max_len);
   slow_log_.SetDumpToLogfileLevel(config->slowlog_dump_logfile_level);
@@ -1329,6 +1332,11 @@ void Server::cron() {
     // check if we need to clean up exited worker threads every 5s
     if (counter != 0 && counter % 50 == 0) {
       cleanupExitedWorkerThreads(false);
+    }
+
+    // Cleanup inactive SNIs from fair scheduler every 60s
+    if (counter != 0 && counter % 600 == 0 && fair_scheduler_) {
+      fair_scheduler_->CleanupInactiveSNIs();
     }
 
     CleanupExitedSlaves();
@@ -2955,8 +2963,15 @@ void Server::AcceptorLoop(int listen_fd, bool is_tls) {
       continue;
     }
 
-    // Select a worker and dispatch the connection
-    auto worker = SelectWorker();
+    // Extract SNI for fair scheduling (Phase 3)
+    std::string sni = GetSchedulingKey(fd, is_tls);
+
+    // Select a worker using FairScheduler
+    auto worker = fair_scheduler_->SelectWorker(sni);
+    if (!worker) {
+      // Fallback to old SelectWorker if FairScheduler fails
+      worker = SelectWorker();
+    }
     if (!worker) {
       error("[acceptor] No workers available, closing connection");
       close(fd);
@@ -2966,6 +2981,7 @@ void Server::AcceptorLoop(int listen_fd, bool is_tls) {
     PendingConnection pc;
     pc.fd = fd;
     pc.is_tls = is_tls;
+    pc.sni = std::move(sni);
     worker->DispatchConnection(std::move(pc));
   }
   }

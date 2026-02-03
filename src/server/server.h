@@ -55,6 +55,7 @@
 #include "storage/redis_metadata.h"
 #include "storage/storage.h"
 #include "task_runner.h"
+#include "fair_scheduler.h"
 #include "tls_util.h"
 #include "worker.h"
 
@@ -243,6 +244,8 @@ class Server {
   bool IsStopped() const { return stop_; }
   bool IsLoading() const { return is_loading_; }
   Config *GetConfig() { return config_; }
+  FairScheduler *GetFairScheduler() { return fair_scheduler_.get(); }
+  std::shared_ptr<std::vector<std::shared_ptr<Worker>>> GetWorkerSnapshot() const;
   static StatusOr<std::unique_ptr<redis::Commander>> LookupAndCreateCommand(const std::string &cmd_name);
   void AdjustOpenFilesLimit();
   void AdjustWorkerThreads();
@@ -526,6 +529,7 @@ class Server {
   std::vector<std::unique_ptr<WorkerThread>> worker_threads_;
   mutable std::mutex worker_threads_mu_;
   std::shared_ptr<std::vector<std::shared_ptr<Worker>>> worker_snapshot_;
+  std::unique_ptr<FairScheduler> fair_scheduler_;
   std::unique_ptr<ReplicationThread> replication_thread_;
   tbb::concurrent_queue<std::unique_ptr<WorkerThread>> recycle_worker_threads_;
 
@@ -557,6 +561,5 @@ class Server {
   void StopAcceptors();
   void AcceptorLoop(int listen_fd, bool is_tls);
   std::shared_ptr<Worker> SelectWorker();
-  std::shared_ptr<std::vector<std::shared_ptr<Worker>>> GetWorkerSnapshot() const;
   void PublishWorkerSnapshot();
 };

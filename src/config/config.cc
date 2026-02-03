@@ -248,6 +248,12 @@ Config::Config() {
       {"lua-strict-key-accessing", false, new YesNoField(&lua_strict_key_accessing, false)},
       {"lua-time-limit", false, new IntField(&lua_time_limit, 5000, 0, INT_MAX)},
 
+      /* SNI-based Fair Scheduling */
+      {"sni-connections-per-worker", false, new IntField(&sni_connections_per_worker, 10, 1, 10000)},
+      {"sni-min-workers", false, new IntField(&sni_min_workers, 2, 1, 256)},
+      {"sni-max-workers-percent", false, new IntField(&sni_max_workers_percent, 0, 0, 100)},
+      {"sni-overdraft-percent", false, new IntField(&sni_overdraft_percent, 30, 0, 200)},
+
       /* rocksdb options */
       {"rocksdb.compression", false,
        new EnumField<rocksdb::CompressionType>(&rocks_db.compression, compression_types,

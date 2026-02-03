@@ -428,6 +428,12 @@ void Worker::FreeConnection(redis::Connection *conn) {
   if (rate_limit_group_) {
     bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
   }
+
+  // Notify FairScheduler of connection close (Phase 3)
+  if (auto *scheduler = srv->GetFairScheduler()) {
+    scheduler->OnConnectionClosed(conn->GetSNI());
+  }
+
   delete conn;
 }
 
@@ -442,6 +448,10 @@ void Worker::FreeConnectionByID(int fd, uint64_t id) {
     // Unregister from central monitor registry if this was a monitor connection
     if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
       srv->UnregisterMonitorClient(conn->GetNamespace(), fd);
+    }
+    // Notify FairScheduler of connection close (Phase 3)
+    if (auto *scheduler = srv->GetFairScheduler()) {
+      scheduler->OnConnectionClosed(conn->GetSNI());
     }
     delete conn;
     conns_.erase(iter);
@@ -798,9 +808,17 @@ void Worker::KickoutIdleClients(int timeout) {
 // Accept-Dispatch: Called by Acceptor thread to dispatch a new connection to this Worker
 // Thread-safe: Adds to queue and wakes up Worker's event loop via eventfd
 void Worker::DispatchConnection(PendingConnection conn) {
+  auto rollback = [&]() {
+    if (conn.sni.empty()) return;
+    if (auto *scheduler = srv->GetFairScheduler()) {
+      scheduler->OnConnectionClosed(conn.sni);
+    }
+  };
+
   // Don't dispatch to terminated workers
   if (!IsAccepting() || is_terminated_.load(std::memory_order_acquire)) {
     debug("[worker] Dropping connection fd={} - worker not accepting", conn.fd);
+    rollback();
     close(conn.fd);
     return;
   }
@@ -819,6 +837,7 @@ void Worker::DispatchConnection(PendingConnection conn) {
   }
 
   if (drop) {
+    rollback();
     close(conn.fd);
     return;
   }
@@ -873,9 +892,17 @@ void Worker::DrainPendingConnections() {
 void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
   debug("[worker] Dispatched connection: fd={} is_tls={} thread #{}", pc.fd, pc.is_tls, fmt::streamed(tid_));
 
+  auto rollback = [&]() {
+    if (pc.sni.empty()) return;
+    if (auto *scheduler = srv->GetFairScheduler()) {
+      scheduler->OnConnectionClosed(pc.sni);
+    }
+  };
+
   auto s = util::SockSetTcpKeepalive(pc.fd, 120);
   if (!s.IsOK()) {
     error("[worker] Failed to set tcp-keepalive on socket. Error: {}", s.Msg());
+    rollback();
     evutil_closesocket(pc.fd);
     return;
   }
@@ -883,6 +910,7 @@ void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
   s = util::SockSetTcpNoDelay(pc.fd, 1);
   if (!s.IsOK()) {
     error("[worker] Failed to set tcp-nodelay on socket. Error: {}", s.Msg());
+    rollback();
     evutil_closesocket(pc.fd);
     return;
   }
@@ -897,6 +925,7 @@ void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
     ssl = SSL_new(srv->ssl_ctx.get());
     if (!ssl) {
       error("[worker] Failed to construct SSL structure for new connection: {}", fmt::streamed(SSLErrors{}));
+      rollback();
       evutil_closesocket(pc.fd);
       return;
     }
@@ -912,9 +941,11 @@ void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
 #ifdef ENABLE_OPENSSL
     error("[worker] Failed to construct socket for new connection: {}, SSL error: {}", socket_err,
           fmt::streamed(SSLErrors{}));
+    rollback();
     if (ssl) SSL_free(ssl);
 #else
     error("[worker] Failed to construct socket for new connection: {}", socket_err);
+    rollback();
 #endif
     evutil_closesocket(pc.fd);
     return;
@@ -926,6 +957,7 @@ void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
 #endif
   auto conn = new redis::Connection(bev, this);
   conn->SetCB(bev);
+  conn->SetSNI(pc.sni);  // Set SNI for fair scheduling
   bufferevent_enable(bev, EV_READ);
 
   s = AddConnection(conn);

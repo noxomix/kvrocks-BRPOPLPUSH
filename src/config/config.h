@@ -202,6 +202,12 @@ struct Config {
   bool lua_strict_key_accessing = false;
   int lua_time_limit = 5000;  // ms, 0 = unlimited
 
+  // SNI-based Fair Scheduling (Phase 3)
+  int sni_connections_per_worker = 10;  // Concentration: expand to more workers when exceeded
+  int sni_min_workers = 2;              // Minimum workers per SNI
+  int sni_max_workers_percent = 0;      // 0 = auto (workers/active_snis)
+  int sni_overdraft_percent = 30;       // Burst: can use up to 130% of fair share
+
   std::vector<double> histogram_bucket_boundaries;
 
   struct RocksDB {

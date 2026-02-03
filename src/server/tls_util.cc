@@ -240,4 +240,139 @@ std::ostream &operator<<(std::ostream &os, SSLError e) {
   return os << msg;
 }
 
+// Parse SNI extension from TLS ClientHello
+// TLS record format: type(1) + version(2) + length(2) + handshake
+// Handshake: type(1) + length(3) + version(2) + random(32) + session_id_len(1) + ...
+// Extensions are after cipher suites and compression methods
+static std::string ParseSNIFromClientHello(const unsigned char *data, size_t len) {
+  // Minimum TLS record header + handshake header
+  if (len < 5 + 4) return "";
+
+  // Check TLS record type (0x16 = Handshake)
+  if (data[0] != 0x16) return "";
+
+  // Skip TLS record header (5 bytes)
+  size_t pos = 5;
+
+  // Check handshake type (0x01 = ClientHello)
+  if (data[pos] != 0x01) return "";
+  pos += 4;  // Skip handshake type + length
+
+  // Skip version (2) + random (32)
+  pos += 2 + 32;
+  if (pos >= len) return "";
+
+  // Skip session ID
+  uint8_t session_id_len = data[pos++];
+  pos += session_id_len;
+  if (pos + 2 >= len) return "";
+
+  // Skip cipher suites
+  uint16_t cipher_len = (data[pos] << 8) | data[pos + 1];
+  pos += 2 + cipher_len;
+  if (pos + 1 >= len) return "";
+
+  // Skip compression methods
+  uint8_t comp_len = data[pos++];
+  pos += comp_len;
+  if (pos + 2 >= len) return "";
+
+  // Extensions length
+  uint16_t ext_len = (data[pos] << 8) | data[pos + 1];
+  pos += 2;
+  size_t ext_end = pos + ext_len;
+  if (ext_end > len) ext_end = len;
+
+  // Parse extensions
+  while (pos + 4 <= ext_end) {
+    uint16_t ext_type = (data[pos] << 8) | data[pos + 1];
+    uint16_t ext_data_len = (data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+
+    if (pos + ext_data_len > ext_end) break;
+
+    // SNI extension type = 0x0000
+    if (ext_type == 0x0000 && ext_data_len >= 5) {
+      // SNI list length (2) + name type (1) + name length (2) + name
+      size_t sni_pos = pos + 2;  // Skip list length
+      if (sni_pos + 3 > pos + ext_data_len) break;
+
+      uint8_t name_type = data[sni_pos++];
+      if (name_type != 0) {  // 0 = hostname
+        pos += ext_data_len;
+        continue;
+      }
+
+      uint16_t name_len = (data[sni_pos] << 8) | data[sni_pos + 1];
+      sni_pos += 2;
+
+      if (sni_pos + name_len <= pos + ext_data_len && name_len > 0 && name_len < 256) {
+        return std::string(reinterpret_cast<const char *>(data + sni_pos), name_len);
+      }
+    }
+
+    pos += ext_data_len;
+  }
+
+  return "";
+}
+
+std::string ExtractSNIFromClientHello(int fd) {
+  unsigned char buf[1500];  // ClientHello typically fits in one packet
+
+  // MSG_PEEK: Read without consuming from buffer
+  ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK);
+  if (n < 10) return "";
+
+  return ParseSNIFromClientHello(buf, static_cast<size_t>(n));
+}
+
 #endif
+
+// Functions available regardless of TLS support
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include <cstring>
+#include <string>
+
+std::string GetPeerIP(int fd) {
+  struct sockaddr_storage addr;
+  socklen_t addr_len = sizeof(addr);
+
+  if (getpeername(fd, reinterpret_cast<struct sockaddr *>(&addr), &addr_len) != 0) {
+    return "";
+  }
+
+  char ip_str[INET6_ADDRSTRLEN] = {};
+
+  if (addr.ss_family == AF_INET) {
+    auto *sin = reinterpret_cast<struct sockaddr_in *>(&addr);
+    inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+  } else if (addr.ss_family == AF_INET6) {
+    auto *sin6 = reinterpret_cast<struct sockaddr_in6 *>(&addr);
+    inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
+  } else {
+    return "";
+  }
+
+  return ip_str;
+}
+
+std::string GetSchedulingKey(int fd, bool is_tls) {
+#ifdef ENABLE_OPENSSL
+  if (is_tls) {
+    std::string sni = ExtractSNIFromClientHello(fd);
+    if (!sni.empty()) {
+      return sni;
+    }
+  }
+#else
+  (void)fd;
+  (void)is_tls;
+#endif
+  // Fallback: use a fixed default domain for non-TLS or missing SNI
+  return "default.domain";
+}

@@ -158,6 +158,10 @@ class Connection : public EvbufCallbackBase<Connection> {
   const std::string& GetNamespace() const { return ns_; }
   void SetNamespace(std::string ns);
 
+  // SNI for fair scheduling (empty if not set)
+  const std::string& GetSNI() const { return sni_; }
+  void SetSNI(std::string sni) { sni_ = std::move(sni); }
+
   void NeedFreeBufferEvent(bool need_free = true) { need_free_bev_ = need_free; }
   void NeedNotFreeBufferEvent() { NeedFreeBufferEvent(false); }
   bool IsNeedFreeBufferEvent() const { return need_free_bev_; }
@@ -198,6 +202,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   uint64_t id_ = 0;
   std::atomic<int> flags_ = 0;
   std::string ns_;  // Empty before AUTH, set via SetNamespace() after successful auth
+  std::string sni_;  // SNI hostname or peer IP for fair scheduling
   std::atomic<bool> connection_counted_{false};  // Atomic to prevent TOCTOU race
   std::string name_;
   std::string ip_;

@@ -67,4 +67,14 @@ struct SSLError {
   unsigned long err;  // NOLINT
 };
 
+// Extract SNI from TLS ClientHello using MSG_PEEK (before SSL_accept)
+// Returns empty string if SNI not found or not TLS
+std::string ExtractSNIFromClientHello(int fd);
+
 #endif
+
+// Get scheduling key for connection (SNI for TLS, default domain otherwise)
+std::string GetSchedulingKey(int fd, bool is_tls);
+
+// Get peer IP address as string
+std::string GetPeerIP(int fd);
