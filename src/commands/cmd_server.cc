@@ -1591,7 +1591,7 @@ class CommandFlushBlockCache : public Commander {
 
 REDIS_REGISTER_COMMANDS(
     Server, MakeCmdAttr<CommandAuth>("auth", 2, "read-only ok-loading auth no-multi", NO_KEY),
-    MakeCmdAttr<CommandPing>("ping", -1, "read-only", NO_KEY),
+    MakeCmdAttr<CommandPing>("ping", -1, "read-only no-lock", NO_KEY),
     MakeCmdAttr<CommandSelect>("select", 2, "read-only", NO_KEY),
     MakeCmdAttr<CommandInfo>("info", -1, "read-only ok-loading", NO_KEY),
     MakeCmdAttr<CommandRole>("role", 1, "read-only ok-loading admin", NO_KEY),
@@ -1611,8 +1611,8 @@ REDIS_REGISTER_COMMANDS(
     MakeCmdAttr<CommandRandomKey>("randomkey", 1, "read-only", NO_KEY),
     MakeCmdAttr<CommandDebug>("debug", -2, "read-only exclusive admin", NO_KEY, CommandDebug::FlagGen),
     MakeCmdAttr<CommandCommand>("command", -1, "read-only", NO_KEY),
-    MakeCmdAttr<CommandEcho>("echo", 2, "read-only", NO_KEY),
-    MakeCmdAttr<CommandTime>("time", 1, "read-only ok-loading", NO_KEY),
+    MakeCmdAttr<CommandEcho>("echo", 2, "read-only no-lock", NO_KEY),
+    MakeCmdAttr<CommandTime>("time", 1, "read-only ok-loading no-lock", NO_KEY),
     MakeCmdAttr<CommandDisk>("disk", 3, "read-only", 2, 2, 1),
     MakeCmdAttr<CommandMemory>("memory", 3, "read-only", 2, 2, 1),
     MakeCmdAttr<CommandHello>("hello", -1, "read-only ok-loading auth", NO_KEY),

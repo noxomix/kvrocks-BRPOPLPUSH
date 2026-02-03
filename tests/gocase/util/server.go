@@ -221,7 +221,69 @@ func StartTLSServer(t testing.TB, configs map[string]string) *KvrocksServer {
 	s := StartServer(t, configs)
 	s.tlsAddr = addr
 
+	// Wait for TLS port to be ready
+	tlsConfig := &tls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true, // Only for startup check
+	}
+	require.Eventually(t, func() bool {
+		conn, err := tls.Dial("tcp", s.tlsAddr.String(), tlsConfig)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}, time.Minute, 100*time.Millisecond, "TLS port not ready")
+
 	return s
+}
+
+// StartTLSServerWithSNIs starts a TLS server with auto-generated certificates
+// that support the given SNI hostnames. Returns the server and the CA cert path
+// for client verification.
+func StartTLSServerWithSNIs(t testing.TB, configs map[string]string, sniHosts []string) (*KvrocksServer, string) {
+	dir := *workspace
+	require.NotEmpty(t, dir, "please set the workspace by `-workspace`")
+
+	// Generate certificates in the workspace directory
+	certDir := filepath.Join(dir, fmt.Sprintf("tls-certs-%d", time.Now().UnixNano()))
+	caCert, serverCert, serverKey, err := GenerateTLSCerts(certDir, sniHosts)
+	require.NoError(t, err)
+
+	configs["tls-cert-file"] = serverCert
+	configs["tls-key-file"] = serverKey
+	configs["tls-ca-cert-file"] = caCert
+	configs["tls-auth-clients"] = "no" // Don't require client certificates
+
+	// Find a free port for TLS
+	tlsPortAddr, err := findFreePort()
+	require.NoError(t, err)
+	tlsPort := tlsPortAddr.Port
+	configs["tls-port"] = fmt.Sprintf("%d", tlsPort)
+
+	s := StartServer(t, configs)
+
+	// TLS uses the same bind address as main server, just different port
+	s.tlsAddr = &net.TCPAddr{
+		IP:   s.addr.IP,
+		Port: tlsPort,
+	}
+
+	// Wait for TLS port to be ready
+	tlsConfig := &tls.Config{
+		ServerName:         "localhost",
+		InsecureSkipVerify: true, // Only for startup check
+	}
+	require.Eventually(t, func() bool {
+		conn, err := tls.Dial("tcp", s.tlsAddr.String(), tlsConfig)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}, time.Minute, 100*time.Millisecond, "TLS port not ready")
+
+	return s, caCert
 }
 
 func StartServer(t testing.TB, configs map[string]string) *KvrocksServer {

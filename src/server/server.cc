@@ -110,6 +110,7 @@ Server::Server(engine::Storage *storage, Config *config)
 
   for (int i = 0; i < config->workers; i++) {
     auto worker = std::make_shared<Worker>(this, config);
+    worker->SetIndex(static_cast<uint32_t>(i));
     // multiple workers can't listen to the same unix socket, so
     // listen unix socket only from a single worker - the first one
     if (!config->unixsocket.empty() && i == 0) {
@@ -2522,6 +2523,7 @@ void Server::AdjustWorkerThreads() {
 void Server::increaseWorkerThreads(size_t delta) {
   for (size_t i = 0; i < delta; i++) {
     auto worker = std::make_shared<Worker>(this, config_);
+    worker->SetIndex(static_cast<uint32_t>(worker_threads_.size()));
     auto worker_thread = std::make_unique<WorkerThread>(std::move(worker));
     worker_thread->Start();
     worker_threads_.emplace_back(std::move(worker_thread));

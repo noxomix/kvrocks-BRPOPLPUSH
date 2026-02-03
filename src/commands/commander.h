@@ -372,6 +372,8 @@ inline uint64_t ParseCommandFlags(const std::string &description, const std::str
       flags |= kCmdBlocking;
     else if (flag == "admin")
       flags |= kCmdAdmin;
+    else if (flag == "no-lock")
+      flags |= kCmdNoLock;
     else {
       std::cout << fmt::format("Encountered non-existent flag '{}' in command {} in command attribute parsing", flag,
                                cmd_name)
@@ -399,6 +401,7 @@ inline std::vector<std::string> CommandAttributes::FlagsToString(uint64_t flags)
   if (flags & kCmdAuth) res.emplace_back("auth");
   if (flags & kCmdAdmin) res.emplace_back("admin");
   if (flags & kCmdSkipMonitor) res.emplace_back("skip-monitor");
+  if (flags & kCmdNoLock) res.emplace_back("no-lock");
 
   return res;
 }

@@ -80,6 +80,10 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   bool IsAccepting() const { return state_.load(std::memory_order_acquire) == WorkerState::kRunning; }
   void StopAccepting() { state_.store(WorkerState::kStopping, std::memory_order_release); }
 
+  // Worker index for debugging and CLIENT LIST
+  uint32_t GetIndex() const { return index_; }
+  void SetIndex(uint32_t idx) { index_ = idx; }
+
   void MigrateConnection(Worker *target, redis::Connection *conn);
   void DetachConnection(redis::Connection *conn);
   void FreeConnection(redis::Connection *conn);
@@ -166,6 +170,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::atomic<lua_State *> lua_;
   std::atomic<bool> is_terminated_ = false;
   std::atomic<WorkerState> state_{WorkerState::kRunning};
+  uint32_t index_ = 0;  // Worker index in server's worker array (for CLIENT LIST)
 
   // Lua script timeout state
   std::atomic<bool> lua_script_running_{false};

@@ -890,8 +890,6 @@ void Worker::DrainPendingConnections() {
 // Accept-Dispatch: Create connection from dispatched fd
 // Similar to newTCPConnection but uses is_tls flag instead of port check
 void Worker::createConnectionFromDispatch(const PendingConnection &pc) {
-  debug("[worker] Dispatched connection: fd={} is_tls={} thread #{}", pc.fd, pc.is_tls, fmt::streamed(tid_));
-
   auto rollback = [&]() {
     if (pc.sni.empty()) return;
     if (auto *scheduler = srv->GetFairScheduler()) {

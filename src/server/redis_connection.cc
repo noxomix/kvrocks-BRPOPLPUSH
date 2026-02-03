@@ -69,9 +69,9 @@ Connection::~Connection() {
 }
 
 std::string Connection::ToString() {
-  return fmt::format("id={} addr={} fd={} name={} age={} idle={} flags={} namespace={} qbuf={} obuf={} cmd={}\n", id_,
-                     addr_, bufferevent_getfd(bev_), name_, GetAge(), GetIdleTime(), GetFlags(), ns_,
-                     evbuffer_get_length(Input()), evbuffer_get_length(Output()), last_cmd_);
+  return fmt::format("id={} addr={} fd={} name={} age={} idle={} flags={} namespace={} qbuf={} obuf={} cmd={} worker={}\n",
+                     id_, addr_, bufferevent_getfd(bev_), name_, GetAge(), GetIdleTime(), GetFlags(), ns_,
+                     evbuffer_get_length(Input()), evbuffer_get_length(Output()), last_cmd_, owner_->GetIndex());
 }
 
 void Connection::Close() {

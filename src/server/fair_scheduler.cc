@@ -23,6 +23,7 @@
 #include <algorithm>
 
 #include "config/config.h"
+#include "event_util.h"  // For info(), warn(), etc.
 #include "server.h"
 #include "time_util.h"
 #include "worker.h"
@@ -202,7 +203,10 @@ std::shared_ptr<Worker> FairScheduler::SelectAnyAccepting(
 std::shared_ptr<Worker> FairScheduler::SelectWorker(const std::string& sni) {
   // Load snapshot once and pass it through (avoid multiple RCU loads)
   auto snapshot = srv_->GetWorkerSnapshot();
-  if (!snapshot || snapshot->empty()) return nullptr;
+  if (!snapshot || snapshot->empty()) {
+    warn("[FairScheduler] SelectWorker: No snapshot or empty!");
+    return nullptr;
+  }
 
   if (sni.empty()) {
     return SelectAnyAccepting(snapshot);
@@ -237,6 +241,7 @@ std::shared_ptr<Worker> FairScheduler::SelectWorker(const std::string& sni) {
   }
 
   // Roll back counters if we couldn't select any worker
+  warn("[FairScheduler] No worker available!");
   OnConnectionClosed(sni);
   return nullptr;
 }
