@@ -184,8 +184,10 @@
 - [x] **Empty-SNI Leak:** leeres Scheduling-Key zaehlt hoch, `OnConnectionClosed()` dekrementiert nicht
 
 ### Mittel - FairScheduler (SNI)
-- [ ] **Rebalance Drift:** `preferred_workers` bleibt nach Aenderungen von `active_sni_count_`/Worker-Count stale
-- [ ] **Per-SNI Mutex Contention:** `SelectFromPreferred()` lockt pro Accept (hot SNI kann bottlenecken)
+- [x] **Rebalance Drift:** `preferred_workers` bleibt nach Aenderungen von `active_sni_count_`/Worker-Count stale
+  - Fix: Lazy `RefreshPreferredWorkers()` bei Select, wenn Worker-Count/Fair-Share geaendert ist
+- [x] **Per-SNI Mutex Contention:** `SelectFromPreferred()` lockt pro Accept (hot SNI kann bottlenecken)
+  - Fix: `preferred_workers` als lockfreier immutable Snapshot (`atomic_load/store` auf `shared_ptr`)
 
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 

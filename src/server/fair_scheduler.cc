@@ -21,6 +21,7 @@
 #include "fair_scheduler.h"
 
 #include <algorithm>
+#include <functional>
 
 #include "config/config.h"
 #include "event_util.h"  // For info(), warn(), etc.
@@ -56,35 +57,39 @@ void FairScheduler::OnSNIBecameInactive() {
   }
 }
 
+uint32_t FairScheduler::GetMaxWorkerCount(uint32_t total_workers, uint32_t active_snis) const {
+  if (total_workers == 0) return 0;
+  uint32_t fair_share = total_workers / std::max(1u, active_snis);
+  if (fair_share == 0) fair_share = 1;
+
+  // Max workers (config or fair share)
+  uint32_t max_workers = (config_.max_workers_percent > 0)
+                             ? (total_workers * config_.max_workers_percent / 100)
+                             : fair_share;
+
+  // Overdraft allowance
+  uint32_t max_with_overdraft = fair_share + (fair_share * config_.overdraft_percent / 100);
+  max_workers = std::min(max_workers, max_with_overdraft);
+  max_workers = std::min(max_workers, total_workers);
+
+  uint32_t effective_min = std::min(config_.min_workers, total_workers);
+  if (max_workers < effective_min) max_workers = effective_min;
+  return max_workers;
+}
+
 uint32_t FairScheduler::GetTargetWorkerCount(const SNIState* state, uint32_t total_workers,
                                              uint32_t active_snis) const {
   if (total_workers == 0) return config_.min_workers;
 
   uint32_t conns = state->active_connections.load(std::memory_order_relaxed);
-
-  // 1. Fair share basis
-  uint32_t fair_share = total_workers / std::max(1u, active_snis);
-  if (fair_share == 0) fair_share = 1;
-  if (fair_share == 0) fair_share = 1;
-
-  // 2. Max workers (config or fair share)
-  uint32_t max_workers = (config_.max_workers_percent > 0)
-                             ? (total_workers * config_.max_workers_percent / 100)
-                             : fair_share;
-
-  // 3. Overdraft allowance
-  uint32_t max_with_overdraft = fair_share + (fair_share * config_.overdraft_percent / 100);
-  max_workers = std::min(max_workers, max_with_overdraft);
-  max_workers = std::min(max_workers, total_workers);  // Cap at total
-
+  uint32_t max_workers = GetMaxWorkerCount(total_workers, active_snis);
   uint32_t effective_min = std::min(config_.min_workers, total_workers);
-  if (max_workers < effective_min) max_workers = effective_min;
 
-  // 4. Concentration: how many workers needed for current load?
+  // Concentration: how many workers needed for current load?
   uint32_t needed_for_load = (conns + config_.connections_per_worker - 1) / config_.connections_per_worker;
   if (needed_for_load == 0) needed_for_load = 1;
 
-  // 5. Clamp between min and max
+  // Clamp between min and max
   return std::clamp(needed_for_load, effective_min, max_workers);
 }
 
@@ -102,55 +107,51 @@ std::shared_ptr<SNIState> FairScheduler::GetOrCreateState(const std::string& sni
   std::unique_lock lock(sni_states_mu_);
   // Double-check after acquiring unique lock
   auto [it, inserted] = sni_states_.try_emplace(sni, std::make_shared<SNIState>(sni));
-  if (inserted) {
-    auto snapshot = srv_->GetWorkerSnapshot();
-    uint32_t total_workers = snapshot ? static_cast<uint32_t>(snapshot->size()) : 0;
-    uint32_t active_snis = GetActiveSNICount();
-    AssignPreferredWorkers(it->second.get(), total_workers, active_snis);
-  }
+  (void)inserted;
   return it->second;
 }
 
-void FairScheduler::AssignPreferredWorkers(SNIState* state, uint32_t total_workers, uint32_t active_snis) {
+void FairScheduler::RefreshPreferredWorkers(SNIState* state, uint32_t total_workers, uint32_t active_snis) {
   if (total_workers == 0) return;
 
-  uint32_t fair_share = total_workers / std::max(1u, active_snis);
-
-  // Find a starting point based on existing SNI count (simple partitioning)
-  uint32_t sni_index = static_cast<uint32_t>(sni_states_.size()) - 1;  // Current SNI is last added
-  uint32_t start = (sni_index * fair_share) % total_workers;
-
-  // Assign fair_share workers with overdraft allowance
-  uint32_t max_with_overdraft = fair_share + (fair_share * config_.overdraft_percent / 100);
-  uint32_t to_assign = std::min(max_with_overdraft, total_workers);
-
-  std::lock_guard state_lock(state->mu);
-  state->preferred_workers.clear();
-  state->preferred_workers.reserve(to_assign);
-  for (uint32_t i = 0; i < to_assign; i++) {
-    state->preferred_workers.push_back((start + i) % total_workers);
+  uint32_t desired_size = GetMaxWorkerCount(total_workers, active_snis);
+  auto current = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
+  uint32_t last_total_workers = state->preferred_total_workers.load(std::memory_order_relaxed);
+  if (current && current->size() == desired_size && last_total_workers == total_workers) {
+    return;
   }
+
+  uint32_t start = static_cast<uint32_t>(std::hash<std::string>{}(state->sni) % total_workers);
+  auto rebuilt = std::make_shared<std::vector<uint32_t>>();
+  rebuilt->reserve(desired_size);
+  for (uint32_t i = 0; i < desired_size; i++) {
+    rebuilt->push_back((start + i) % total_workers);
+  }
+  state->preferred_total_workers.store(total_workers, std::memory_order_relaxed);
+  std::atomic_store_explicit(&state->preferred_workers,
+                             std::static_pointer_cast<const std::vector<uint32_t>>(std::move(rebuilt)),
+                             std::memory_order_release);
 }
 
 std::shared_ptr<Worker> FairScheduler::SelectFromPreferred(
     SNIState* state, uint32_t target_count,
     const std::shared_ptr<std::vector<std::shared_ptr<Worker>>>& snapshot) {
   if (!snapshot || snapshot->empty()) return nullptr;
+  auto preferred = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
+  if (!preferred || preferred->empty()) return nullptr;
+  uint32_t preferred_size = static_cast<uint32_t>(preferred->size());
+
+  // Limit to target_count
+  uint32_t search_count = std::min(target_count, preferred_size);
+  if (search_count == 0) return nullptr;
 
   // Round-robin within target_count workers
   uint32_t idx = state->next_worker_idx.fetch_add(1, std::memory_order_relaxed);
 
-  std::lock_guard state_lock(state->mu);  // Regular mutex, not shared_mutex
-  uint32_t preferred_size = static_cast<uint32_t>(state->preferred_workers.size());
-  if (preferred_size == 0) return nullptr;
-
-  // Limit to target_count
-  uint32_t search_count = std::min(target_count, preferred_size);
-
   // Try preferred workers (within target_count)
   for (uint32_t i = 0; i < search_count; i++) {
     uint32_t worker_idx = (idx + i) % search_count;
-    uint32_t worker_id = state->preferred_workers[worker_idx];
+    uint32_t worker_id = (*preferred)[worker_idx];
     if (worker_id < snapshot->size()) {
       auto& worker = (*snapshot)[worker_id];
       if (worker->IsAccepting() && !worker->IsLuaScriptRunning()) {
@@ -161,7 +162,7 @@ std::shared_ptr<Worker> FairScheduler::SelectFromPreferred(
 
   // All target workers Lua-blocked, try remaining preferred workers (overdraft)
   for (uint32_t i = search_count; i < preferred_size; i++) {
-    uint32_t worker_id = state->preferred_workers[i];
+    uint32_t worker_id = (*preferred)[i];
     if (worker_id < snapshot->size()) {
       auto& worker = (*snapshot)[worker_id];
       if (worker->IsAccepting() && !worker->IsLuaScriptRunning()) {
@@ -222,8 +223,12 @@ std::shared_ptr<Worker> FairScheduler::SelectWorker(const std::string& sni) {
   uint32_t prev_conns = state->active_connections.fetch_add(1, std::memory_order_relaxed);
   if (prev_conns == 0) {
     OnSNIBecameActive();
+    active_snis = active_snis + 1;
   }
   state->last_activity_ms.store(util::GetTimeStampMS(), std::memory_order_relaxed);
+
+  // Rebuild preferred worker list lazily when active SNI count or worker count changed
+  RefreshPreferredWorkers(state.get(), total_workers, active_snis);
 
   // Calculate target worker count based on config
   uint32_t target_count = GetTargetWorkerCount(state.get(), total_workers, active_snis);
@@ -303,10 +308,8 @@ std::vector<SNIStats> FairScheduler::GetSNIStats() const {
     SNIStats stats;
     stats.sni = sni;
     stats.active_connections = state->active_connections.load(std::memory_order_relaxed);
-    {
-      std::lock_guard state_lock(state->mu);
-      stats.preferred_worker_count = static_cast<uint32_t>(state->preferred_workers.size());
-    }
+    auto preferred = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
+    stats.preferred_worker_count = preferred ? static_cast<uint32_t>(preferred->size()) : 0;
     // Now GetTargetWorkerCount doesn't acquire sni_states_mu_ (no deadlock)
     stats.target_worker_count = GetTargetWorkerCount(state.get(), total_workers, active_snis);
     result.push_back(std::move(stats));

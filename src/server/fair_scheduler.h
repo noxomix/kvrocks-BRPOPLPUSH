@@ -23,7 +23,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -48,11 +47,12 @@ struct SNIState {
   std::string sni;
   std::atomic<uint32_t> active_connections{0};
   std::atomic<uint32_t> next_worker_idx{0};  // Lock-free round-robin
-  std::vector<uint32_t> preferred_workers;   // Worker affinity
+  std::atomic<uint32_t> preferred_total_workers{0};
+  std::shared_ptr<const std::vector<uint32_t>> preferred_workers;
   std::atomic<uint64_t> last_activity_ms{0};
-  mutable std::mutex mu;  // Only for preferred_workers updates
 
-  explicit SNIState(std::string sni_name) : sni(std::move(sni_name)) {}
+  explicit SNIState(std::string sni_name)
+      : sni(std::move(sni_name)), preferred_workers(std::make_shared<const std::vector<uint32_t>>()) {}
 };
 
 // Statistics for monitoring
@@ -105,8 +105,14 @@ class FairScheduler {
   // Get or create state for SNI (thread-safe)
   std::shared_ptr<SNIState> GetOrCreateState(const std::string& sni);
 
+  // Compute max workers (fair share + overdraft + config clamp)
+  uint32_t GetMaxWorkerCount(uint32_t total_workers, uint32_t active_snis) const;
+
   // Calculate target worker count for SNI based on config
   uint32_t GetTargetWorkerCount(const SNIState* state, uint32_t total_workers, uint32_t active_snis) const;
+
+  // Refresh preferred workers for SNI when fair share/topology changed
+  void RefreshPreferredWorkers(SNIState* state, uint32_t total_workers, uint32_t active_snis);
 
   // Select worker from preferred list
   std::shared_ptr<Worker> SelectFromPreferred(
@@ -116,9 +122,6 @@ class FairScheduler {
   // Fallback: select any accepting worker (does NOT modify preferred_workers)
   std::shared_ptr<Worker> SelectAnyAccepting(
       const std::shared_ptr<std::vector<std::shared_ptr<Worker>>>& snapshot);
-
-  // Assign initial preferred workers to new SNI
-  void AssignPreferredWorkers(SNIState* state, uint32_t total_workers, uint32_t active_snis);
 
   // Update active_sni_count_ when a connection becomes first/last for an SNI
   void OnSNIBecameActive();
