@@ -27,8 +27,10 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <pthread.h>
+#include <poll.h>
 
 #include <bitset>
+#include <cerrno>
 #include <mutex>
 #include <string>
 
@@ -318,13 +320,46 @@ static std::string ParseSNIFromClientHello(const unsigned char *data, size_t len
 }
 
 std::string ExtractSNIFromClientHello(int fd) {
-  unsigned char buf[1500];  // ClientHello typically fits in one packet
+  // Keep this bounded and short: one immediate peek + one 1ms wait retry.
+  // This avoids flaky "no-SNI" classification when ClientHello bytes arrive
+  // a few micro/milliseconds after accept().
+  constexpr int kMaxAttempts = 2;
+  constexpr int kRetryWaitMs = 1;
+  unsigned char buf[4096];
 
-  // MSG_PEEK: Read without consuming from buffer
-  ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK);
-  if (n < 10) return "";
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    // MSG_PEEK: Read without consuming from buffer
+    ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK);
+    if (n > 0) {
+      if (n >= 10) {
+        std::string sni = ParseSNIFromClientHello(buf, static_cast<size_t>(n));
+        if (!sni.empty()) {
+          return sni;
+        }
 
-  return ParseSNIFromClientHello(buf, static_cast<size_t>(n));
+        // If we already have a full TLS record and no SNI was parsed, treat as no-SNI.
+        if (static_cast<size_t>(n) >= 5) {
+          size_t tls_record_len = (static_cast<size_t>(buf[3]) << 8) | static_cast<size_t>(buf[4]);
+          if (static_cast<size_t>(n) >= 5 + tls_record_len) {
+            return "";
+          }
+        }
+      }
+    } else if (n == 0) {
+      return "";
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      return "";
+    }
+
+    if (attempt + 1 < kMaxAttempts) {
+      pollfd pfd{};
+      pfd.fd = fd;
+      pfd.events = POLLIN;
+      (void)poll(&pfd, 1, kRetryWaitMs);
+    }
+  }
+
+  return "";
 }
 
 #endif

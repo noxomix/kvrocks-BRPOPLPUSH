@@ -190,6 +190,8 @@
   - Fix: Lazy `RefreshPreferredWorkers()` bei Select, wenn Worker-Count/Fair-Share geaendert ist
 - [x] **Per-SNI Mutex Contention:** `SelectFromPreferred()` lockt pro Accept (hot SNI kann bottlenecken)
   - Fix: `preferred_workers` als lockfreier immutable Snapshot (`atomic_load/store` auf `shared_ptr`)
+- [x] **TLS-SNI Flaky Erkennung bei Accept:** sofortiges `MSG_PEEK` konnte ClientHello sporadisch verpassen → gemischte Scheduling-Keys
+  - Fix: bounded Retry (1x/1ms) in `ExtractSNIFromClientHello()`, plus "voller TLS-Record ohne SNI" fast-exit
 
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 
