@@ -290,9 +290,10 @@ std::vector<SNIStats> FairScheduler::GetSNIStats() const {
     SNIStats stats;
     stats.sni = sni;
     stats.active_connections = state->active_connections.load(std::memory_order_relaxed);
+    stats.fair_share = GetFairWorkerCount(total_workers, active_snis);
+    stats.overdraft_limit = GetMaxWorkerCount(total_workers, active_snis);
     auto preferred = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
-    stats.preferred_worker_count = preferred ? static_cast<uint32_t>(preferred->size()) : 0;
-    stats.target_worker_count = GetFairWorkerCount(total_workers, active_snis);
+    stats.target_pool_size = preferred ? static_cast<uint32_t>(preferred->size()) : 0;
     result.push_back(std::move(stats));
   }
 

@@ -343,6 +343,7 @@ class Server {
   InfoEntries GetMemoryInfo(redis::Connection *conn);
   InfoEntries GetRocksDBInfo();
   InfoEntries GetClientsInfo(redis::Connection *self);
+  InfoEntries GetSchedulerInfo();
   InfoEntries GetReplicationInfo();
   InfoEntries GetCommandsStatsInfo(const std::string &ns, bool is_admin);
   InfoEntries GetClusterInfo();

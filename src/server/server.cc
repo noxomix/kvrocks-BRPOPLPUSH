@@ -1538,6 +1538,27 @@ Server::InfoEntries Server::GetClientsInfo(redis::Connection *self) {
   return entries;
 }
 
+Server::InfoEntries Server::GetSchedulerInfo() {
+  InfoEntries entries;
+  if (!fair_scheduler_) return entries;
+
+  auto sni_stats = fair_scheduler_->GetSNIStats();
+  std::sort(sni_stats.begin(), sni_stats.end(),
+            [](const SNIStats &a, const SNIStats &b) { return a.sni < b.sni; });
+
+  entries.emplace_back("active_snis", fair_scheduler_->GetActiveSNICountRaw());
+  entries.emplace_back("tracked_snis", sni_stats.size());
+
+  for (const auto &stats : sni_stats) {
+    entries.emplace_back("sni[" + stats.sni + "]",
+                         fmt::format("active_connections={},fair_share={},overdraft_limit={},target_pool_size={}",
+                                     stats.active_connections, stats.fair_share, stats.overdraft_limit,
+                                     stats.target_pool_size));
+  }
+
+  return entries;
+}
+
 Server::InfoEntries Server::GetMemoryInfo(redis::Connection *conn) {
   int64_t rss = Stats::GetMemoryRSS();
   std::string used_memory_rss_human = util::BytesToHuman(rss);
@@ -1943,11 +1964,13 @@ std::string Server::GetInfo(redis::Connection *conn, const std::vector<std::stri
   bool is_admin = conn->IsAdmin();
 
   // Sections that expose internal infrastructure details (network topology, storage internals, system metrics)
-  static const std::set<std::string> admin_only_sections = {"RocksDB", "Replication", "CPU", "Persistence"};
+  static const std::set<std::string> admin_only_sections = {"RocksDB", "Replication", "CPU", "Persistence",
+                                                             "Scheduler"};
 
   std::vector<std::pair<std::string, std::function<InfoEntries(Server *)>>> info_funcs = {
       {"Server", &Server::GetServerInfo},
       {"Clients", [conn](Server *srv) { return srv->GetClientsInfo(conn); }},
+      {"Scheduler", &Server::GetSchedulerInfo},
       {"Memory", [conn](Server *srv) { return srv->GetMemoryInfo(conn); }},
       {"Persistence", &Server::GetPersistenceInfo},
       {"Stats", [&ns, is_admin](Server *srv) { return srv->GetStatsInfo(ns, is_admin); }},

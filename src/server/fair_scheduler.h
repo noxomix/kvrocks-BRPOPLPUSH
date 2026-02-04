@@ -57,8 +57,9 @@ struct SNIState {
 struct SNIStats {
   std::string sni;
   uint32_t active_connections = 0;
-  uint32_t preferred_worker_count = 0;
-  uint32_t target_worker_count = 0;
+  uint32_t fair_share = 0;
+  uint32_t overdraft_limit = 0;
+  uint32_t target_pool_size = 0;
 };
 
 // SNI-based fair scheduler for worker selection
@@ -83,6 +84,8 @@ class FairScheduler {
 
   // Get count of active SNIs (with connections > 0) - O(1) via cached counter
   uint32_t GetActiveSNICount() const { return std::max(1u, active_sni_count_.load(std::memory_order_relaxed)); }
+  // Raw counter for observability (can be 0)
+  uint32_t GetActiveSNICountRaw() const { return active_sni_count_.load(std::memory_order_relaxed); }
 
   // Reload config (e.g., after CONFIG SET)
   void ReloadConfig();

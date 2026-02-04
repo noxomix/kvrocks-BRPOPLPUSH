@@ -199,7 +199,7 @@
 - [x] **2-Phasen Auswahl im Hot Path**: zuerst innerhalb Fair-Share Pool, nur bei Block/Backpressure auf Overdraft-Bereich ausweichen
 - [ ] **Lock/Allocation-freier Accept-Hot-Path behalten**: keine per-accept Mutex- oder Rebuild-Kosten
 - [x] **Config-Bereinigung**: alte Konzentrations-Parameter entfernt; nur `sni-max-workers-percent` + `sni-overdraft-percent`
-- [ ] **Observability ergaenzen**: INFO/Debug Sicht auf `active_snis`, `fair_share`, `overdraft_limit`, `target_pool_size` pro SNI
+- [x] **Observability ergaenzen**: INFO `Scheduler` zeigt `active_snis` sowie pro-SNI `fair_share`, `overdraft_limit`, `target_pool_size`
 - [x] **Tests erweitern**:
   - non-TLS single-key (`default.domain`) verteilt frueh breit statt auf wenige Worker zu konzentrieren
   - Multi-SNI Fairness bleibt erhalten (kein Starvation)
