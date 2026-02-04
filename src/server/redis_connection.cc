@@ -195,7 +195,11 @@ uint64_t Connection::GetIdleTime() const { return static_cast<uint64_t>(util::Ge
 uint64_t Connection::GetClientType() const {
   if (IsFlagEnabled(kSlave)) return kTypeSlave;
 
-  if (!subscribe_channels_.empty() || !subscribe_patterns_.empty()) return kTypePubsub;
+  if (subscribe_channels_count_.load(std::memory_order_relaxed) > 0 ||
+      subscribe_patterns_count_.load(std::memory_order_relaxed) > 0 ||
+      subscribe_shard_channels_count_.load(std::memory_order_relaxed) > 0) {
+    return kTypePubsub;
+  }
 
   return kTypeNormal;
 }
@@ -206,7 +210,11 @@ std::string Connection::GetFlags() const {
   if (IsFlagEnabled(kCloseAfterReply)) flags.append("c");
   if (IsFlagEnabled(kMonitor)) flags.append("M");
   if (IsFlagEnabled(kAsking)) flags.append("A");
-  if (!subscribe_channels_.empty() || !subscribe_patterns_.empty()) flags.append("P");
+  if (subscribe_channels_count_.load(std::memory_order_relaxed) > 0 ||
+      subscribe_patterns_count_.load(std::memory_order_relaxed) > 0 ||
+      subscribe_shard_channels_count_.load(std::memory_order_relaxed) > 0) {
+    flags.append("P");
+  }
   if (flags.empty()) flags = "N";
   return flags;
 }
@@ -222,7 +230,9 @@ bool Connection::CanMigrate() const {
          && !IsFlagEnabled(redis::Connection::kCloseAfterReply)          // close after reply
          && !IsFlagEnabled(redis::Connection::kMonitor)                  // monitor connections have worker-specific registration
          && saved_current_command_ == nullptr                            // not executing blocking command like BLPOP
-         && subscribe_channels_.empty() && subscribe_patterns_.empty();  // not subscribing any channel
+         && subscribe_channels_count_.load(std::memory_order_relaxed) == 0
+         && subscribe_patterns_count_.load(std::memory_order_relaxed) == 0
+         && subscribe_shard_channels_count_.load(std::memory_order_relaxed) == 0;  // not subscribing any channel
 }
 
 void Connection::SubscribeChannel(const std::string &channel) {
@@ -231,6 +241,7 @@ void Connection::SubscribeChannel(const std::string &channel) {
   }
 
   subscribe_channels_.emplace_back(channel);
+  subscribe_channels_count_.fetch_add(1, std::memory_order_relaxed);
   owner_->srv->SubscribeChannel(channel, this);
 }
 
@@ -238,6 +249,7 @@ void Connection::UnsubscribeChannel(const std::string &channel) {
   for (auto iter = subscribe_channels_.begin(); iter != subscribe_channels_.end(); iter++) {
     if (*iter == channel) {
       subscribe_channels_.erase(iter);
+      subscribe_channels_count_.fetch_sub(1, std::memory_order_relaxed);
       owner_->srv->UnsubscribeChannel(channel, this);
       return;
     }
@@ -259,15 +271,17 @@ void Connection::UnsubscribeAll(const UnsubscribeCallback &reply) {
     }
   }
   subscribe_channels_.clear();
+  subscribe_channels_count_.store(0, std::memory_order_relaxed);
 }
 
-int Connection::SubscriptionsCount() { return static_cast<int>(subscribe_channels_.size()); }
+int Connection::SubscriptionsCount() { return subscribe_channels_count_.load(std::memory_order_relaxed); }
 
 void Connection::PSubscribeChannel(const std::string &pattern) {
   for (const auto &p : subscribe_patterns_) {
     if (pattern == p) return;
   }
   subscribe_patterns_.emplace_back(pattern);
+  subscribe_patterns_count_.fetch_add(1, std::memory_order_relaxed);
   owner_->srv->PSubscribeChannel(pattern, this);
 }
 
@@ -275,6 +289,7 @@ void Connection::PUnsubscribeChannel(const std::string &pattern) {
   for (auto iter = subscribe_patterns_.begin(); iter != subscribe_patterns_.end(); iter++) {
     if (*iter == pattern) {
       subscribe_patterns_.erase(iter);
+      subscribe_patterns_count_.fetch_sub(1, std::memory_order_relaxed);
       owner_->srv->PUnsubscribeChannel(pattern, this);
       return;
     }
@@ -296,9 +311,10 @@ void Connection::PUnsubscribeAll(const UnsubscribeCallback &reply) {
     }
   }
   subscribe_patterns_.clear();
+  subscribe_patterns_count_.store(0, std::memory_order_relaxed);
 }
 
-int Connection::PSubscriptionsCount() { return static_cast<int>(subscribe_patterns_.size()); }
+int Connection::PSubscriptionsCount() { return subscribe_patterns_count_.load(std::memory_order_relaxed); }
 
 void Connection::SSubscribeChannel(const std::string &channel, uint16_t slot) {
   for (const auto &chan : subscribe_shard_channels_) {
@@ -306,6 +322,7 @@ void Connection::SSubscribeChannel(const std::string &channel, uint16_t slot) {
   }
 
   subscribe_shard_channels_.emplace_back(channel);
+  subscribe_shard_channels_count_.fetch_add(1, std::memory_order_relaxed);
   owner_->srv->SSubscribeChannel(channel, this, slot);
 }
 
@@ -313,6 +330,7 @@ void Connection::SUnsubscribeChannel(const std::string &channel, uint16_t slot) 
   for (auto iter = subscribe_shard_channels_.begin(); iter != subscribe_shard_channels_.end(); iter++) {
     if (*iter == channel) {
       subscribe_shard_channels_.erase(iter);
+      subscribe_shard_channels_count_.fetch_sub(1, std::memory_order_relaxed);
       owner_->srv->SUnsubscribeChannel(channel, this, slot);
       return;
     }
@@ -335,9 +353,12 @@ void Connection::SUnsubscribeAll(const UnsubscribeCallback &reply) {
     }
   }
   subscribe_shard_channels_.clear();
+  subscribe_shard_channels_count_.store(0, std::memory_order_relaxed);
 }
 
-int Connection::SSubscriptionsCount() { return static_cast<int>(subscribe_shard_channels_.size()); }
+int Connection::SSubscriptionsCount() {
+  return subscribe_shard_channels_count_.load(std::memory_order_relaxed);
+}
 
 bool Connection::IsProfilingEnabled(const std::string &cmd) {
   auto config = srv_->GetConfig();

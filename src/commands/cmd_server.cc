@@ -1311,6 +1311,9 @@ class CommandReset : public Commander {
     if (conn->PSubscriptionsCount() != 0) {
       conn->PUnsubscribeAll();
     }
+    if (conn->SSubscriptionsCount() != 0) {
+      conn->SUnsubscribeAll();
+    }
     // 11. Deauthenticates the connection, requiring a call AUTH to reauthenticate when authentication is enabled.
     conn->SetNamespace(kDefaultNamespace);
     conn->BecomeAdmin();

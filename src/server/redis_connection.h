@@ -224,6 +224,9 @@ class Connection : public EvbufCallbackBase<Connection> {
   std::vector<std::string> subscribe_channels_;
   std::vector<std::string> subscribe_patterns_;
   std::vector<std::string> subscribe_shard_channels_;
+  std::atomic<int> subscribe_channels_count_{0};
+  std::atomic<int> subscribe_patterns_count_{0};
+  std::atomic<int> subscribe_shard_channels_count_{0};
 
   Server *srv_;
   bool in_exec_ = false;

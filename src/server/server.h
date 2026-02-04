@@ -71,28 +71,34 @@ struct DBScanInfo {
 struct ConnContext {
   Worker *owner;
   int fd;
+  uint64_t conn_id;
   std::string ns;
 
-  ConnContext(Worker *w, int fd, std::string ns) : owner(w), fd(fd), ns(std::move(ns)) {}
+  ConnContext(Worker *w, int fd, uint64_t conn_id, std::string ns)
+      : owner(w), fd(fd), conn_id(conn_id), ns(std::move(ns)) {}
 
   bool operator<(const ConnContext &c) const {
     if (owner == c.owner) {
+      if (fd == c.fd) {
+        return conn_id < c.conn_id;
+      }
       return fd < c.fd;
     }
 
     return owner < c.owner;
   }
 
-  bool operator==(const ConnContext &c) const { return owner == c.owner && fd == c.fd; }
+  bool operator==(const ConnContext &c) const { return owner == c.owner && fd == c.fd && conn_id == c.conn_id; }
 };
 
 struct StreamConsumer {
   Worker *owner;
   int fd;
+  uint64_t conn_id;
   std::string ns;
   redis::StreamEntryID last_consumed_id;
-  StreamConsumer(Worker *w, int fd, std::string ns, redis::StreamEntryID id)
-      : owner(w), fd(fd), ns(std::move(ns)), last_consumed_id(id) {}
+  StreamConsumer(Worker *w, int fd, uint64_t conn_id, std::string ns, redis::StreamEntryID id)
+      : owner(w), fd(fd), conn_id(conn_id), ns(std::move(ns)), last_consumed_id(id) {}
 };
 
 struct ChannelSubscribeNum {
@@ -508,12 +514,20 @@ class Server {
 
   // WAIT command blocking infrastructure
   struct WaitContext {
-    redis::Connection *conn;
+    Worker *owner;
+    int fd;
+    uint64_t conn_id;
+    std::string ns;
     rocksdb::SequenceNumber target_seq;
     uint64_t num_replicas;
 
     WaitContext(redis::Connection *c, rocksdb::SequenceNumber seq, uint64_t replicas)
-        : conn(c), target_seq(seq), num_replicas(replicas) {}
+        : owner(c->Owner()),
+          fd(c->GetFD()),
+          conn_id(c->GetID()),
+          ns(c->GetNamespace()),
+          target_seq(seq),
+          num_replicas(replicas) {}
   };
   std::multimap<rocksdb::SequenceNumber, WaitContext> wait_contexts_;
   std::shared_mutex wait_contexts_mu_;

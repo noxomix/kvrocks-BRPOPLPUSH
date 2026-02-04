@@ -17,7 +17,7 @@
 - **Per-NS Pattern:** `unordered_map<ns, unique_ptr<Struct>>` + `shared_mutex` (Lookup parallel)
 - **Lock-Reihenfolge:** Outer Map Lock → Inner Struct Lock (nie umgekehrt)
 - **Copy-then-Reply:** Empfänger unter Lock kopieren, Lock lösen, dann I/O
-- **Nur `(Worker*, fd)` kopieren**, nie `Connection*` (Use-After-Free nach Lock-Release)
+- **Nur stabile Handles `(Worker*, fd, conn_id)` kopieren**, nie `Connection*` (UAF/FD-Reuse nach Lock-Release)
 
 ### Work Guards (Command-Level Locking)
 - **`kCmdExclusive`** → `WorkExclusivityGuard(ns)` = `unique_lock<shared_mutex>`
@@ -172,6 +172,8 @@
 - [ ] **GetConnections() Data-Race** → Resize nutzt `Worker::GetConnections()` ohne Lock
 - [ ] **Worker Destruktor UB** → iteriert `conns_` und löscht gleichzeitig (Shutdown/Resize)
 - [ ] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` lesen `Connection`-Felder ohne Atomics/Lock
+- [x] **PubSub Subscribe-State Race (UB)** → geloest via atomare Subscribe-Counter (cross-thread Leser ohne Vektorzugriff)
+- [x] **FD-Reuse Misrouting (PubSub/Blocking/Streams/WAIT)** → async Reply/Wakeup jetzt via `(fd + conn_id)` validiert
 - [ ] **DBScan Map Race** → `db_scan_infos_` read ohne Lock (`GetLatestKeyNumStats/GetLastScanTime`)
 - [ ] **BGSAVE/Compact Flags Race** → `is_bgsave_in_progress_`, `db_compacting_`, `last_bgsave_*` read ohne Lock (INFO)
 - [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
@@ -204,6 +206,11 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 - [ ] **List O(n):** LRANGE, LINSERT, LREM (`cmd_list.cc`)
 - [ ] **ZSet O(n):** ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE (`cmd_zset.cc`)
 - [ ] **Keys O(n):** KEYS (`cmd_server.cc`)
+
+### Mittel - PubSub/RESP Semantik
+- [ ] **Subscribed-Mode Guard fehlt** → auf abonnierter Connection sind Nicht-PubSub-Commands aktuell nicht strikt geblockt (RESP2/Kompatibilitaet)
+- [x] **RESET unvollstaendig fuer PubSub** → `RESET` ruft jetzt auch `SUnsubscribeAll()` auf
+- [x] **Client-Type unvollstaendig** → `GetClientType()/GetFlags()/CanMigrate()` beruecksichtigen `SSUBSCRIBE`
 
 **Bereits geschützt:**
 - [x] SORT - Hat `SORT_LENGTH_LIMIT = 512` (`redis_db.h:39`)

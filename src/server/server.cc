@@ -533,9 +533,9 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
   int index = 0;
 
   // Collect subscribers under lock, reply outside lock
-  std::vector<std::pair<Worker*, int>> to_publish_conn_ctxs;
+  std::vector<std::tuple<Worker *, int, uint64_t>> to_publish_conn_ctxs;
   std::vector<std::string> patterns;
-  std::vector<std::pair<Worker*, int>> to_publish_patterns_conn_ctxs;
+  std::vector<std::tuple<Worker *, int, uint64_t>> to_publish_patterns_conn_ctxs;
 
   {
     std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
@@ -548,7 +548,7 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
       // Collect channel subscribers
       if (auto iter = it->second->channels.find(channel); iter != it->second->channels.end()) {
         for (const auto &conn_ctx : iter->second) {
-          to_publish_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd);
+          to_publish_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id);
         }
       }
 
@@ -556,7 +556,7 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
       for (const auto &iter : it->second->patterns) {
         if (util::StringMatch(iter.first, channel, false)) {
           for (const auto &conn_ctx : iter.second) {
-            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd);
+            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id);
             patterns.emplace_back(iter.first);
           }
         }
@@ -570,22 +570,22 @@ int Server::PublishMessage(const std::string &ns, const std::string &channel, co
   channel_reply.append(redis::BulkString("message"));
   channel_reply.append(redis::BulkString(channel));
   channel_reply.append(redis::BulkString(msg));
-  for (const auto &[owner, fd] : to_publish_conn_ctxs) {
-    auto s = owner->Reply(fd, channel_reply);
+  for (const auto &[owner, fd, conn_id] : to_publish_conn_ctxs) {
+    auto s = owner->ReplyByID(fd, conn_id, channel_reply);
     if (s.IsOK()) {
       cnt++;
     }
   }
 
   // We should publish corresponding pattern and message for connections
-  for (const auto &[owner, fd] : to_publish_patterns_conn_ctxs) {
+  for (const auto &[owner, fd, conn_id] : to_publish_patterns_conn_ctxs) {
     std::string pattern_reply;
     pattern_reply.append(redis::MultiLen(4));
     pattern_reply.append(redis::BulkString("pmessage"));
     pattern_reply.append(redis::BulkString(patterns[index++]));
     pattern_reply.append(redis::BulkString(channel));
     pattern_reply.append(redis::BulkString(msg));
-    auto s = owner->Reply(fd, pattern_reply);
+    auto s = owner->ReplyByID(fd, conn_id, pattern_reply);
     if (s.IsOK()) {
       cnt++;
     }
@@ -609,7 +609,7 @@ void Server::SubscribeChannel(const std::string &channel, redis::Connection *con
   }
 
   std::lock_guard<std::mutex> guard(it->second->mu);
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetID(), ns);
   if (auto iter = it->second->channels.find(channel); iter == it->second->channels.end()) {
     it->second->channels.emplace(channel, std::list<ConnContext>{conn_ctx});
   } else {
@@ -633,7 +633,7 @@ void Server::UnsubscribeChannel(const std::string &channel, redis::Connection *c
   }
 
   for (const auto &conn_ctx : iter->second) {
-    if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
+    if (conn->GetFD() == conn_ctx.fd && conn->GetID() == conn_ctx.conn_id && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
         it->second->channels.erase(iter);
@@ -699,7 +699,7 @@ void Server::PSubscribeChannel(const std::string &pattern, redis::Connection *co
   }
 
   std::lock_guard<std::mutex> guard(it->second->mu);
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetID(), ns);
   if (auto iter = it->second->patterns.find(pattern); iter == it->second->patterns.end()) {
     it->second->patterns.emplace(pattern, std::list<ConnContext>{conn_ctx});
   } else {
@@ -723,7 +723,7 @@ void Server::PUnsubscribeChannel(const std::string &pattern, redis::Connection *
   }
 
   for (const auto &conn_ctx : iter->second) {
-    if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
+    if (conn->GetFD() == conn_ctx.fd && conn->GetID() == conn_ctx.conn_id && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
         it->second->patterns.erase(iter);
@@ -737,7 +737,7 @@ void Server::SSubscribeChannel(const std::string &channel, redis::Connection *co
   assert((config_->cluster_enabled && slot < HASH_SLOTS_SIZE) || slot == 0);
   std::lock_guard<std::mutex> guard(pubsub_shard_channels_mu_);
 
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetNamespace());
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetID(), conn->GetNamespace());
   if (auto iter = pubsub_shard_channels_[slot].find(channel); iter == pubsub_shard_channels_[slot].end()) {
     pubsub_shard_channels_[slot].emplace(channel, std::list<ConnContext>{conn_ctx});
   } else {
@@ -755,7 +755,7 @@ void Server::SUnsubscribeChannel(const std::string &channel, redis::Connection *
   }
 
   for (const auto &conn_ctx : iter->second) {
-    if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
+    if (conn->GetFD() == conn_ctx.fd && conn->GetID() == conn_ctx.conn_id && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
         pubsub_shard_channels_[slot].erase(iter);
@@ -804,7 +804,7 @@ void Server::BlockOnKey(const std::string &key, redis::Connection *conn) {
   }
 
   std::lock_guard<std::mutex> guard(it->second->mu);
-  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), ns);
+  auto conn_ctx = ConnContext(conn->Owner(), conn->GetFD(), conn->GetID(), ns);
 
   if (auto iter = it->second->keys.find(key); iter == it->second->keys.end()) {
     it->second->keys.emplace(key, std::list<ConnContext>{conn_ctx});
@@ -831,7 +831,7 @@ void Server::UnblockOnKey(const std::string &key, redis::Connection *conn) {
   }
 
   for (const auto &conn_ctx : iter->second) {
-    if (conn->GetFD() == conn_ctx.fd && conn->Owner() == conn_ctx.owner) {
+    if (conn->GetFD() == conn_ctx.fd && conn->GetID() == conn_ctx.conn_id && conn->Owner() == conn_ctx.owner) {
       iter->second.remove(conn_ctx);
       if (iter->second.empty()) {
         it->second->keys.erase(iter);
@@ -860,7 +860,7 @@ void Server::BlockOnStreams(const std::vector<std::string> &keys, const std::vec
   IncrBlockedClientNum();
 
   for (size_t i = 0; i < keys.size(); ++i) {
-    auto consumer = std::make_shared<StreamConsumer>(conn->Owner(), conn->GetFD(), ns, entry_ids[i]);
+    auto consumer = std::make_shared<StreamConsumer>(conn->Owner(), conn->GetFD(), conn->GetID(), ns, entry_ids[i]);
     if (auto iter = it->second->consumers.find(keys[i]); iter == it->second->consumers.end()) {
       std::set<std::shared_ptr<StreamConsumer>> consumers;
       consumers.insert(consumer);
@@ -891,7 +891,7 @@ void Server::UnblockOnStreams(const std::vector<std::string> &keys, redis::Conne
 
     for (auto consumer_it = iter->second.begin(); consumer_it != iter->second.end();) {
       const auto &consumer = *consumer_it;
-      if (conn->GetFD() == consumer->fd && conn->Owner() == consumer->owner) {
+      if (conn->GetFD() == consumer->fd && conn->GetID() == consumer->conn_id && conn->Owner() == consumer->owner) {
         iter->second.erase(consumer_it);
         if (iter->second.empty()) {
           it->second->consumers.erase(iter);
@@ -904,7 +904,7 @@ void Server::UnblockOnStreams(const std::vector<std::string> &keys, redis::Conne
 }
 
 void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, size_t n_conns) {
-  std::vector<std::pair<Worker *, int>> to_wakeup;
+  std::vector<std::tuple<Worker *, int, uint64_t>> to_wakeup;
 
   {
     std::shared_lock<std::shared_mutex> ns_map_lock(blocking_keys_ns_mu_);
@@ -922,13 +922,13 @@ void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, 
     while (n_conns-- && !iter->second.empty()) {
       auto conn_ctx = std::move(iter->second.front());
       iter->second.pop_front();
-      to_wakeup.emplace_back(conn_ctx.owner, conn_ctx.fd);
+      to_wakeup.emplace_back(conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id);
     }
   }  // Lock released
 
   // I/O outside lock - EnableWriteEvent validates fd internally
-  for (const auto &[owner, fd] : to_wakeup) {
-    auto s = owner->EnableWriteEvent(fd);
+  for (const auto &[owner, fd, conn_id] : to_wakeup) {
+    auto s = owner->EnableWriteEventByID(fd, conn_id);
     if (!s.IsOK()) {
       error("[server] Failed to enable write event on blocked client {}: {}", fd, s.Msg());
     }
@@ -936,7 +936,7 @@ void Server::WakeupBlockingConns(const std::string &ns, const std::string &key, 
 }
 
 void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id) {
-  std::vector<std::pair<Worker *, int>> to_wakeup;
+  std::vector<std::tuple<Worker *, int, uint64_t>> to_wakeup;
 
   {
     std::shared_lock<std::shared_mutex> ns_map_lock(stream_consumers_ns_mu_);
@@ -955,7 +955,7 @@ void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key,
       auto consumer = *it;
       // No need to check consumer->ns == ns since we already filtered by namespace
       if (entry_id > consumer->last_consumed_id) {
-        to_wakeup.emplace_back(consumer->owner, consumer->fd);
+        to_wakeup.emplace_back(consumer->owner, consumer->fd, consumer->conn_id);
         it = iter->second.erase(it);
       } else {
         ++it;
@@ -964,8 +964,8 @@ void Server::OnEntryAddedToStream(const std::string &ns, const std::string &key,
   }  // Lock released
 
   // I/O outside lock - EnableWriteEvent validates fd internally
-  for (const auto &[owner, fd] : to_wakeup) {
-    auto s = owner->EnableWriteEvent(fd);
+  for (const auto &[owner, fd, conn_id] : to_wakeup) {
+    auto s = owner->EnableWriteEventByID(fd, conn_id);
     if (!s.IsOK()) {
       error("[server] Failed to enable write event on blocked stream consumer {}: {}", fd, s.Msg());
     }
@@ -991,8 +991,7 @@ void Server::BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target
 }
 
 void Server::WakeupWaitConnections(rocksdb::SequenceNumber seq) {
-  // Store (Worker*, fd, reached_replicas) - no Connection* needed to avoid Use-After-Free
-  std::vector<std::tuple<Worker *, int, size_t>> to_wakeup;
+  std::vector<std::tuple<Worker *, int, uint64_t, size_t>> to_wakeup;
 
   {
     std::unique_lock<std::shared_mutex> guard(wait_contexts_mu_);
@@ -1005,7 +1004,7 @@ void Server::WakeupWaitConnections(rocksdb::SequenceNumber seq) {
 
       // If enough replicas have reached the target sequence, collect for wakeup
       if (reached_replicas >= it->second.num_replicas) {
-        to_wakeup.emplace_back(it->second.conn->Owner(), it->second.conn->GetFD(), reached_replicas);
+        to_wakeup.emplace_back(it->second.owner, it->second.fd, it->second.conn_id, reached_replicas);
         it = wait_contexts_.erase(it);
         continue;
       }
@@ -1014,11 +1013,11 @@ void Server::WakeupWaitConnections(rocksdb::SequenceNumber seq) {
   }  // Lock released
 
   // I/O + counter outside lock - Worker::Reply validates fd internally
-  for (const auto &[owner, fd, reached_replicas] : to_wakeup) {
+  for (const auto &[owner, fd, conn_id, reached_replicas] : to_wakeup) {
     auto reply = redis::Integer(reached_replicas);
-    auto s = owner->Reply(fd, reply);
+    auto s = owner->ReplyByID(fd, conn_id, reply);
     if (s.IsOK()) {
-      std::ignore = owner->EnableWriteEvent(fd);
+      std::ignore = owner->EnableWriteEventByID(fd, conn_id);
     }
     // Note: Connection might already be closed, but counter must still be decremented
     DecrBlockedClientNum();
@@ -1030,9 +1029,12 @@ void Server::WakeupWaitConnection(redis::Connection *conn, rocksdb::SequenceNumb
   cleanupWaitConnection(conn);
 
   size_t reached_replicas = GetReplicasReachedSequence(seq);
-  conn->Reply(redis::Integer(reached_replicas));
+  auto reply = redis::Integer(reached_replicas);
+  auto s = conn->Owner()->ReplyByID(conn->GetFD(), conn->GetID(), reply);
 
-  auto s = conn->Owner()->EnableWriteEvent(conn->GetFD());
+  if (s.IsOK()) {
+    s = conn->Owner()->EnableWriteEventByID(conn->GetFD(), conn->GetID());
+  }
   if (!s.IsOK()) {
     error("[server] Failed to enable write event on WAIT connection {}: {}", conn->GetFD(), s.Msg());
   }
@@ -1048,7 +1050,7 @@ void Server::cleanupWaitConnection(redis::Connection *conn) {
   auto it = wait_contexts_.begin();
   int erased_count = 0;
   while (it != wait_contexts_.end()) {
-    if (it->second.conn == conn) {
+    if (it->second.owner == conn->Owner() && it->second.fd == conn->GetFD() && it->second.conn_id == conn->GetID()) {
       it = wait_contexts_.erase(it);
       erased_count++;
       // Technically only one client is unblocked, but we call IncrBlockedClientNum for each added wait context,
@@ -1152,7 +1154,7 @@ int Server::GetBlockedClientsCount(redis::Connection *self) {
   {
     std::shared_lock<std::shared_mutex> guard(wait_contexts_mu_);
     for (const auto &[seq, ctx] : wait_contexts_) {
-      if (ctx.conn->GetNamespace() == ns) count++;
+      if (ctx.ns == ns) count++;
     }
   }
 

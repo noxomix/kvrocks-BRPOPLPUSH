@@ -90,7 +90,9 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void FreeConnectionByID(int fd, uint64_t id);
   Status AddConnection(redis::Connection *c);
   Status EnableWriteEvent(int fd);
+  Status EnableWriteEventByID(int fd, uint64_t id);
   Status Reply(int fd, const std::string &reply);
+  Status ReplyByID(int fd, uint64_t id, const std::string &reply);
   void BecomeMonitorConn(redis::Connection *conn);
   void QuitMonitorConn(redis::Connection *conn);
 

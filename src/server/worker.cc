@@ -471,10 +471,34 @@ Status Worker::EnableWriteEvent(int fd) {
   return {Status::NotOK, "connection doesn't exist"};
 }
 
+Status Worker::EnableWriteEventByID(int fd, uint64_t id) {
+  std::unique_lock<std::mutex> lock(conns_mu_);
+  auto iter = conns_.find(fd);
+  if (iter != conns_.end() && iter->second->GetID() == id) {
+    auto bev = iter->second->GetBufferEvent();
+    bufferevent_enable(bev, EV_WRITE);
+    return Status::OK();
+  }
+
+  return {Status::NotOK, "connection doesn't exist"};
+}
+
 Status Worker::Reply(int fd, const std::string &reply) {
   std::unique_lock<std::mutex> lock(conns_mu_);
   auto iter = conns_.find(fd);
   if (iter != conns_.end()) {
+    iter->second->SetLastInteraction();
+    redis::Reply(iter->second->Output(), reply);
+    return Status::OK();
+  }
+
+  return {Status::NotOK, "connection doesn't exist"};
+}
+
+Status Worker::ReplyByID(int fd, uint64_t id, const std::string &reply) {
+  std::unique_lock<std::mutex> lock(conns_mu_);
+  auto iter = conns_.find(fd);
+  if (iter != conns_.end() && iter->second->GetID() == id) {
     iter->second->SetLastInteraction();
     redis::Reply(iter->second->Output(), reply);
     return Status::OK();
