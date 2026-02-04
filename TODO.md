@@ -169,9 +169,9 @@
   - Hinweis: Hash war bereits namespace-aware (ns_key), nur zu wenige Buckets
 
 ### Hoch - Concurrency
-- [ ] **GetConnections() Data-Race** → Resize nutzt `Worker::GetConnections()` ohne Lock
-- [ ] **Worker Destruktor UB** → iteriert `conns_` und löscht gleichzeitig (Shutdown/Resize)
-- [ ] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` lesen `Connection`-Felder ohne Atomics/Lock
+- [x] **GetConnections() Data-Race** → Resize nutzt jetzt `GetConnectionsSnapshot()` unter `conns_mu_`
+- [x] **Worker Destruktor UB** → Zwei-Phasen-Cleanup (Map unter Lock leeren, danach kontrolliert freigeben)
+- [x] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` nutzen thread-sichere `Connection::ClientInfo` Snapshots
 - [x] **PubSub Subscribe-State Race (UB)** → geloest via atomare Subscribe-Counter (cross-thread Leser ohne Vektorzugriff)
 - [x] **FD-Reuse Misrouting (PubSub/Blocking/Streams/WAIT)** → async Reply/Wakeup jetzt via `(fd + conn_id)` validiert
 - [x] **DBScan Map Race** → `db_scan_infos_` reads jetzt immer unter `db_job_mu_` (GetLatestKeyNumStats/GetLastScanTime)
@@ -192,6 +192,21 @@
   - Fix: `preferred_workers` als lockfreier immutable Snapshot (`atomic_load/store` auf `shared_ptr`)
 - [x] **TLS-SNI Flaky Erkennung bei Accept:** sofortiges `MSG_PEEK` konnte ClientHello sporadisch verpassen → gemischte Scheduling-Keys
   - Fix: bounded Retry (1x/1ms) in `ExtractSNIFromClientHello()`, plus "voller TLS-Record ohne SNI" fast-exit
+
+### Hoch - FairScheduler (SNI) Throughput Rework (2026-02-04)
+- [ ] **Concentration-Gating entfernen**: keine "Worker erst ab N Connections freischalten" Logik mehr (`needed_for_load`, `sni-connections-per-worker`, `sni-min-workers`)
+- [ ] **Fair Pool strikt ueber Share+Overdraft**: pro SNI `fair_share` als Basis, optional `overdraft` als Burst-Kapazitaet; Round-Robin ueber den zugewiesenen Pool
+- [ ] **2-Phasen Auswahl im Hot Path**: zuerst innerhalb Fair-Share Pool, nur bei Block/Backpressure auf Overdraft-Bereich ausweichen
+- [ ] **Lock/Allocation-freier Accept-Hot-Path behalten**: keine per-accept Mutex- oder Rebuild-Kosten
+- [ ] **Config-Bereinigung**: alte Konzentrations-Parameter als deprecated/no-op markieren oder durch neues, klareres Modell ersetzen
+- [ ] **Observability ergaenzen**: INFO/Debug Sicht auf `active_snis`, `fair_share`, `overdraft_limit`, `target_pool_size` pro SNI
+- [ ] **Tests erweitern**:
+  - non-TLS single-key (`default.domain`) verteilt frueh breit statt auf wenige Worker zu konzentrieren
+  - Multi-SNI Fairness bleibt erhalten (kein Starvation)
+  - Lua-blocked Worker werden weiterhin vermieden
+- [ ] **Perf-Abnahme mit memtier**:
+  - A/B gegen Build von vorgestern (gleiche Docker-Umgebung)
+  - Ziel: Write-RPS wieder Richtung historischer ~6000 statt ~2500
 
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 

@@ -131,7 +131,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::string GetLuaScriptNs() const { return lua_script_ns_; }  // Copy for thread-safety
   void RequestLuaScriptKill() { lua_script_kill_requested_.store(true, std::memory_order_release); }
 
-  std::map<int, redis::Connection *> GetConnections() const { return conns_; }
+  std::map<int, redis::Connection *> GetConnectionsSnapshot();
   Server *srv;
 
   // Per-namespace stats (with per-worker mutex for thread-safety)

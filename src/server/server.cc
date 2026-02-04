@@ -2554,7 +2554,7 @@ void Server::decreaseWorkerThreads(size_t delta) {
     worker_threads_.pop_back();
     // Migrate connections to other workers before stopping the worker,
     // we use round-robin to choose the target worker here.
-    auto connections = worker_thread->GetWorker()->GetConnections();
+    auto connections = worker_thread->GetWorker()->GetConnectionsSnapshot();
     worker_thread->GetWorker()->StopAccepting();
     for (const auto &iter : connections) {
       auto target_worker = worker_threads_[iter.first % remain_worker_threads]->GetWorker();

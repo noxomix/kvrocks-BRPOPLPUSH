@@ -81,9 +81,32 @@ Worker::Worker(Server *srv, [[maybe_unused]] Config *config) : srv(srv), base_(e
 
 Worker::~Worker() {
   DrainPendingConnections();
-  // All connections (including monitors) are now in conns_
-  for (const auto &iter : conns_) {
-    iter.second->Close();
+  std::vector<redis::Connection *> connections;
+  {
+    std::lock_guard<std::mutex> lock(conns_mu_);
+    connections.reserve(conns_.size());
+    for (const auto &[fd, conn] : conns_) {
+      (void)fd;
+      connections.push_back(conn);
+    }
+    conns_.clear();
+  }
+
+  // Event loop is already stopped when worker thread joins; cleanup can run without iterating mutable map.
+  for (auto *conn : connections) {
+    srv->ResetWatchedKeys(conn);
+    srv->CleanupWaitConnection(conn);
+    if (rate_limit_group_) {
+      bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
+    }
+    if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+      srv->UnregisterMonitorClient(conn->GetNamespace(), conn->GetFD());
+    }
+    if (auto *scheduler = srv->GetFairScheduler()) {
+      scheduler->OnConnectionClosed(conn->GetSNI());
+    }
+    srv->DecrClientNum();
+    delete conn;
   }
 
   timer_.reset();
@@ -102,6 +125,11 @@ Worker::~Worker() {
   }
   event_base_free(base_);
   lua::DestroyState(lua_);
+}
+
+std::map<int, redis::Connection *> Worker::GetConnectionsSnapshot() {
+  std::lock_guard<std::mutex> lock(conns_mu_);
+  return conns_;
 }
 
 void Worker::TimerCB(int, [[maybe_unused]] int16_t events) {
@@ -525,15 +553,18 @@ void Worker::QuitMonitorConn(redis::Connection *conn) {
 
 std::string Worker::GetClientsStr(redis::Connection *self) {
   std::unique_lock<std::mutex> lock(conns_mu_);
+  const bool is_admin = self->IsAdmin();
+  const auto self_ns = std::string(self->GetNamespace());
 
   std::string output;
   for (const auto &iter : conns_) {
     redis::Connection *conn = iter.second;
+    auto info = conn->GetClientInfo(true);
     // Non-admin users can only see connections in their own namespace
-    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+    if (!is_admin && info.ns != self_ns) {
       continue;
     }
-    output.append(conn->ToString());
+    output.append(redis::Connection::FormatClientInfo(info));
   }
 
   return output;
@@ -541,47 +572,73 @@ std::string Worker::GetClientsStr(redis::Connection *self) {
 
 void Worker::KillClient(redis::Connection *self, uint64_t id, const std::string &addr, uint64_t type, bool skipme,
                         int64_t *killed) {
-  std::lock_guard<std::mutex> guard(conns_mu_);
+  struct KillCandidate {
+    int fd;
+    uint64_t conn_id;
+  };
 
-  for (const auto &iter : conns_) {
-    redis::Connection *conn = iter.second;
-    if (skipme && self == conn) continue;
+  std::vector<KillCandidate> candidates;
+  const bool is_admin = self->IsAdmin();
+  const auto self_ns = std::string(self->GetNamespace());
+  {
+    std::lock_guard<std::mutex> guard(conns_mu_);
+    for (const auto &iter : conns_) {
+      redis::Connection *conn = iter.second;
+      if (skipme && self == conn) continue;
 
-    // Non-admin users can only kill connections in their own namespace
-    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+      auto info = conn->GetClientInfo();
+      // Non-admin users can only kill connections in their own namespace
+      if (!is_admin && info.ns != self_ns) {
+        continue;
+      }
+
+      // no need to kill the client again if the kCloseAfterReply flag is set
+      if (info.close_after_reply) {
+        continue;
+      }
+
+      if ((type & info.type) || (!addr.empty() && (info.addr == addr || info.announce_addr == addr)) ||
+          (id != 0 && info.id == id)) {
+        candidates.push_back({iter.first, info.id});
+      }
+    }
+  }
+
+  for (const auto &candidate : candidates) {
+    std::lock_guard<std::mutex> guard(conns_mu_);
+    auto iter = conns_.find(candidate.fd);
+    if (iter == conns_.end() || iter->second->GetID() != candidate.conn_id) {
       continue;
     }
-
-    // no need to kill the client again if the kCloseAfterReply flag is set
+    auto *conn = iter->second;
     if (conn->IsFlagEnabled(redis::Connection::kCloseAfterReply)) {
       continue;
     }
-
-    if ((type & conn->GetClientType()) ||
-        (!addr.empty() && (conn->GetAddr() == addr || conn->GetAnnounceAddr() == addr)) ||
-        (id != 0 && conn->GetID() == id)) {
-      conn->EnableFlag(redis::Connection::kCloseAfterReply);
-      // enable write event to notify worker wake up ASAP, and remove the connection
-      if (!conn->IsFlagEnabled(redis::Connection::kSlave)) {  // don't enable any event in slave connection
-        auto bev = conn->GetBufferEvent();
-        bufferevent_enable(bev, EV_WRITE);
-      }
-      (*killed)++;
+    conn->EnableFlag(redis::Connection::kCloseAfterReply);
+    // Enable write event to notify worker wake up ASAP, and remove the connection.
+    if (!conn->IsFlagEnabled(redis::Connection::kSlave)) {  // don't enable any event in slave connection
+      auto bev = conn->GetBufferEvent();
+      bufferevent_enable(bev, EV_WRITE);
     }
+    (*killed)++;
   }
 }
 
 ClientCounts Worker::GetClientCounts(redis::Connection *self) {
   std::lock_guard<std::mutex> guard(conns_mu_);
+  const bool is_admin = self->IsAdmin();
+  const auto self_ns = std::string(self->GetNamespace());
   ClientCounts counts;
   for (const auto &[fd, conn] : conns_) {
+    (void)fd;
+    auto info = conn->GetClientInfo();
     // Non-admin only sees own namespace
-    if (!self->IsAdmin() && conn->GetNamespace() != self->GetNamespace()) {
+    if (!is_admin && info.ns != self_ns) {
       continue;
     }
     counts.connected++;
     // Count monitor connections via flag
-    if (conn->IsFlagEnabled(redis::Connection::kMonitor)) {
+    if (info.is_monitor) {
       counts.monitor++;
     }
   }

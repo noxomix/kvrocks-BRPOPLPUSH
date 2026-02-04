@@ -50,7 +50,7 @@ Connection::Connection(bufferevent *bev, Worker *owner)
     : need_free_bev_(true), bev_(bev), req_(owner->srv, this), owner_(owner), srv_(owner->srv) {
   int64_t now = util::GetTimeStamp();
   create_time_ = now;
-  last_interaction_ = now;
+  last_interaction_.store(now, std::memory_order_relaxed);
 }
 
 Connection::~Connection() {
@@ -68,10 +68,43 @@ Connection::~Connection() {
   SUnsubscribeAll();
 }
 
-std::string Connection::ToString() {
+std::string Connection::ToString() { return FormatClientInfo(GetClientInfo(true)); }
+
+Connection::ClientInfo Connection::GetClientInfo(bool include_buffers) const {
+  ClientInfo info;
+  info.id = GetID();
+  info.type = GetClientType();
+  info.flags = GetFlags();
+  info.age = GetAge();
+  info.idle = GetIdleTime();
+  info.close_after_reply = IsFlagEnabled(kCloseAfterReply);
+  info.is_slave = IsFlagEnabled(kSlave);
+  info.is_monitor = IsFlagEnabled(kMonitor);
+  info.worker = owner_->GetIndex();
+  info.fd = bufferevent_getfd(bev_);
+
+  std::lock_guard<std::mutex> lock(client_mu_);
+  info.addr = addr_;
+  info.name = name_;
+  info.ns = ns_;
+  info.last_cmd = last_cmd_;
+  if (!announce_ip_.empty()) {
+    info.announce_addr = announce_ip_ + ":" + std::to_string(GetAnnouncePort());
+  } else {
+    info.announce_addr = addr_;
+  }
+
+  if (include_buffers) {
+    info.qbuf = evbuffer_get_length(bufferevent_get_input(bev_));
+    info.obuf = evbuffer_get_length(bufferevent_get_output(bev_));
+  }
+  return info;
+}
+
+std::string Connection::FormatClientInfo(const ClientInfo &info) {
   return fmt::format("id={} addr={} fd={} name={} age={} idle={} flags={} namespace={} qbuf={} obuf={} cmd={} worker={}\n",
-                     id_, addr_, bufferevent_getfd(bev_), name_, GetAge(), GetIdleTime(), GetFlags(), ns_,
-                     evbuffer_get_length(Input()), evbuffer_get_length(Output()), last_cmd_, owner_->GetIndex());
+                     info.id, info.addr, info.fd, info.name, info.age, info.idle, info.flags, info.ns, info.qbuf,
+                     info.obuf, info.last_cmd, info.worker);
 }
 
 void Connection::Close() {
@@ -162,28 +195,80 @@ void Connection::SendFile(int fd) {
 }
 
 void Connection::SetAddr(std::string ip, uint32_t port) {
+  std::lock_guard<std::mutex> lock(client_mu_);
   ip_ = std::move(ip);
-  port_ = port;
-  addr_ = ip_ + ":" + std::to_string(port_);
+  port_.store(port, std::memory_order_relaxed);
+  addr_ = ip_ + ":" + std::to_string(port);
 }
 
 void Connection::SetNamespace(std::string ns) {
-  // Count only on first authentication (ns_ was empty, new ns is not empty)
-  // Atomic compare_exchange prevents TOCTOU race on connection_counted_
-  if (!ns.empty() && ns_.empty()) {
-    bool expected = false;
-    if (connection_counted_.compare_exchange_strong(expected, true)) {
-      owner_->IncrConnectionsForNamespace(ns);
+  bool should_count = false;
+  std::string ns_for_stats;
+  {
+    std::lock_guard<std::mutex> lock(client_mu_);
+    // Count only on first authentication (ns_ was empty, new ns is not empty)
+    // Atomic compare_exchange prevents TOCTOU race on connection_counted_
+    if (!ns.empty() && ns_.empty()) {
+      bool expected = false;
+      if (connection_counted_.compare_exchange_strong(expected, true)) {
+        should_count = true;
+        ns_for_stats = ns;
+      }
     }
+    ns_ = std::move(ns);
   }
-  ns_ = std::move(ns);
+  if (should_count) {
+    owner_->IncrConnectionsForNamespace(ns_for_stats);
+  }
 }
 
 uint64_t Connection::GetAge() const { return static_cast<uint64_t>(util::GetTimeStamp() - create_time_); }
 
-void Connection::SetLastInteraction() { last_interaction_ = util::GetTimeStamp(); }
+void Connection::SetLastInteraction() { last_interaction_.store(util::GetTimeStamp(), std::memory_order_relaxed); }
 
-uint64_t Connection::GetIdleTime() const { return static_cast<uint64_t>(util::GetTimeStamp() - last_interaction_); }
+uint64_t Connection::GetIdleTime() const {
+  return static_cast<uint64_t>(util::GetTimeStamp() - last_interaction_.load(std::memory_order_relaxed));
+}
+
+std::string Connection::GetName() const {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  return name_;
+}
+
+void Connection::SetName(std::string name) {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  name_ = std::move(name);
+}
+
+std::string Connection::GetAddr() const {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  return addr_;
+}
+
+void Connection::SetLastCmd(std::string cmd) {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  last_cmd_ = std::move(cmd);
+}
+
+std::string Connection::GetIP() const {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  return ip_;
+}
+
+void Connection::SetAnnounceIP(std::string ip) {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  announce_ip_ = std::move(ip);
+}
+
+std::string Connection::GetAnnounceIP() const {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  return !announce_ip_.empty() ? announce_ip_ : ip_;
+}
+
+std::string Connection::GetAnnounceAddr() const {
+  auto announce_ip = GetAnnounceIP();
+  return announce_ip + ":" + std::to_string(GetAnnouncePort());
+}
 
 // Currently, master connection is not handled in connection
 // but in replication thread.

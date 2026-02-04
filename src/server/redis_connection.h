@@ -23,8 +23,10 @@
 #include <event2/buffer.h>
 
 #include <atomic>
+#include <cstddef>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
@@ -41,6 +43,26 @@ namespace redis {
 
 class Connection : public EvbufCallbackBase<Connection> {
  public:
+  struct ClientInfo {
+    uint64_t id = 0;
+    uint64_t type = 0;
+    std::string addr;
+    std::string announce_addr;
+    std::string name;
+    std::string ns;
+    std::string last_cmd;
+    std::string flags;
+    uint64_t age = 0;
+    uint64_t idle = 0;
+    int fd = -1;
+    size_t qbuf = 0;
+    size_t obuf = 0;
+    bool close_after_reply = false;
+    bool is_slave = false;
+    bool is_monitor = false;
+    uint32_t worker = 0;
+  };
+
   enum Flag {
     kSlave = 1 << 4,
     kMonitor = 1 << 5,
@@ -70,6 +92,8 @@ class Connection : public EvbufCallbackBase<Connection> {
   void OnEvent(bufferevent *bev, int16_t events);
   void SendFile(int fd);
   std::string ToString();
+  ClientInfo GetClientInfo(bool include_buffers = false) const;
+  static std::string FormatClientInfo(const ClientInfo &info);
 
   void Reply(const std::string &msg);
   const std::vector<std::string> &GetQueuedReplies() const;
@@ -134,21 +158,27 @@ class Connection : public EvbufCallbackBase<Connection> {
   void DisableFlag(Flag flag);
   bool IsFlagEnabled(Flag flag) const;
 
-  uint64_t GetID() const { return id_; }
-  void SetID(uint64_t id) { id_ = id; }
-  std::string GetName() const { return name_; }
-  void SetName(std::string name) { name_ = std::move(name); }
-  std::string GetAddr() const { return addr_; }
+  uint64_t GetID() const { return id_.load(std::memory_order_relaxed); }
+  void SetID(uint64_t id) { id_.store(id, std::memory_order_relaxed); }
+  std::string GetName() const;
+  void SetName(std::string name);
+  std::string GetAddr() const;
   void SetAddr(std::string ip, uint32_t port);
-  void SetLastCmd(std::string cmd) { last_cmd_ = std::move(cmd); }
-  std::string GetIP() const { return ip_; }
-  uint32_t GetPort() const { return port_; }
-  void SetListeningPort(int port) { listening_port_ = port; }
-  int GetListeningPort() const { return listening_port_; }
-  void SetAnnounceIP(std::string ip) { announce_ip_ = std::move(ip); }
-  std::string GetAnnounceIP() const { return !announce_ip_.empty() ? announce_ip_ : ip_; }
-  uint32_t GetAnnouncePort() const { return listening_port_ != 0 ? listening_port_ : port_; }
-  std::string GetAnnounceAddr() const { return GetAnnounceIP() + ":" + std::to_string(GetAnnouncePort()); }
+  void SetLastCmd(std::string cmd);
+  std::string GetIP() const;
+  uint32_t GetPort() const { return port_.load(std::memory_order_relaxed); }
+  void SetListeningPort(int port) { listening_port_.store(port, std::memory_order_relaxed); }
+  int GetListeningPort() const { return listening_port_.load(std::memory_order_relaxed); }
+  void SetAnnounceIP(std::string ip);
+  std::string GetAnnounceIP() const;
+  uint32_t GetAnnouncePort() const {
+    auto listening_port = listening_port_.load(std::memory_order_relaxed);
+    if (listening_port != 0) {
+      return static_cast<uint32_t>(listening_port);
+    }
+    return port_.load(std::memory_order_relaxed);
+  }
+  std::string GetAnnounceAddr() const;
   uint64_t GetClientType() const;
   Server *GetServer() { return srv_; }
 
@@ -199,22 +229,23 @@ class Connection : public EvbufCallbackBase<Connection> {
   ReplyMode GetReplyMode() const { return reply_mode_; }
 
  private:
-  uint64_t id_ = 0;
+  std::atomic<uint64_t> id_{0};
   std::atomic<int> flags_ = 0;
+  mutable std::mutex client_mu_;
   std::string ns_;  // Empty before AUTH, set via SetNamespace() after successful auth
   std::string sni_;  // SNI hostname or peer IP for fair scheduling
   std::atomic<bool> connection_counted_{false};  // Atomic to prevent TOCTOU race
   std::string name_;
   std::string ip_;
   std::string announce_ip_;
-  uint32_t port_ = 0;
+  std::atomic<uint32_t> port_{0};
   std::string addr_;
-  int listening_port_ = 0;
+  std::atomic<int> listening_port_{0};
   bool is_admin_ = false;
   bool need_free_bev_ = true;
   std::string last_cmd_;
   int64_t create_time_;
-  int64_t last_interaction_;
+  std::atomic<int64_t> last_interaction_{0};
 
   bufferevent *bev_;
   Request req_;
