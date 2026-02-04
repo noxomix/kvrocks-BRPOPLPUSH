@@ -194,13 +194,13 @@
   - Fix: bounded Retry (1x/1ms) in `ExtractSNIFromClientHello()`, plus "voller TLS-Record ohne SNI" fast-exit
 
 ### Hoch - FairScheduler (SNI) Throughput Rework (2026-02-04)
-- [ ] **Concentration-Gating entfernen**: keine "Worker erst ab N Connections freischalten" Logik mehr (`needed_for_load`, `sni-connections-per-worker`, `sni-min-workers`)
-- [ ] **Fair Pool strikt ueber Share+Overdraft**: pro SNI `fair_share` als Basis, optional `overdraft` als Burst-Kapazitaet; Round-Robin ueber den zugewiesenen Pool
-- [ ] **2-Phasen Auswahl im Hot Path**: zuerst innerhalb Fair-Share Pool, nur bei Block/Backpressure auf Overdraft-Bereich ausweichen
+- [x] **Concentration-Gating entfernen**: keine "Worker erst ab N Connections freischalten" Logik mehr (`needed_for_load`, `sni-connections-per-worker`, `sni-min-workers`)
+- [x] **Fair Pool strikt ueber Share+Overdraft**: pro SNI `fair_share` als Basis, optional `overdraft` als Burst-Kapazitaet; Round-Robin ueber den zugewiesenen Pool
+- [x] **2-Phasen Auswahl im Hot Path**: zuerst innerhalb Fair-Share Pool, nur bei Block/Backpressure auf Overdraft-Bereich ausweichen
 - [ ] **Lock/Allocation-freier Accept-Hot-Path behalten**: keine per-accept Mutex- oder Rebuild-Kosten
-- [ ] **Config-Bereinigung**: alte Konzentrations-Parameter als deprecated/no-op markieren oder durch neues, klareres Modell ersetzen
+- [x] **Config-Bereinigung**: alte Konzentrations-Parameter entfernt; nur `sni-max-workers-percent` + `sni-overdraft-percent`
 - [ ] **Observability ergaenzen**: INFO/Debug Sicht auf `active_snis`, `fair_share`, `overdraft_limit`, `target_pool_size` pro SNI
-- [ ] **Tests erweitern**:
+- [x] **Tests erweitern**:
   - non-TLS single-key (`default.domain`) verteilt frueh breit statt auf wenige Worker zu konzentrieren
   - Multi-SNI Fairness bleibt erhalten (kein Starvation)
   - Lua-blocked Worker werden weiterhin vermieden
@@ -228,6 +228,11 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 - [ ] **Subscribed-Mode Guard fehlt** → auf abonnierter Connection sind Nicht-PubSub-Commands aktuell nicht strikt geblockt (RESP2/Kompatibilitaet)
 - [x] **RESET unvollstaendig fuer PubSub** → `RESET` ruft jetzt auch `SUnsubscribeAll()` auf
 - [x] **Client-Type unvollstaendig** → `GetClientType()/GetFlags()/CanMigrate()` beruecksichtigen `SSUBSCRIBE`
+
+### Niedrig - Concurrency Follow-up
+- [ ] **GetClientInfo Lock-Zeit verkuerzen** → in `GetClientInfo(true)` `client_mu_` nicht waehrend Buffer-Reads (`OutputBufferSize()/InputBufferSize()`) halten
+- [ ] **KillClient Lock-Reacquire reduzieren** → Kandidaten pro Worker gruppieren und nicht pro Kandidat `conns_mu_` neu locken
+- [ ] **GetNamespace API haerten** → `GetNamespace()` liefert `const std::string&`; fuer cross-thread-safe Nutzung auf Snapshot/Kopie umstellen
 
 **Bereits geschützt:**
 - [x] SORT - Hat `SORT_LENGTH_LIMIT = 512` (`redis_db.h:39`)
@@ -266,13 +271,11 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
     - **Limitierung:** SCRIPT KILL funktioniert nur von NEUER Connection (bestehende Connection auf blockiertem Worker kann nichts senden)
   - **Phase 3 - SNI-basiertes Fair Scheduling (DONE):**
     - [x] Config-Optionen in `config.h/cc`:
-      - `sni-connections-per-worker` (Default: 10) - Konzentration
-      - `sni-min-workers` (Default: 2) - Minimum pro SNI
       - `sni-max-workers-percent` (Default: 0 = auto) - Maximum
       - `sni-overdraft-percent` (Default: 30) - Überziehung im Burst
     - [x] `FairScheduler` Klasse (`fair_scheduler.h/cc`)
     - [x] SNI-Extraktion aus TLS ClientHello (`tls_util.h/cc`)
-    - [x] `SelectWorker(sni)` mit Fair Share + Konzentration + Overdraft
+    - [x] `SelectWorker(sni)` mit Fair Share + Overdraft
     - [x] Connection Tracking (`OnConnectionClosed()`)
     - [x] `CleanupInactiveSNIs()` in Server::cron() eingehängt
     - [ ] Go-Tests für Fair Scheduling

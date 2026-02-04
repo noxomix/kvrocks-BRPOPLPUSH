@@ -51,6 +51,25 @@ func extractWorkerIDs(clientList string) []int {
 	return workerIDs
 }
 
+func extractWorkerIDsByNamePrefix(clientList, prefix string) []int {
+	var workerIDs []int
+	re := regexp.MustCompile(`worker=(\d+)`)
+	lines := strings.Split(strings.TrimSpace(clientList), "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "name="+prefix) {
+			continue
+		}
+		matches := re.FindStringSubmatch(line)
+		if len(matches) == 2 {
+			id, err := strconv.Atoi(matches[1])
+			if err == nil {
+				workerIDs = append(workerIDs, id)
+			}
+		}
+	}
+	return workerIDs
+}
+
 // countUniqueWorkers counts unique worker IDs
 func countUniqueWorkers(ids []int) int {
 	seen := make(map[int]bool)
@@ -69,19 +88,9 @@ func TestFairSchedulerConfig(t *testing.T) {
 	defer func() { require.NoError(t, rdb.Close()) }()
 
 	t.Run("SNI config parameters are gettable and settable", func(t *testing.T) {
-		// Test sni-connections-per-worker
-		require.NoError(t, rdb.ConfigSet(ctx, "sni-connections-per-worker", "20").Err())
-		val := rdb.ConfigGet(ctx, "sni-connections-per-worker").Val()
-		require.Equal(t, "20", val["sni-connections-per-worker"])
-
-		// Test sni-min-workers
-		require.NoError(t, rdb.ConfigSet(ctx, "sni-min-workers", "3").Err())
-		val = rdb.ConfigGet(ctx, "sni-min-workers").Val()
-		require.Equal(t, "3", val["sni-min-workers"])
-
 		// Test sni-max-workers-percent
 		require.NoError(t, rdb.ConfigSet(ctx, "sni-max-workers-percent", "50").Err())
-		val = rdb.ConfigGet(ctx, "sni-max-workers-percent").Val()
+		val := rdb.ConfigGet(ctx, "sni-max-workers-percent").Val()
 		require.Equal(t, "50", val["sni-max-workers-percent"])
 
 		// Test sni-overdraft-percent
@@ -100,13 +109,7 @@ func TestFairSchedulerConfigDefaults(t *testing.T) {
 	rdb := srv.NewClient()
 	defer func() { require.NoError(t, rdb.Close()) }()
 
-	val := rdb.ConfigGet(ctx, "sni-connections-per-worker").Val()
-	require.Equal(t, "10", val["sni-connections-per-worker"])
-
-	val = rdb.ConfigGet(ctx, "sni-min-workers").Val()
-	require.Equal(t, "2", val["sni-min-workers"])
-
-	val = rdb.ConfigGet(ctx, "sni-max-workers-percent").Val()
+	val := rdb.ConfigGet(ctx, "sni-max-workers-percent").Val()
 	require.Equal(t, "0", val["sni-max-workers-percent"])
 
 	val = rdb.ConfigGet(ctx, "sni-overdraft-percent").Val()
@@ -115,10 +118,8 @@ func TestFairSchedulerConfigDefaults(t *testing.T) {
 
 func TestFairSchedulerWorkerDistribution(t *testing.T) {
 	srv := util.StartServer(t, map[string]string{
-		"workers":                    "8",
-		"sni-connections-per-worker": "5",
-		"sni-min-workers":            "2",
-		"sni-overdraft-percent":      "30",
+		"workers":               "8",
+		"sni-overdraft-percent": "30",
 	})
 	defer srv.Close()
 
@@ -143,10 +144,10 @@ func TestFairSchedulerWorkerDistribution(t *testing.T) {
 		tc.MustRead(t, "+PONG")
 	})
 
-	t.Run("Multiple connections from same IP concentrate on fewer workers", func(t *testing.T) {
-		// Create 10 connections from localhost
-		conns := make([]*redis.Client, 10)
-		for i := 0; i < 10; i++ {
+	t.Run("Multiple connections from same IP spread across workers", func(t *testing.T) {
+		// Create 16 connections from localhost (single scheduling key: default.domain)
+		conns := make([]*redis.Client, 16)
+		for i := 0; i < 16; i++ {
 			conns[i] = srv.NewClient()
 			require.NoError(t, conns[i].Ping(ctx).Err())
 		}
@@ -160,13 +161,11 @@ func TestFairSchedulerWorkerDistribution(t *testing.T) {
 		list := conns[0].ClientList(ctx).Val()
 		workerIDs := extractWorkerIDs(list)
 
-		// With sni-connections-per-worker=5, sni-min-workers=2, overdraft=30%
-		// 10 connections should be on 2-3 workers (not all 8)
 		unique := countUniqueWorkers(workerIDs)
 
-		// Allow some flexibility - should be concentrated, not spread across all workers
-		require.LessOrEqual(t, unique, 5,
-			"10 connections should concentrate on 2-5 workers (fair scheduler), got %d unique workers from IDs: %v",
+		// With no concentration gating, single-key traffic should fan out early.
+		require.GreaterOrEqual(t, unique, 6,
+			"16 connections should spread to >=6 workers, got %d unique workers from IDs: %v",
 			unique, workerIDs)
 	})
 }
@@ -226,10 +225,8 @@ func TestFairSchedulerLuaAvoidance(t *testing.T) {
 func TestFairSchedulerMultiTenant(t *testing.T) {
 	password := "adminpwd"
 	srv := util.StartServer(t, map[string]string{
-		"requirepass":                password,
-		"workers":                    "8",
-		"sni-connections-per-worker": "5",
-		"sni-min-workers":            "2",
+		"requirepass": password,
+		"workers":     "8",
 	})
 	defer srv.Close()
 
@@ -291,10 +288,8 @@ func TestFairSchedulerSNIDistribution(t *testing.T) {
 
 	// Start TLS server with auto-generated certs supporting these SNIs
 	srv, caCertPath := util.StartTLSServerWithSNIs(t, map[string]string{
-		"workers":                    "8",
-		"sni-connections-per-worker": "5",
-		"sni-min-workers":            "2",
-		"sni-overdraft-percent":      "30",
+		"workers":               "8",
+		"sni-overdraft-percent": "30",
 	}, sniHosts)
 	defer srv.Close()
 
@@ -317,8 +312,9 @@ func TestFairSchedulerSNIDistribution(t *testing.T) {
 		sni1Conns := make([]*redis.Client, 5)
 		for i := 0; i < 5; i++ {
 			sni1Conns[i] = srv.NewClientWithOption(&redis.Options{
-				Addr:      srv.TLSAddr(),
-				TLSConfig: tlsConfig1,
+				Addr:       srv.TLSAddr(),
+				TLSConfig:  tlsConfig1,
+				ClientName: fmt.Sprintf("sni1-%d", i),
 			})
 			require.NoError(t, sni1Conns[i].Ping(ctx).Err())
 		}
@@ -332,8 +328,9 @@ func TestFairSchedulerSNIDistribution(t *testing.T) {
 		sni2Conns := make([]*redis.Client, 5)
 		for i := 0; i < 5; i++ {
 			sni2Conns[i] = srv.NewClientWithOption(&redis.Options{
-				Addr:      srv.TLSAddr(),
-				TLSConfig: tlsConfig2,
+				Addr:       srv.TLSAddr(),
+				TLSConfig:  tlsConfig2,
+				ClientName: fmt.Sprintf("sni2-%d", i),
 			})
 			require.NoError(t, sni2Conns[i].Ping(ctx).Err())
 		}
@@ -345,26 +342,26 @@ func TestFairSchedulerSNIDistribution(t *testing.T) {
 
 		// Get worker IDs for SNI 1 connections
 		sni1List := sni1Conns[0].ClientList(ctx).Val()
-		sni1Workers := extractWorkerIDs(sni1List)
+		sni1Workers := extractWorkerIDsByNamePrefix(sni1List, "sni1-")
 		t.Logf("SNI %s connections on workers: %v", sni1, sni1Workers)
 
 		// Get worker IDs for SNI 2 connections
 		sni2List := sni2Conns[0].ClientList(ctx).Val()
-		sni2Workers := extractWorkerIDs(sni2List)
+		sni2Workers := extractWorkerIDsByNamePrefix(sni2List, "sni2-")
 		t.Logf("SNI %s connections on workers: %v", sni2, sni2Workers)
 
 		// Both should have worker= field
 		require.NotEmpty(t, sni1Workers, "SNI 1 should have worker IDs")
 		require.NotEmpty(t, sni2Workers, "SNI 2 should have worker IDs")
 
-		// Each SNI group should be concentrated (not all 8 workers)
+		// Each SNI group should stay within fair-share+overdraft range.
 		unique1 := countUniqueWorkers(sni1Workers)
 		unique2 := countUniqueWorkers(sni2Workers)
 
-		require.LessOrEqual(t, unique1, 4,
-			"SNI %s should concentrate on <=4 workers, got %d", sni1, unique1)
-		require.LessOrEqual(t, unique2, 4,
-			"SNI %s should concentrate on <=4 workers, got %d", sni2, unique2)
+		require.LessOrEqual(t, unique1, 5,
+			"SNI %s should use <=5 workers (4 fair + 30%% overdraft), got %d", sni1, unique1)
+		require.LessOrEqual(t, unique2, 5,
+			"SNI %s should use <=5 workers (4 fair + 30%% overdraft), got %d", sni2, unique2)
 	})
 
 	t.Run("TLS connection with SNI works", func(t *testing.T) {
@@ -386,24 +383,22 @@ func TestFairSchedulerSNIDistribution(t *testing.T) {
 	})
 }
 
-func TestFairSchedulerSNIConcentration(t *testing.T) {
+func TestFairSchedulerSNIWideDistribution(t *testing.T) {
 	sniHosts := []string{"localhost", "test.local"}
 
 	srv, caCertPath := util.StartTLSServerWithSNIs(t, map[string]string{
-		"workers":                    "8",
-		"sni-connections-per-worker": "3", // Low threshold for concentration
-		"sni-min-workers":            "2",
-		"sni-overdraft-percent":      "0", // No overdraft
+		"workers":               "8",
+		"sni-overdraft-percent": "0", // pure fair-share
 	}, sniHosts)
 	defer srv.Close()
 
 	ctx := context.Background()
 
-	t.Run("Connections concentrate based on sni-connections-per-worker", func(t *testing.T) {
+	t.Run("Single SNI spreads without concentration gating", func(t *testing.T) {
 		tlsConfig, err := util.TLSConfigWithSNI("localhost", caCertPath)
 		require.NoError(t, err)
 
-		// Create 6 connections (should need ceil(6/3)=2 workers)
+		// Create 6 connections. Without concentration gating, these should spread.
 		conns := make([]*redis.Client, 6)
 		for i := 0; i < 6; i++ {
 			conns[i] = srv.NewClientWithOption(&redis.Options{
@@ -418,17 +413,15 @@ func TestFairSchedulerSNIConcentration(t *testing.T) {
 			}
 		}()
 
-		// Check concentration
+		// Check spread
 		list := conns[0].ClientList(ctx).Val()
 		workerIDs := extractWorkerIDs(list)
 		unique := countUniqueWorkers(workerIDs)
 
 		t.Logf("6 connections on %d unique workers: %v", unique, workerIDs)
 
-		// With 3 connections per worker, 6 connections should use ~2 workers
-		// Allow some flexibility (2-3 workers)
-		require.LessOrEqual(t, unique, 3,
-			"6 connections with 3/worker should use 2-3 workers, got %d", unique)
+		require.GreaterOrEqual(t, unique, 5,
+			"6 connections should spread to >=5 workers, got %d", unique)
 	})
 }
 

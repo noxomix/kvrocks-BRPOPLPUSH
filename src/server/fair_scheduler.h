@@ -34,8 +34,6 @@ struct Config;
 
 // Configuration for SNI-based fair scheduling
 struct FairSchedulerConfig {
-  uint32_t connections_per_worker = 10;  // Concentration threshold
-  uint32_t min_workers = 2;              // Minimum workers per SNI
   uint32_t max_workers_percent = 0;      // 0 = auto (workers/active_snis)
   uint32_t overdraft_percent = 30;       // Burst allowance
 
@@ -108,15 +106,15 @@ class FairScheduler {
   // Compute max workers (fair share + overdraft + config clamp)
   uint32_t GetMaxWorkerCount(uint32_t total_workers, uint32_t active_snis) const;
 
-  // Calculate target worker count for SNI based on config
-  uint32_t GetTargetWorkerCount(const SNIState* state, uint32_t total_workers, uint32_t active_snis) const;
+  // Fair-share workers for first-pass round-robin (without concentration gating)
+  uint32_t GetFairWorkerCount(uint32_t total_workers, uint32_t active_snis) const;
 
   // Refresh preferred workers for SNI when fair share/topology changed
   void RefreshPreferredWorkers(SNIState* state, uint32_t total_workers, uint32_t active_snis);
 
   // Select worker from preferred list
   std::shared_ptr<Worker> SelectFromPreferred(
-      SNIState* state, uint32_t target_count,
+      SNIState* state, uint32_t fair_count,
       const std::shared_ptr<std::vector<std::shared_ptr<Worker>>>& snapshot);
 
   // Fallback: select any accepting worker (does NOT modify preferred_workers)
