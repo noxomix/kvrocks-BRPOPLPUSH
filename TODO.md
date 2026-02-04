@@ -174,8 +174,8 @@
 - [ ] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` lesen `Connection`-Felder ohne Atomics/Lock
 - [x] **PubSub Subscribe-State Race (UB)** → geloest via atomare Subscribe-Counter (cross-thread Leser ohne Vektorzugriff)
 - [x] **FD-Reuse Misrouting (PubSub/Blocking/Streams/WAIT)** → async Reply/Wakeup jetzt via `(fd + conn_id)` validiert
-- [ ] **DBScan Map Race** → `db_scan_infos_` read ohne Lock (`GetLatestKeyNumStats/GetLastScanTime`)
-- [ ] **BGSAVE/Compact Flags Race** → `is_bgsave_in_progress_`, `db_compacting_`, `last_bgsave_*` read ohne Lock (INFO)
+- [x] **DBScan Map Race** → `db_scan_infos_` reads jetzt immer unter `db_job_mu_` (GetLatestKeyNumStats/GetLastScanTime)
+- [x] **BGSAVE/Compact Flags Race** → INFO/Persistence reads unter `db_job_mu_`; async `TryPublish`-Fehler rollen Flags sauber zurueck
 - [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
 - [ ] **TLS Repl SSL Race** → `SSL_read` (worker) + `SSL_write` (feed thread) auf gleicher SSL*
 

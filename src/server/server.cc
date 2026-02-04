@@ -1466,10 +1466,11 @@ Server::InfoEntries Server::GetRocksDBInfo() {
   entries.emplace_back("seek_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_ROCKSDB_SEEK));
   entries.emplace_back("next_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_ROCKSDB_NEXT));
   entries.emplace_back("prev_per_sec", stats.GetInstantaneousMetric(STATS_METRIC_ROCKSDB_PREV));
-  db_job_mu_.lock();
-  entries.emplace_back("is_bgsaving", (is_bgsave_in_progress_ ? "yes" : "no"));
-  entries.emplace_back("is_compacting", (db_compacting_ ? "yes" : "no"));
-  db_job_mu_.unlock();
+  {
+    std::lock_guard<std::mutex> lg(db_job_mu_);
+    entries.emplace_back("is_bgsaving", (is_bgsave_in_progress_ ? "yes" : "no"));
+    entries.emplace_back("is_compacting", (db_compacting_ ? "yes" : "no"));
+  }
 
   return entries;
 }
@@ -2070,8 +2071,7 @@ Status Server::AsyncCompactDB(const std::string &begin_key, const std::string &e
   }
 
   db_compacting_ = true;
-
-  return task_runner_.TryPublish([begin_key, end_key, this] {
+  auto publish_status = task_runner_.TryPublish([begin_key, end_key, this] {
     std::unique_ptr<Slice> begin = nullptr, end = nullptr;
     if (!begin_key.empty()) begin = std::make_unique<Slice>(begin_key);
     if (!end_key.empty()) end = std::make_unique<Slice>(end_key);
@@ -2084,6 +2084,10 @@ Status Server::AsyncCompactDB(const std::string &begin_key, const std::string &e
     std::lock_guard<std::mutex> lg(db_job_mu_);
     db_compacting_ = false;
   });
+  if (!publish_status.IsOK()) {
+    db_compacting_ = false;
+  }
+  return publish_status;
 }
 
 Status Server::AsyncBgSaveDB() {
@@ -2093,8 +2097,7 @@ Status Server::AsyncBgSaveDB() {
   }
 
   is_bgsave_in_progress_ = true;
-
-  return task_runner_.TryPublish([this] {
+  auto publish_status = task_runner_.TryPublish([this] {
     auto start_bgsave_time_secs = util::GetTimeStamp<std::chrono::seconds>();
     Status s = storage->CreateBackup();
     auto stop_bgsave_time_secs = util::GetTimeStamp<std::chrono::seconds>();
@@ -2105,6 +2108,10 @@ Status Server::AsyncBgSaveDB() {
     last_bgsave_status_ = s.IsOK() ? "ok" : "err";
     last_bgsave_duration_secs_ = stop_bgsave_time_secs - start_bgsave_time_secs;
   });
+  if (!publish_status.IsOK()) {
+    is_bgsave_in_progress_ = false;
+  }
+  return publish_status;
 }
 
 Status Server::AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours) {
@@ -2125,8 +2132,7 @@ Status Server::AsyncScanDBSize(const std::string &ns) {
   }
 
   db_scan_infos_[ns].is_scanning = true;
-
-  return task_runner_.TryPublish([ns, this] {
+  auto publish_status = task_runner_.TryPublish([ns, this] {
     redis::Database db(storage, ns);
 
     KeyNumStats stats;
@@ -2142,12 +2148,16 @@ Status Server::AsyncScanDBSize(const std::string &ns) {
     db_scan_infos_[ns].last_scan_time_secs = util::GetTimeStamp();
     db_scan_infos_[ns].is_scanning = false;
   });
+  if (!publish_status.IsOK()) {
+    db_scan_infos_[ns].is_scanning = false;
+  }
+  return publish_status;
 }
 
 void Server::GetLatestKeyNumStats(const std::string &ns, KeyNumStats *stats) {
+  std::lock_guard<std::mutex> lg(db_job_mu_);
   auto iter = db_scan_infos_.find(ns);
   if (iter != db_scan_infos_.end()) {
-    std::lock_guard<std::mutex> lg(db_job_mu_);
     *stats = iter->second.key_num_stats;
   }
 }
