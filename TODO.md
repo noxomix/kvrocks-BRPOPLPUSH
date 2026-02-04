@@ -177,7 +177,7 @@
 - [x] **DBScan Map Race** → `db_scan_infos_` reads jetzt immer unter `db_job_mu_` (GetLatestKeyNumStats/GetLastScanTime)
 - [x] **BGSAVE/Compact Flags Race** → INFO/Persistence reads unter `db_job_mu_`; async `TryPublish`-Fehler rollen Flags sauber zurueck
 - [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
-- [ ] **TLS Repl SSL Race** → `SSL_read` (worker) + `SSL_write` (feed thread) auf gleicher SSL*
+- [x] **TLS Repl SSL Race** → Feed-Thread pausiert `EV_READ` unter `bufferevent`-Lock waehrend TLS-Send (kein paralleles `SSL_read`/`SSL_write` auf gleicher SSL-Session)
 
 ### Hoch - FairScheduler (SNI)
 - [x] **UAF Risk:** `CleanupInactiveSNIs()` loescht `SNIState` waehrend `SelectWorker()` mit rohem Pointer arbeitet
@@ -204,10 +204,6 @@
   - non-TLS single-key (`default.domain`) verteilt frueh breit statt auf wenige Worker zu konzentrieren
   - Multi-SNI Fairness bleibt erhalten (kein Starvation)
   - Lua-blocked Worker werden weiterhin vermieden
-- [ ] **Perf-Abnahme mit memtier**:
-  - A/B gegen Build von vorgestern (gleiche Docker-Umgebung)
-  - Ziel: Write-RPS wieder Richtung historischer ~6000 statt ~2500
-
 ### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
 
 **Problem:** Diese Commands blockieren einen Worker während der gesamten Iteration.

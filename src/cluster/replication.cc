@@ -57,6 +57,32 @@
 #include <openssl/ssl.h>
 #endif
 
+namespace {
+
+// FeedSlaveThread writes to a detached replication connection from a dedicated thread.
+// For TLS connections, the worker event loop may concurrently run SSL_read on the same SSL*.
+// We pause EV_READ under the bufferevent lock before SSL_write to avoid cross-thread SSL races.
+Status SockSendReplicaSafe(redis::Connection *conn, const std::string &data) {
+  auto *bev = conn->GetBufferEvent();
+#ifdef ENABLE_OPENSSL
+  if (bufferevent_openssl_get_ssl(bev) != nullptr) {
+    bufferevent_lock(bev);
+    bufferevent_disable(bev, EV_READ);
+    bufferevent_unlock(bev);
+
+    auto resume_read = MakeScopeExit([bev] {
+      bufferevent_lock(bev);
+      bufferevent_enable(bev, EV_READ);
+      bufferevent_unlock(bev);
+    });
+    return util::SockSend(conn->GetFD(), data, bev);
+  }
+#endif
+  return util::SockSend(conn->GetFD(), data, bev);
+}
+
+}  // namespace
+
 FeedSlaveThread::FeedSlaveThread(Server *srv, redis::Connection *conn, rocksdb::SequenceNumber next_repl_seq)
     : srv_(srv),
       conn_(conn),
@@ -74,7 +100,7 @@ Status FeedSlaveThread::Start() {
     sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &mask, &omask);
-    auto s = util::SockSend(conn_->GetFD(), redis::RESP_OK, conn_->GetBufferEvent());
+    auto s = SockSendReplicaSafe(conn_.get(), redis::RESP_OK);
     if (!s.IsOK()) {
       error("failed to send OK response to the replica: {}", s.Msg());
       return;
@@ -110,7 +136,7 @@ void FeedSlaveThread::Join() {
 void FeedSlaveThread::checkLivenessIfNeed() {
   if (++interval_ % 1000) return;
   const auto ping_command = redis::BulkString("ping");
-  auto s = util::SockSend(conn_->GetFD(), ping_command, conn_->GetBufferEvent());
+  auto s = SockSendReplicaSafe(conn_.get(), ping_command);
   if (!s.IsOK()) {
     error("Ping slave [{}] err: {}, would stop the thread", conn_->GetAddr(), s.Msg());
     Stop();
@@ -222,7 +248,7 @@ void FeedSlaveThread::loop() {
       }
 
       // Send entire bulk which contain multiple batches
-      auto s = util::SockSend(conn_->GetFD(), batches_bulk, conn_->GetBufferEvent());
+      auto s = SockSendReplicaSafe(conn_.get(), batches_bulk);
       if (!s.IsOK()) {
         error("Write error while sending batch to slave: {}. batches: 0x{}", s.Msg(), util::StringToHex(batches_bulk));
         Stop();
