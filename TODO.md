@@ -222,6 +222,7 @@ Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && 
 - [ ] **GetClientInfo Lock-Zeit** - `client_mu_` nicht während Buffer-Reads halten
 - [ ] **KillClient Lock-Reacquire** - Kandidaten pro Worker gruppieren
 - [ ] **GetNamespace API** - cross-thread-safe Snapshot/Kopie
+- [x] **OnRead Yield/Quota** - Long Pipelines blockieren Worker: pro Tick max N Commands oder Zeitbudget, dann via event reschedulen; Re-Entry-Guard (`is_running_`), Backpressure (EV_READ off/on), kein Yield innerhalb EXEC
 
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
@@ -245,6 +246,9 @@ TODO später:
 ```
 
 ### Ideen
+
+**Worker-Fairness bei langen Pipelines:**
+Implementiert: Yield/Quota in `Connection::OnRead()` (max N Commands oder Zeitbudget), Reschedule via Event; Backpressure (EV_READ off/on), kein Yield innerhalb EXEC.
 
 **Response-Size pro Namespace begrenzen:**
 Problem mit HGETALL/HSET mit Milliarden Elementen - am Ende iteriert man über große Datenstrukturen.

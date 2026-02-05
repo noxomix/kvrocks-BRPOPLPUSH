@@ -53,6 +53,7 @@ class Request {
 
   // Parse the redis requests (bulk string array format)
   Status Tokenize(evbuffer *input);
+  Status Tokenize(evbuffer *input, size_t max_commands);
 
   std::deque<CommandTokens> *GetCommands() { return &commands_; }
 

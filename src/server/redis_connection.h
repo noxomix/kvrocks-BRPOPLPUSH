@@ -203,7 +203,10 @@ class Connection : public EvbufCallbackBase<Connection> {
   evbuffer *Input() { return bufferevent_get_input(bev_); }
   evbuffer *Output() { return bufferevent_get_output(bev_); }
   bufferevent *GetBufferEvent() { return bev_; }
+  enum class ExecuteResult { kDrained, kYielded, kBlocked };
   void ExecuteCommands(std::deque<CommandTokens> *to_process_cmds);
+  ExecuteResult ExecuteCommandsWithBudget(std::deque<CommandTokens> *to_process_cmds, size_t max_cmds,
+                                          int64_t max_time_us, bool allow_yield);
   Status ExecuteCommand(engine::Context &ctx, const std::string &cmd_name, const std::vector<std::string> &cmd_tokens,
                         Commander *current_cmd, std::string *reply);
   bool IsProfilingEnabled(const std::string &cmd);
@@ -230,6 +233,11 @@ class Connection : public EvbufCallbackBase<Connection> {
   ReplyMode GetReplyMode() const { return reply_mode_; }
 
  private:
+  void OnResume(int, int16_t);
+  void ScheduleResume();
+  void PauseReadForQuota();
+  void ResumeReadIfPaused();
+
   std::atomic<uint64_t> id_{0};
   std::atomic<int> flags_ = 0;
   mutable std::mutex client_mu_;
@@ -264,6 +272,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   bool in_exec_ = false;
   bool multi_error_ = false;
   std::atomic<bool> is_running_ = false;
+  std::atomic<bool> has_pending_cmds_ = false;
   std::deque<redis::CommandTokens> multi_cmds_;
   bool in_script_ = false;
 
@@ -272,6 +281,9 @@ class Connection : public EvbufCallbackBase<Connection> {
 
   ReplyMode reply_mode_ = ReplyMode::ON;
   std::vector<std::string> queued_replies_;
+  UniqueEvent resume_event_;
+  bool resume_scheduled_ = false;
+  bool read_paused_for_quota_ = false;
 };
 
 }  // namespace redis

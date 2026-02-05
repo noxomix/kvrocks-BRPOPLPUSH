@@ -119,7 +119,10 @@ void Connection::OnRead([[maybe_unused]] struct bufferevent *bev) {
   MakeScopeExit([this] { is_running_ = false; });
 
   SetLastInteraction();
-  auto s = req_.Tokenize(Input());
+  auto config = srv_->GetConfig()->GetSnapshot();
+  size_t max_cmds = static_cast<size_t>(config->read_event_max_commands);
+  int64_t max_time_us = config->read_event_max_time_us;
+  auto s = req_.Tokenize(Input(), max_cmds);
   if (!s.IsOK()) {
     EnableFlag(redis::Connection::kCloseAfterReply);
     Reply(redis::Error(s));
@@ -127,9 +130,72 @@ void Connection::OnRead([[maybe_unused]] struct bufferevent *bev) {
     return;
   }
 
-  ExecuteCommands(req_.GetCommands());
+  auto result = ExecuteCommandsWithBudget(req_.GetCommands(), max_cmds, max_time_us, true);
   if (IsFlagEnabled(kCloseAsync)) {
     Close();
+    return;
+  }
+
+  if (result == ExecuteResult::kYielded) {
+    PauseReadForQuota();
+    ScheduleResume();
+  } else if (result == ExecuteResult::kBlocked) {
+    read_paused_for_quota_ = false;
+  } else {
+    ResumeReadIfPaused();
+  }
+}
+
+void Connection::PauseReadForQuota() {
+  if (read_paused_for_quota_) return;
+  read_paused_for_quota_ = true;
+  bufferevent_disable(bev_, EV_READ);
+}
+
+void Connection::ResumeReadIfPaused() {
+  if (!read_paused_for_quota_) return;
+  read_paused_for_quota_ = false;
+  bufferevent_enable(bev_, EV_READ);
+  bufferevent_trigger(bev_, EV_READ, BEV_TRIG_IGNORE_WATERMARKS);
+}
+
+void Connection::ScheduleResume() {
+  if (resume_scheduled_) return;
+  if (!resume_event_) {
+    auto *base = bufferevent_get_base(bev_);
+    resume_event_.reset(evtimer_new(base, EventCallbackFunc<&Connection::OnResume>, this));
+  }
+  resume_scheduled_ = true;
+  timeval tv = {0, 0};
+  evtimer_add(resume_event_.get(), &tv);
+}
+
+void Connection::OnResume(int, int16_t) {
+  resume_scheduled_ = false;
+  if (IsFlagEnabled(kCloseAsync)) {
+    Close();
+    return;
+  }
+
+  is_running_ = true;
+  MakeScopeExit([this] { is_running_ = false; });
+
+  auto config = srv_->GetConfig()->GetSnapshot();
+  size_t max_cmds = static_cast<size_t>(config->read_event_max_commands);
+  int64_t max_time_us = config->read_event_max_time_us;
+  auto result = ExecuteCommandsWithBudget(req_.GetCommands(), max_cmds, max_time_us, true);
+  if (IsFlagEnabled(kCloseAsync)) {
+    Close();
+    return;
+  }
+
+  if (result == ExecuteResult::kYielded) {
+    PauseReadForQuota();
+    ScheduleResume();
+  } else if (result == ExecuteResult::kBlocked) {
+    read_paused_for_quota_ = false;
+  } else {
+    ResumeReadIfPaused();
   }
 }
 
@@ -312,6 +378,7 @@ bool Connection::IsFlagEnabled(Flag flag) const { return (flags_ & flag) > 0; }
 
 bool Connection::CanMigrate() const {
   return !is_running_                                                    // reading or writing
+         && !has_pending_cmds_.load(std::memory_order_relaxed)           // pending commands
          && !IsFlagEnabled(redis::Connection::kCloseAfterReply)          // close after reply
          && !IsFlagEnabled(redis::Connection::kMonitor)                  // monitor connections have worker-specific registration
          && saved_current_command_ == nullptr                            // not executing blocking command like BLPOP
@@ -535,18 +602,46 @@ static bool IsAllowedInSubscribedMode(const std::string &cmd_name) {
 }
 
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
+  ExecuteCommandsWithBudget(to_process_cmds, 0, 0, false);
+}
+
+Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<CommandTokens> *to_process_cmds,
+                                                                size_t max_cmds, int64_t max_time_us,
+                                                                bool allow_yield) {
   std::string reply;
+  bool yielded = false;
+  bool blocked = false;
+  size_t processed = 0;
+  constexpr size_t kTimeCheckInterval = 16;
+  auto start = std::chrono::steady_clock::now();
+
+  auto should_yield = [&]() {
+    if (!allow_yield) return false;
+    if (max_cmds > 0 && processed >= max_cmds) return true;
+    if (max_time_us > 0 && processed > 0 && (processed % kTimeCheckInterval == 0)) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+                         .count();
+      return elapsed >= max_time_us;
+    }
+    return false;
+  };
 
   while (!to_process_cmds->empty()) {
+    if (should_yield()) {
+      yielded = true;
+      break;
+    }
     CommandTokens cmd_tokens = std::move(to_process_cmds->front());
     to_process_cmds->pop_front();
     if (cmd_tokens.empty()) continue;
+    processed++;
     auto config = srv_->GetConfig()->GetSnapshot();
     bool cluster_enabled = srv_->GetConfig()->cluster_enabled;
     const std::string &password = config->requirepass;
 
     bool is_multi_exec = IsFlagEnabled(Connection::kMultiExec);
     if (IsFlagEnabled(redis::Connection::kCloseAfterReply) && !is_multi_exec) break;
+    if (IsFlagEnabled(redis::Connection::kCloseAsync)) break;
     auto multi_error_exit = MakeScopeExit([&] {
       if (is_multi_exec) multi_error_ = true;
     });
@@ -559,7 +654,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
             "[connection] A likely HTTP request is detected in the RESP connection, indicating a potential "
             "Cross-Protocol Scripting attack. Connection aborted.");
         EnableFlag(kCloseAsync);
-        return;
+        break;
       }
       Reply(redis::Error(
           {Status::NotOK,
@@ -753,6 +848,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       // Migrate connection would also check the saved_current_command_ to determine whether
       // the connection can be migrated or not.
       saved_current_command_ = std::move(current_cmd);
+      blocked = true;
       break;
     }
 
@@ -767,6 +863,11 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     if (!reply.empty()) Reply(reply);
     reply.clear();
   }
+
+  has_pending_cmds_.store(!to_process_cmds->empty(), std::memory_order_relaxed);
+  if (blocked) return ExecuteResult::kBlocked;
+  if (yielded) return ExecuteResult::kYielded;
+  return ExecuteResult::kDrained;
 }
 
 void Connection::ResetMultiExec() {

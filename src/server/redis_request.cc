@@ -37,8 +37,11 @@
 
 namespace redis {
 
-Status Request::Tokenize(evbuffer *input) {
+Status Request::Tokenize(evbuffer *input) { return Tokenize(input, 0); }
+
+Status Request::Tokenize(evbuffer *input, size_t max_commands) {
   size_t pipeline_size = 0;
+  if (max_commands > 0 && commands_.size() >= max_commands) return Status::OK();
 
   while (true) {
     switch (state_) {
@@ -101,6 +104,9 @@ Status Request::Tokenize(evbuffer *input) {
           if (tokens_.empty()) continue;
           commands_.emplace_back(std::move(tokens_));
           state_ = ArrayLen;
+          if (max_commands > 0 && commands_.size() >= max_commands) {
+            return Status::OK();
+          }
         }
         break;
       }
@@ -150,6 +156,9 @@ Status Request::Tokenize(evbuffer *input) {
           state_ = ArrayLen;
           commands_.emplace_back(std::move(tokens_));
           tokens_.clear();
+          if (max_commands > 0 && commands_.size() >= max_commands) {
+            return Status::OK();
+          }
         } else {
           state_ = BulkLen;
         }
