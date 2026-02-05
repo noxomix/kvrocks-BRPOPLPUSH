@@ -131,7 +131,8 @@ uint64_t GenerateFCallFlags(uint64_t flags, const std::vector<std::string> &,
 
 REDIS_REGISTER_COMMANDS(
     Function, MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", NO_KEY, GenerateFunctionFlags),
-    MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script skip-monitor", GetScriptEvalKeyRange, GenerateFCallFlags),
-    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange));
+    MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script skip-monitor heavy", GetScriptEvalKeyRange,
+                                GenerateFCallFlags),
+    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange));
 
 }  // namespace redis

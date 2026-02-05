@@ -168,6 +168,7 @@ Config::Config() {
       {"acceptor-queue-limit", false, new IntField(&acceptor_queue_limit, 4096, 0, INT_MAX)},
       {"read-event-max-commands", false, new IntField(&read_event_max_commands, 256, 0, INT_MAX)},
       {"read-event-max-time-us", false, new IntField(&read_event_max_time_us, 2000, 0, INT_MAX)},
+      {"read-event-max-heavy", false, new IntField(&read_event_max_heavy, 1, 0, INT_MAX)},
       {"timeout", false, new IntField(&timeout, 0, 0, INT_MAX)},
       {"tcp-backlog", true, new IntField(&backlog, 511, 0, INT_MAX)},
       {"maxclients", false, new IntField(&maxclients, 10240, 0, INT_MAX)},
@@ -1049,6 +1050,7 @@ std::shared_ptr<Config::RuntimeConfigSnapshot> Config::BuildRuntimeSnapshot() co
   snapshot->acceptor_queue_limit = acceptor_queue_limit;
   snapshot->read_event_max_commands = read_event_max_commands;
   snapshot->read_event_max_time_us = read_event_max_time_us;
+  snapshot->read_event_max_heavy = read_event_max_heavy;
   snapshot->sni_max_workers_percent = sni_max_workers_percent;
   snapshot->sni_overdraft_percent = sni_overdraft_percent;
   snapshot->timeout = timeout;

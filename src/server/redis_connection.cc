@@ -601,6 +601,14 @@ static bool IsAllowedInSubscribedMode(const std::string &cmd_name) {
          cmd_name == "ping" || cmd_name == "quit" || cmd_name == "reset";
 }
 
+static const CommandAttributes *LookupCommandAttributesByName(const std::string &cmd_name) {
+  if (cmd_name.empty()) return nullptr;
+  auto commands = redis::CommandTable::Get();
+  auto iter = commands->find(util::ToLower(cmd_name));
+  if (iter == commands->end()) return nullptr;
+  return iter->second;
+}
+
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
   ExecuteCommandsWithBudget(to_process_cmds, 0, 0, false);
 }
@@ -612,6 +620,8 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
   bool yielded = false;
   bool blocked = false;
   size_t processed = 0;
+  size_t heavy_used = 0;
+  size_t max_heavy = static_cast<size_t>(srv_->GetConfig()->GetSnapshot()->read_event_max_heavy);
   constexpr size_t kTimeCheckInterval = 16;
   auto start = std::chrono::steady_clock::now();
 
@@ -627,10 +637,40 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
   };
 
   while (!to_process_cmds->empty()) {
-    if (should_yield()) {
-      yielded = true;
-      break;
+    if (allow_yield && (max_cmds > 0 || max_time_us > 0 || max_heavy > 0)) {
+      const CommandAttributes *next_attr = nullptr;
+      bool next_is_heavy = false;
+      bool next_is_exec = false;
+      if (const auto &front = to_process_cmds->front(); !front.empty()) {
+        next_attr = LookupCommandAttributesByName(front.front());
+      }
+      if (next_attr != nullptr) {
+        next_is_heavy = (next_attr->InitialFlags() & kCmdHeavy) != 0;
+        next_is_exec = next_attr->name == "exec";
+      }
+
+      if (max_heavy > 0 && heavy_used >= max_heavy && next_is_heavy) {
+        yielded = true;
+        break;
+      }
+      if (processed > 0 && next_is_exec) {
+        yielded = true;
+        break;
+      }
+      if (max_time_us > 0 && processed > 0 && next_is_exec) {
+        auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= max_time_us) {
+          yielded = true;
+          break;
+        }
+      }
+      if (should_yield()) {
+        yielded = true;
+        break;
+      }
     }
+
     CommandTokens cmd_tokens = std::move(to_process_cmds->front());
     to_process_cmds->pop_front();
     if (cmd_tokens.empty()) continue;
@@ -762,6 +802,9 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       multi_cmds_.emplace_back(std::move(cmd_tokens));
       Reply(redis::SimpleString("QUEUED"));
       continue;
+    }
+    if (cmd_flags & kCmdHeavy) {
+      heavy_used++;
     }
 
     if (config->slave_readonly && srv_->IsSlave() && (cmd_flags & kCmdWrite)) {

@@ -155,11 +155,11 @@ uint64_t GenerateEvalFlags(uint64_t flags, const std::vector<std::string> &,
 
 REDIS_REGISTER_COMMANDS(
     Script,
-    MakeCmdAttr<CommandEval>("eval", -3, "write no-script skip-monitor", GetScriptEvalKeyRange, GenerateEvalFlags),
-    MakeCmdAttr<CommandEvalSHA>("evalsha", -3, "write no-script skip-monitor", GetScriptEvalKeyRange,
+    MakeCmdAttr<CommandEval>("eval", -3, "write no-script skip-monitor heavy", GetScriptEvalKeyRange, GenerateEvalFlags),
+    MakeCmdAttr<CommandEvalSHA>("evalsha", -3, "write no-script skip-monitor heavy", GetScriptEvalKeyRange,
                                 GenerateEvalFlags),
-    MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange),
-    MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange),
+    MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange),
+    MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange),
     MakeCmdAttr<CommandScript>("script", -2, "no-script skip-monitor", NO_KEY, GenerateScriptFlags), )
 
 }  // namespace redis

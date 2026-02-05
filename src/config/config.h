@@ -113,6 +113,7 @@ struct Config {
   int acceptor_queue_limit = 4096;  // Per-worker pending connection queue limit (0 = unlimited)
   int read_event_max_commands = 256;  // 0 = unlimited
   int read_event_max_time_us = 2000;  // 0 = unlimited
+  int read_event_max_heavy = 1;  // 0 = unlimited
   int timeout = 0;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;
@@ -296,6 +297,7 @@ struct Config {
     int acceptor_queue_limit = 0;
     int read_event_max_commands = 0;
     int read_event_max_time_us = 0;
+    int read_event_max_heavy = 0;
     int sni_max_workers_percent = 0;
     int sni_overdraft_percent = 0;
     int timeout = 0;

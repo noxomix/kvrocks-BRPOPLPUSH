@@ -91,6 +91,8 @@ enum CommandFlags : uint64_t {
   kCmdSkipMonitor = 1ULL << 12,
   // "no-lock" flag, for commands that bypass work locks (e.g., SCRIPT KILL)
   kCmdNoLock = 1ULL << 13,
+  // "heavy" flag, for commands that are expensive and should be rate-limited per read event
+  kCmdHeavy = 1ULL << 14,
 };
 
 enum class CommandCategory : uint8_t {
@@ -378,6 +380,8 @@ inline uint64_t ParseCommandFlags(const std::string &description, const std::str
       flags |= kCmdAdmin;
     else if (flag == "no-lock")
       flags |= kCmdNoLock;
+    else if (flag == "heavy")
+      flags |= kCmdHeavy;
     else {
       std::cout << fmt::format("Encountered non-existent flag '{}' in command {} in command attribute parsing", flag,
                                cmd_name)
@@ -406,6 +410,7 @@ inline std::vector<std::string> CommandAttributes::FlagsToString(uint64_t flags)
   if (flags & kCmdAdmin) res.emplace_back("admin");
   if (flags & kCmdSkipMonitor) res.emplace_back("skip-monitor");
   if (flags & kCmdNoLock) res.emplace_back("no-lock");
+  if (flags & kCmdHeavy) res.emplace_back("heavy");
 
   return res;
 }

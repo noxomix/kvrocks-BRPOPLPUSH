@@ -131,7 +131,7 @@ class CommandUnwatch : public Commander {
 
 REDIS_REGISTER_COMMANDS(Txn, MakeCmdAttr<CommandMulti>("multi", 1, "bypass-multi", NO_KEY),
                         MakeCmdAttr<CommandDiscard>("discard", 1, "bypass-multi", NO_KEY),
-                        MakeCmdAttr<CommandExec>("exec", 1, "exclusive bypass-multi slow", NO_KEY),
+                        MakeCmdAttr<CommandExec>("exec", 1, "exclusive bypass-multi slow heavy", NO_KEY),
                         MakeCmdAttr<CommandWatch>("watch", -2, "no-multi", 1, -1, 1),
                         MakeCmdAttr<CommandUnwatch>("unwatch", 1, "no-multi", NO_KEY), )
 
