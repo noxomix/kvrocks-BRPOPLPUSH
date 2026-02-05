@@ -445,6 +445,12 @@ int Connection::SSubscriptionsCount() {
   return subscribe_shard_channels_count_.load(std::memory_order_relaxed);
 }
 
+bool Connection::IsSubscribed() const {
+  return subscribe_channels_count_.load(std::memory_order_relaxed) > 0 ||
+         subscribe_patterns_count_.load(std::memory_order_relaxed) > 0 ||
+         subscribe_shard_channels_count_.load(std::memory_order_relaxed) > 0;
+}
+
 bool Connection::IsProfilingEnabled(const std::string &cmd) {
   auto config = srv_->GetConfig();
   if (config->profiling_sample_ratio == 0) return false;
@@ -522,6 +528,12 @@ static bool IsCmdAllowedInStaleData(const std::string &cmd_name) {
   return cmd_name == "info" || cmd_name == "slaveof" || cmd_name == "config";
 }
 
+static bool IsAllowedInSubscribedMode(const std::string &cmd_name) {
+  return cmd_name == "subscribe" || cmd_name == "unsubscribe" || cmd_name == "psubscribe" ||
+         cmd_name == "punsubscribe" || cmd_name == "ssubscribe" || cmd_name == "sunsubscribe" ||
+         cmd_name == "ping" || cmd_name == "quit" || cmd_name == "reset";
+}
+
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
   const Config *config = srv_->GetConfig();
   std::string reply;
@@ -559,6 +571,11 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
 
     const auto &attributes = current_cmd->GetAttributes();
     auto cmd_name = attributes->name;
+
+    if (GetProtocolVersion() != RESP::v3 && IsSubscribed() && !IsAllowedInSubscribedMode(cmd_name)) {
+      Reply(redis::Error({Status::NotOK, errSubscribedModeOnlyPubSub}));
+      continue;
+    }
 
     int tokens = static_cast<int>(cmd_tokens.size());
     if (!attributes->CheckArity(tokens)) {

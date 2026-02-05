@@ -149,6 +149,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   void SUnsubscribeChannel(const std::string &channel, uint16_t slot);
   void SUnsubscribeAll(const UnsubscribeCallback &reply = nullptr);
   int SSubscriptionsCount();
+  bool IsSubscribed() const;
 
   uint64_t GetAge() const;
   uint64_t GetIdleTime() const;

@@ -53,4 +53,6 @@ inline constexpr const char *errKeyAlreadyExists = "key already exists";
 inline constexpr const char *errParsingNumkeys = "error parsing numkeys";
 inline constexpr const char *errNumkeysMustBePositive = "numkeys need to be a positive integer";
 inline constexpr const char *errWrongKeyword = "wrong keyword";
+inline constexpr const char *errSubscribedModeOnlyPubSub =
+    "only (P)SUBSCRIBE / (P)UNSUBSCRIBE / (S)SUBSCRIBE / (S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context";
 }  // namespace redis

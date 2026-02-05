@@ -197,6 +197,22 @@ func TestProtocolRESP2(t *testing.T) {
 		}
 	})
 
+	t.Run("subscribed mode blocks non-pubsub commands", func(t *testing.T) {
+		c := srv.NewTCPClient()
+		defer func() { require.NoError(t, c.Close()) }()
+
+		require.NoError(t, c.WriteArgs("SUBSCRIBE", "test-channel"))
+		c.MustRead(t, "*3")
+		c.MustRead(t, "$9")
+		c.MustRead(t, "subscribe")
+		c.MustRead(t, "$12")
+		c.MustRead(t, "test-channel")
+		c.MustRead(t, ":1")
+
+		require.NoError(t, c.WriteArgs("GET", "foo"))
+		c.MustMatch(t, "only .*SUBSCRIBE.*allowed in this context")
+	})
+
 	t.Run("multi bulk strings with null string", func(t *testing.T) {
 		require.NoError(t, c.WriteArgs("HSET", "hash", "f1", "v1"))
 		c.MustRead(t, ":1")
