@@ -65,12 +65,12 @@ void CommandTable::GetAllCommandsInfo(std::string *info) {
   }
 }
 
-void CommandTable::GetCommandsInfo(std::string *info, const std::vector<std::string> &cmd_names) {
+void CommandTable::GetCommandsInfo(std::string *info, const std::vector<std::string> &cmd_names, RESP ver) {
   info->append(redis::MultiLen(cmd_names.size()));
   for (const auto &cmd_name : cmd_names) {
     auto cmd_iter = commands.find(util::ToLower(cmd_name));
     if (cmd_iter == commands.end()) {
-      info->append(NilString(RESP::v2));
+      info->append(NilString(ver));
     } else {
       auto command_attribute = cmd_iter->second;
       auto command_info = GetCommandInfo(command_attribute);

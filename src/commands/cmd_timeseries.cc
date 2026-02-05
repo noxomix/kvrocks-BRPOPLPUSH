@@ -82,10 +82,10 @@ std::string FormatAddResultAsRedisReply(TSChunk::AddResult res) {
   return "";
 }
 
-std::string FormatTSSampleAsRedisReply(TSSample sample) {
+std::string FormatTSSampleAsRedisReply(const redis::Connection *conn, TSSample sample) {
   std::string res = redis::MultiLen(2);
   res += redis::Integer(sample.ts);
-  res += redis::Double(redis::RESP::v3, sample.v);
+  res += conn->Double(sample.v);
   return res;
 }
 
@@ -158,12 +158,12 @@ std::string FormatCreateRuleResAsRedisReply(TSCreateRuleResult res) {
   return "";
 }
 
-std::string FormatTSLabelListAsRedisReply(const redis::LabelKVList &labels) {
+std::string FormatTSLabelListAsRedisReply(const redis::Connection *conn, const redis::LabelKVList &labels) {
   std::vector<std::string> labels_str;
   labels_str.reserve(labels.size());
   for (const auto &label : labels) {
     auto str = redis::Array(
-        {redis::BulkString(label.k), label.v.size() ? redis::BulkString(label.v) : redis::NilString(redis::RESP::v3)});
+        {redis::BulkString(label.k), label.v.size() ? redis::BulkString(label.v) : conn->NilString()});
     labels_str.push_back(str);
   }
   return redis::Array(labels_str);
@@ -371,10 +371,9 @@ class CommandTSInfo : public Commander {
     *output += redis::SimpleString("duplicatePolicy");
     *output += redis::SimpleString(FormatDuplicatePolicyAsRedisReply(info.metadata.duplicate_policy));
     *output += redis::SimpleString("labels");
-    *output += FormatTSLabelListAsRedisReply(info.labels);
+    *output += FormatTSLabelListAsRedisReply(conn, info.labels);
     *output += redis::SimpleString("sourceKey");
-    *output += info.metadata.source_key.empty() ? redis::NilString(redis::RESP::v3)
-                                                : redis::BulkString(info.metadata.source_key);
+    *output += info.metadata.source_key.empty() ? conn->NilString() : redis::BulkString(info.metadata.source_key);
     *output += redis::SimpleString("rules");
     std::vector<std::string> rules_str;
     rules_str.reserve(info.downstream_rules.size());
@@ -761,7 +760,7 @@ class CommandTSRange : public CommandTSRangeBase {
     std::vector<std::string> reply;
     reply.reserve(res.size());
     for (auto &sample : res) {
-      reply.push_back(FormatTSSampleAsRedisReply(sample));
+      reply.push_back(FormatTSSampleAsRedisReply(conn, sample));
     }
     *output = redis::Array(reply);
     return Status::OK();
@@ -784,7 +783,7 @@ class CommandTSRevRange : public CommandTSRangeBase {
     if (!s.ok()) return {Status::RedisExecErr, errKeyNotFound};
     std::vector<std::string> reply;
     reply.reserve(res.size());
-    for (auto &sample : res) reply.push_back(FormatTSSampleAsRedisReply(sample));
+    for (auto &sample : res) reply.push_back(FormatTSSampleAsRedisReply(conn, sample));
     *output = redis::Array(reply);
     return Status::OK();
   }
@@ -856,7 +855,7 @@ class CommandTSGet : public CommandTSAggregatorBase {
     std::vector<std::string> reply;
     reply.reserve(res.size());
     for (auto &sample : res) {
-      reply.push_back(FormatTSSampleAsRedisReply(sample));
+      reply.push_back(FormatTSSampleAsRedisReply(conn, sample));
     }
     *output = redis::Array(reply);
     return Status::OK();
@@ -939,11 +938,11 @@ class CommandTSMGet : public CommandTSMGetBase {
     for (auto &result : results) {
       std::vector<std::string> entry(3);
       entry[0] = redis::BulkString(result.name);
-      entry[1] = FormatTSLabelListAsRedisReply(result.labels);
+      entry[1] = FormatTSLabelListAsRedisReply(conn, result.labels);
       std::vector<std::string> temp;
       temp.reserve(result.samples.size());
       for (auto &sample : result.samples) {
-        temp.push_back(FormatTSSampleAsRedisReply(sample));
+        temp.push_back(FormatTSSampleAsRedisReply(conn, sample));
       }
       entry[2] = redis::Array(temp);
       reply.push_back(redis::Array(entry));
@@ -997,11 +996,11 @@ class CommandTSMRange : public CommandTSRangeBase, public CommandTSMGetBase {
         result.labels.push_back(LabelKVPair{"__reducer__", std::string(GroupReducerTypeToString(option_.reducer))});
         result.labels.push_back(LabelKVPair{"__source__", GroupSourceToString(result.source_keys)});
       }
-      entry[1] = FormatTSLabelListAsRedisReply(result.labels);
+      entry[1] = FormatTSLabelListAsRedisReply(conn, result.labels);
       std::vector<std::string> temp;
       temp.reserve(result.samples.size());
       for (auto &sample : result.samples) {
-        temp.push_back(FormatTSSampleAsRedisReply(sample));
+        temp.push_back(FormatTSSampleAsRedisReply(conn, sample));
       }
       entry[2] = redis::Array(temp);
       reply.push_back(redis::Array(entry));

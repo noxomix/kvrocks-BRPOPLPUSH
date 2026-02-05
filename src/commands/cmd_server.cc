@@ -789,7 +789,8 @@ class CommandCommand : public Commander {
       if (sub_command == "count") {
         *output = redis::Integer(CommandTable::Size());
       } else if (sub_command == "info") {
-        CommandTable::GetCommandsInfo(output, std::vector<std::string>(args_.begin() + 2, args_.end()));
+        CommandTable::GetCommandsInfo(output, std::vector<std::string>(args_.begin() + 2, args_.end()),
+                                      conn->GetProtocolVersion());
       } else if (sub_command == "getkeys") {
         auto cmd_iter = CommandTable::GetOriginal()->find(util::ToLower(args_[2]));
         if (cmd_iter == CommandTable::GetOriginal()->end()) {

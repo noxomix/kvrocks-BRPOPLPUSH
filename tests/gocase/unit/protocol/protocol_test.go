@@ -197,6 +197,12 @@ func TestProtocolRESP2(t *testing.T) {
 		}
 	})
 
+	t.Run("command info null uses RESP2", func(t *testing.T) {
+		require.NoError(t, c.WriteArgs("COMMAND", "INFO", "__nope__"))
+		c.MustRead(t, "*1")
+		c.MustRead(t, "$-1")
+	})
+
 	t.Run("subscribed mode blocks non-pubsub commands", func(t *testing.T) {
 		c := srv.NewTCPClient()
 		defer func() { require.NoError(t, c.Close()) }()
@@ -312,6 +318,12 @@ func TestProtocolRESP3(t *testing.T) {
 				c.MustRead(t, line)
 			}
 		}
+	})
+
+	t.Run("command info null uses RESP3", func(t *testing.T) {
+		require.NoError(t, c.WriteArgs("COMMAND", "INFO", "__nope__"))
+		c.MustRead(t, "*1")
+		c.MustRead(t, "_")
 	})
 
 	t.Run("multi bulk strings with null", func(t *testing.T) {

@@ -226,12 +226,8 @@ Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
 - [x] **Client-Type unvollstaendig** → `GetClientType()/GetFlags()/CanMigrate()` beruecksichtigen `SSUBSCRIBE`
 
 ### Mittel - RESP2/RESP3 Kompatibilitaet
-- [ ] **TimeSeries antwortet immer RESP3** → `cmd_timeseries.cc` nutzt harte `RESP::v3` (RESP2-Clients bekommen falsche Typen)
-  - Fix: konsequent `conn->...` Helper (NilString/Double/Map) verwenden
-  - Test: TS-Commands unter `resp3-enabled=no` liefern RESP2-Formate
-- [ ] **COMMAND INFO Null-Typ** → `CommandTable::GetCommandsInfo()` nutzt `NilString(RESP::v2)` ohne Conn-Kontext
-  - Fix: plumb `RESP`/Connection in COMMAND-Info Ausgabe oder RESP3-konforme Null darstellen
-  - Test: `COMMAND INFO` in RESP3 liefert `_` statt `$-1`
+- [x] **TimeSeries antwortet immer RESP3** → `cmd_timeseries.cc` nutzt harte `RESP::v3` (RESP2-Clients bekommen falsche Typen)
+- [x] **COMMAND INFO Null-Typ** → `CommandTable::GetCommandsInfo()` nutzt `NilString(RESP::v2)` ohne Conn-Kontext
 
 ### Niedrig - Concurrency Follow-up
 - [ ] **GetClientInfo Lock-Zeit verkuerzen** → in `GetClientInfo(true)` `client_mu_` nicht waehrend Buffer-Reads (`OutputBufferSize()/InputBufferSize()`) halten

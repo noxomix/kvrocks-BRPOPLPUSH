@@ -466,7 +466,7 @@ struct CommandTable {
   static void Reset();
 
   static void GetAllCommandsInfo(std::string *info);
-  static void GetCommandsInfo(std::string *info, const std::vector<std::string> &cmd_names);
+  static void GetCommandsInfo(std::string *info, const std::vector<std::string> &cmd_names, RESP ver);
   static std::string GetCommandInfo(const CommandAttributes *command_attributes);
   static StatusOr<std::vector<int>> GetKeysFromCommand(const CommandAttributes *attributes,
                                                        const std::vector<std::string> &cmd_tokens);
