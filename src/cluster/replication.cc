@@ -88,8 +88,8 @@ FeedSlaveThread::FeedSlaveThread(Server *srv, redis::Connection *conn, rocksdb::
       conn_(conn),
       next_repl_seq_(next_repl_seq),
       req_(srv),
-      max_delay_bytes_(srv->GetConfig()->max_replication_delay_bytes),
-      max_delay_updates_(srv->GetConfig()->max_replication_delay_updates) {}
+      max_delay_bytes_(srv->GetConfig()->GetSnapshot()->max_replication_delay_bytes),
+      max_delay_updates_(srv->GetConfig()->GetSnapshot()->max_replication_delay_updates) {}
 
 Status FeedSlaveThread::Start() {
   auto s = util::CreateThread("feed-replica", [this] {
@@ -351,9 +351,8 @@ void ReplicationThread::CallbacksStateMachine::Start() {
     return;
   }
 
-  // Note: It may cause data races to use 'masterauth' directly.
-  // It is acceptable because password change is a low frequency operation.
-  if (!repl_->srv_->GetConfig()->masterauth.empty()) {
+  auto cfg = repl_->srv_->GetConfig()->GetSnapshot();
+  if (!cfg->masterauth.empty()) {
     handlers_.emplace_front(CallbacksStateMachine::READ, "auth read", &ReplicationThread::authReadCB);
     handlers_.emplace_front(CallbacksStateMachine::WRITE, "auth write", &ReplicationThread::authWriteCB);
   }
@@ -366,7 +365,8 @@ void ReplicationThread::CallbacksStateMachine::Start() {
       sleep(1);
     }
     last_connect_timestamp = util::GetTimeStampMS();
-    auto cfd = util::SockConnect(repl_->host_, repl_->port_, repl_->srv_->GetConfig()->replication_connect_timeout_ms);
+    auto cfd = util::SockConnect(repl_->host_, repl_->port_,
+                                 repl_->srv_->GetConfig()->GetSnapshot()->replication_connect_timeout_ms);
     if (!cfd) {
       error("[replication] Failed to connect the master, err: {}", cfd.Msg());
       continue;
@@ -430,8 +430,8 @@ ReplicationThread::ReplicationThread(std::string host, uint32_t port, Server *sr
       repl_state_(kReplConnecting),
       // replication_group_sync_ is only enabled when both replication-group-sync and rocksdb.write_options.sync are
       // true
-      replication_group_sync_(srv->GetConfig()->replication_group_sync &&
-                              srv->GetConfig()->rocks_db.write_options.sync),
+      replication_group_sync_(srv->GetConfig()->GetSnapshot()->replication_group_sync &&
+                              srv->GetConfig()->GetSnapshot()->rocks_db.write_options.sync),
       psync_steps_(
           this,
           CallbacksStateMachine::CallbackList{
@@ -507,7 +507,8 @@ void ReplicationThread::run() {
 }
 
 ReplicationThread::CBState ReplicationThread::authWriteCB(bufferevent *bev) {
-  SendString(bev, redis::ArrayOfBulkStrings({"AUTH", srv_->GetConfig()->masterauth}));
+  auto cfg = srv_->GetConfig()->GetSnapshot();
+  SendString(bev, redis::ArrayOfBulkStrings({"AUTH", cfg->masterauth}));
   info("[replication] Auth request was sent, waiting for response");
   repl_state_.store(kReplSendAuth, std::memory_order_relaxed);
   return CBState::NEXT;
@@ -559,9 +560,8 @@ ReplicationThread::CBState ReplicationThread::checkDBNameReadCB(bufferevent *bev
 }
 
 ReplicationThread::CBState ReplicationThread::replConfWriteCB(bufferevent *bev) {
-  auto config = srv_->GetConfig();
-
-  auto port = config->replica_announce_port > 0 ? config->replica_announce_port : config->port;
+  auto config = srv_->GetConfig()->GetSnapshot();
+  auto port = config->replica_announce_port > 0 ? config->replica_announce_port : srv_->GetConfig()->port;
   std::vector<std::string> data_to_send{"replconf", "listening-port", std::to_string(port)};
   if (!next_try_without_announce_ip_address_ && !config->replica_announce_ip.empty()) {
     data_to_send.emplace_back("ip-address");
@@ -697,7 +697,7 @@ ReplicationThread::CBState ReplicationThread::incrementBatchLoopCB(bufferevent *
   // If rocksdb.write_options.no_slowdown is enabled, use replication_no_slowdown config
   // to determine if it should be applied to replication writes
   if (srv_->GetConfig()->rocks_db.write_options.no_slowdown) {
-    write_opts.no_slowdown = srv_->GetConfig()->replication_no_slowdown;
+    write_opts.no_slowdown = srv_->GetConfig()->GetSnapshot()->replication_no_slowdown;
   }
 
   while (true) {
@@ -791,7 +791,7 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
   switch (fullsync_state_) {
     case kFetchMetaID: {
       // New version master only sends meta file content
-      if (!srv_->GetConfig()->master_use_repl_port) {
+      if (!srv_->GetConfig()->GetSnapshot()->master_use_repl_port) {
         fullsync_state_ = kFetchMetaContent;
         return CBState::AGAIN;
       }
@@ -828,7 +828,7 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       std::string target_dir;
       engine::Storage::ReplDataManager::MetaInfo meta;
       // Master using old version
-      if (srv_->GetConfig()->master_use_repl_port) {
+      if (srv_->GetConfig()->GetSnapshot()->master_use_repl_port) {
         if (evbuffer_get_length(input) < fullsync_filesize_) {
           return CBState::AGAIN;
         }
@@ -875,7 +875,7 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       // If 'slave-empty-db-before-fullsync' is yes, we call 'pre_fullsync_cb_'
       // just like reloading database. And we don't want slave to occupy too much
       // disk space, so we just empty entire database rudely.
-      if (srv_->GetConfig()->slave_empty_db_before_fullsync) {
+      if (srv_->GetConfig()->GetSnapshot()->slave_empty_db_before_fullsync) {
         if (!pre_fullsync_cb_()) return CBState::RESTART;
         pre_fullsync_done = true;
         storage_->EmptyDB();
@@ -894,7 +894,7 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       if (!pre_fullsync_done && !pre_fullsync_cb_()) return CBState::RESTART;
 
       // For old version, master uses rocksdb backup to implement data snapshot
-      if (srv_->GetConfig()->master_use_repl_port) {
+      if (srv_->GetConfig()->GetSnapshot()->master_use_repl_port) {
         s = storage_->RestoreFromBackup();
       } else {
         s = storage_->RestoreFromCheckpoint();
@@ -945,9 +945,9 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
           }
           auto exit = MakeScopeExit([ssl] { SSL_free(ssl); });
 #endif
-          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl,
-                                                     this->srv_->GetConfig()->replication_connect_timeout_ms,
-                                                     this->srv_->GetConfig()->replication_recv_timeout_ms)
+          auto cfg = this->srv_->GetConfig()->GetSnapshot();
+          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl, cfg->replication_connect_timeout_ms,
+                                                     cfg->replication_recv_timeout_ms)
                                        .Prefixed("connect the server err"));
 #ifdef ENABLE_OPENSSL
           exit.Disable();
@@ -988,7 +988,7 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
           };
           // For master using old version, it only supports to fetch a single file by one
           // command, so we need to fetch all files by multiple command interactions.
-          if (srv_->GetConfig()->master_use_repl_port) {
+          if (srv_->GetConfig()->GetSnapshot()->master_use_repl_port) {
             for (unsigned i = 0; i < fetch_files.size(); i++) {
               s = this->fetchFiles(sock_fd, dir, {fetch_files[i]}, {crcs[i]}, fn, ssl);
               if (!s.IsOK()) break;
@@ -1012,7 +1012,7 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
 
 Status ReplicationThread::sendAuth(int sock_fd, ssl_st *ssl) {
   // Send auth when needed
-  std::string auth = srv_->GetConfig()->masterauth;
+  std::string auth = srv_->GetConfig()->GetSnapshot()->masterauth;
   if (!auth.empty()) {
     UniqueEvbuf evbuf;
     const auto auth_command = redis::ArrayOfBulkStrings({"AUTH", auth});
@@ -1132,8 +1132,9 @@ Status ReplicationThread::fetchFiles(int sock_fd, const std::string &dir, const 
     debug("[fetch] Succeed fetching file {}", files[i]);
 
     // Just for tests
-    if (srv_->GetConfig()->fullsync_recv_file_delay) {
-      sleep(srv_->GetConfig()->fullsync_recv_file_delay);
+    auto delay = srv_->GetConfig()->GetSnapshot()->fullsync_recv_file_delay;
+    if (delay) {
+      sleep(delay);
     }
   }
   return s;

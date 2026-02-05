@@ -48,7 +48,8 @@ Status IsNamespaceLegal(const std::string& ns) {
 bool Namespace::IsAllowModify() const {
   auto config = storage_->GetConfig();
 
-  return config->HasConfigFile() || config->repl_namespace_enabled;
+  auto snapshot = config->GetSnapshot();
+  return config->HasConfigFile() || snapshot->repl_namespace_enabled;
 }
 
 Status Namespace::loadFromDB(std::map<std::string, std::string>* db_tokens) const {
@@ -77,7 +78,7 @@ Status Namespace::LoadAndRewrite() {
   auto s = loadFromDB(&db_tokens);
   if (!s.IsOK()) return s;
 
-  if (!db_tokens.empty() && !config->repl_namespace_enabled) {
+  if (!db_tokens.empty() && !config->GetSnapshot()->repl_namespace_enabled) {
     return {Status::NotOK, "cannot switch off repl_namespace_enabled when namespaces exist in db"};
   }
 
@@ -93,7 +94,7 @@ Status Namespace::LoadAndRewrite() {
 
   // The following rewrite is to remove namespace/token pairs from the configuration if the namespace replication
   // is enabled. So we don't need to do that if no tokens are loaded or the namespace replication is disabled.
-  if (config->load_tokens.empty() || !config->repl_namespace_enabled) return Status::OK();
+  if (config->load_tokens.empty() || !config->GetSnapshot()->repl_namespace_enabled) return Status::OK();
 
   return Rewrite(tokens_);
 }
@@ -121,7 +122,8 @@ Status Namespace::Set(const std::string& ns, const std::string& token) {
   auto s = IsNamespaceLegal(ns);
   if (!s.IsOK()) return s;
   auto config = storage_->GetConfig();
-  if (config->requirepass.empty()) {
+  auto snapshot = config->GetSnapshot();
+  if (snapshot->requirepass.empty()) {
     return {Status::NotOK, kErrRequiredPassEmpty};
   }
   if (config->cluster_enabled) {
@@ -133,7 +135,7 @@ Status Namespace::Set(const std::string& ns, const std::string& token) {
   if (ns == kDefaultNamespace) {
     return {Status::NotOK, kErrAddDefaultNamespace};
   }
-  if (token == config->requirepass || token == config->masterauth) {
+  if (token == snapshot->requirepass || token == snapshot->masterauth) {
     return {Status::NotOK, kErrInvalidToken};
   }
 
@@ -221,7 +223,7 @@ Status Namespace::Rewrite(const std::map<std::string, std::string>& tokens) cons
   }
 
   // Don't need to write to db if repl_namespace_enabled is false
-  if (!config->repl_namespace_enabled) {
+  if (!config->GetSnapshot()->repl_namespace_enabled) {
     return Status::OK();
   }
   jsoncons::json json;

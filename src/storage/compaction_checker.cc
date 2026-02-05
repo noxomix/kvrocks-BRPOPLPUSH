@@ -29,7 +29,7 @@ void CompactionChecker::CompactPropagateAndPubSubFiles() {
   rocksdb::CompactRangeOptions compact_opts;
   // See https://github.com/facebook/rocksdb/issues/13671
   // change_level doesn't work well with level_compaction_dynamic_level_bytes
-  compact_opts.change_level = !storage_->GetConfig()->rocks_db.level_compaction_dynamic_level_bytes;
+  compact_opts.change_level = !storage_->GetConfig()->GetSnapshot()->rocks_db.level_compaction_dynamic_level_bytes;
   for (const auto &cf :
        {engine::ColumnFamilyConfigs::PubSubColumnFamily(), engine::ColumnFamilyConfigs::PropagateColumnFamily()}) {
     info("[compaction checker] Start to compact the column family: {}", cf.Name());
@@ -58,9 +58,9 @@ void CompactionChecker::PickCompactionFilesForCf(const engine::ColumnFamilyConfi
   }
   int64_t now = util::GetTimeStamp();
 
-  auto force_compact_file_age = storage_->GetConfig()->force_compact_file_age;
-  auto force_compact_min_ratio =
-      static_cast<double>(storage_->GetConfig()->force_compact_file_min_deleted_percentage) / 100.0;
+  auto cfg = storage_->GetConfig()->GetSnapshot();
+  auto force_compact_file_age = cfg->force_compact_file_age;
+  auto force_compact_min_ratio = static_cast<double>(cfg->force_compact_file_min_deleted_percentage) / 100.0;
 
   std::string best_filename;
   double best_delete_ratio = 0;

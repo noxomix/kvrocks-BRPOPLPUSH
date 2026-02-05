@@ -30,8 +30,9 @@
 #include "worker.h"
 
 void FairSchedulerConfig::LoadFromConfig(const Config* config) {
-  max_workers_percent = static_cast<uint32_t>(config->sni_max_workers_percent);
-  overdraft_percent = static_cast<uint32_t>(config->sni_overdraft_percent);
+  auto snapshot = config->GetSnapshot();
+  max_workers_percent = static_cast<uint32_t>(snapshot->sni_max_workers_percent);
+  overdraft_percent = static_cast<uint32_t>(snapshot->sni_overdraft_percent);
 }
 
 FairScheduler::FairScheduler(Server* srv) : srv_(srv) {

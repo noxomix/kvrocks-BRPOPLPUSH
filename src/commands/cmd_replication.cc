@@ -286,8 +286,9 @@ class CommandFetchFile : public Commander {
         if (srv->IsStopped()) break;
 
         uint64_t file_size = 0, max_replication_bytes = 0;
-        if (srv->GetConfig()->max_replication_mb > 0 && srv->GetFetchFileThreadNum() != 0) {
-          max_replication_bytes = (srv->GetConfig()->max_replication_mb * MiB) / srv->GetFetchFileThreadNum();
+        auto cfg = srv->GetConfig()->GetSnapshot();
+        if (cfg->max_replication_mb > 0 && srv->GetFetchFileThreadNum() != 0) {
+          max_replication_bytes = (cfg->max_replication_mb * MiB) / srv->GetFetchFileThreadNum();
         }
         auto start = std::chrono::high_resolution_clock::now();
         auto fd = UniqueFD(engine::Storage::ReplDataManager::OpenDataFile(srv->storage, file, &file_size));

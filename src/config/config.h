@@ -23,6 +23,7 @@
 #include <rocksdb/options.h>
 #include <sys/resource.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <set>
@@ -83,6 +84,9 @@ struct CLIOptions {
 
 struct Config {
  public:
+  struct RocksDB;
+  struct RuntimeConfigSnapshot;
+
   Config();
   ~Config() = default;
   uint32_t port = 0;
@@ -272,6 +276,69 @@ struct Config {
     } read_options;
   } rocks_db;
 
+  struct RuntimeConfigSnapshot {
+    // Authentication / replication
+    std::string masterauth;
+    std::string requirepass;
+    std::string master_host;
+    uint32_t master_port = 0;
+
+    // Protocol / scripting
+    bool resp3_enabled = false;
+    uint64_t proto_max_bulk_len = 0;
+    bool lua_strict_key_accessing = false;
+    int lua_time_limit = 0;
+
+    // Client limits / scheduling
+    int maxclients = 0;
+    int acceptor_queue_limit = 0;
+    int sni_max_workers_percent = 0;
+    int sni_overdraft_percent = 0;
+    int timeout = 0;
+
+    // Replication / migration
+    int replication_connect_timeout_ms = 0;
+    int replication_recv_timeout_ms = 0;
+    int max_replication_delay_bytes = 0;
+    int max_replication_delay_updates = 0;
+    int max_replication_mb = 0;
+    bool replication_group_sync = false;
+    bool replication_no_slowdown = false;
+    bool master_use_repl_port = false;
+    std::string replica_announce_ip;
+    uint32_t replica_announce_port = 0;
+    bool slave_readonly = true;
+    bool slave_serve_stale_data = true;
+    bool slave_empty_db_before_fullsync = false;
+    int fullsync_recv_file_delay = 0;
+    int migrate_speed = 0;
+    int pipeline_size = 0;
+    int sequence_gap = 0;
+    MigrationType migrate_type{};
+    int migrate_batch_size_kb = 0;
+    int migrate_batch_rate_limit_mb = 0;
+
+    // JSON / String / Profiling
+    int json_max_nesting_depth = 0;
+    JsonStorageFormat json_storage_format = JsonStorageFormat::JSON;
+    int max_bitmap_to_string_mb = 0;
+    int profiling_sample_ratio = 0;
+    bool profiling_sample_all_commands = false;
+    std::set<std::string> profiling_sample_commands;
+    int profiling_sample_record_threshold_ms = 0;
+
+    // RocksDB / compaction
+    RocksDB rocks_db;
+    int force_compact_file_age = 0;
+    int force_compact_file_min_deleted_percentage = 0;
+
+    // Namespace / cluster misc
+    bool repl_namespace_enabled = false;
+    bool persist_cluster_nodes_enabled = true;
+
+    bool is_slave = false;
+  };
+
   mutable std::mutex backup_mu;
 
   std::string NodesFilePath() const;
@@ -281,11 +348,19 @@ struct Config {
   Status Set(Server *srv, std::string key, const std::string &value);
   void SetMaster(const std::string &host, uint32_t port);
   void ClearMaster();
-  bool IsSlave() const { return !master_host.empty(); }
+  bool IsSlave() const {
+    auto snapshot = GetSnapshot();
+    return snapshot ? snapshot->is_slave : !master_host.empty();
+  }
   bool HasConfigFile() const { return !path_.empty(); }
   std::string ConfigFilePath() const { return path_; }
+  std::shared_ptr<const RuntimeConfigSnapshot> GetSnapshot() const;
 
  private:
+  std::shared_ptr<RuntimeConfigSnapshot> BuildRuntimeSnapshot() const;
+  void UpdateRuntimeSnapshot();
+
+  std::shared_ptr<const RuntimeConfigSnapshot> runtime_snapshot_;
   std::string path_;
   std::string binds_str_;
   std::string slaveof_;

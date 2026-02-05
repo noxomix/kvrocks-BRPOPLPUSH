@@ -48,11 +48,11 @@ static std::map<RedisType, std::string> type_to_cmd = {
 SlotMigrator::SlotMigrator(Server *srv)
     : Database(srv->storage, kDefaultNamespace),
       srv_(srv),
-      max_migration_speed_(srv->GetConfig()->migrate_speed),
-      max_pipeline_size_(srv->GetConfig()->pipeline_size),
-      seq_gap_limit_(srv->GetConfig()->sequence_gap),
-      migrate_batch_bytes_per_sec_(srv->GetConfig()->migrate_batch_rate_limit_mb * MiB),
-      migrate_batch_size_bytes_(srv->GetConfig()->migrate_batch_size_kb * KiB) {
+      max_migration_speed_(srv->GetConfig()->GetSnapshot()->migrate_speed),
+      max_pipeline_size_(srv->GetConfig()->GetSnapshot()->pipeline_size),
+      seq_gap_limit_(srv->GetConfig()->GetSnapshot()->sequence_gap),
+      migrate_batch_bytes_per_sec_(srv->GetConfig()->GetSnapshot()->migrate_batch_rate_limit_mb * MiB),
+      migrate_batch_size_bytes_(srv->GetConfig()->GetSnapshot()->migrate_batch_size_kb * KiB) {
   // Let metadata_cf_handle_ be nullptr, and get them in real time to avoid accessing invalid pointer,
   // because metadata_cf_handle_ and db_ will be destroyed if DB is reopened.
   // [Situation]:
@@ -91,9 +91,10 @@ Status SlotMigrator::PerformSlotRangeMigration(const std::string &node_id, std::
   }
   migration_state_ = MigrationState::kStarted;
 
-  auto speed = srv_->GetConfig()->migrate_speed;
-  auto seq_gap = srv_->GetConfig()->sequence_gap;
-  auto pipeline_size = srv_->GetConfig()->pipeline_size;
+  auto cfg = srv_->GetConfig()->GetSnapshot();
+  auto speed = cfg->migrate_speed;
+  auto seq_gap = cfg->sequence_gap;
+  auto pipeline_size = cfg->pipeline_size;
 
   if (speed <= 0) {
     speed = 0;
@@ -275,7 +276,7 @@ Status SlotMigrator::startMigration() {
   dst_fd_.Reset(*result);
 
   // Auth first
-  std::string pass = srv_->GetConfig()->requirepass;
+  std::string pass = srv_->GetConfig()->GetSnapshot()->requirepass;
   if (!pass.empty()) {
     auto s = authOnDstNode(*dst_fd_, pass);
     if (!s.IsOK()) {
@@ -289,7 +290,7 @@ Status SlotMigrator::startMigration() {
     return s.Prefixed(errFailedToSetImportStatus);
   }
 
-  migration_type_ = srv_->GetConfig()->migrate_type;
+  migration_type_ = srv_->GetConfig()->GetSnapshot()->migrate_type;
 
   // If the APPLYBATCH command is not supported on the destination,
   // we will fall back to the redis-command migration type.

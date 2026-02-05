@@ -120,7 +120,8 @@ uint64_t GenerateFunctionFlags(uint64_t flags, const std::vector<std::string> &a
   return flags;
 }
 
-uint64_t GenerateFCallFlags(uint64_t flags, const std::vector<std::string> &, const Config &config) {
+uint64_t GenerateFCallFlags(uint64_t flags, const std::vector<std::string> &,
+                            const Config::RuntimeConfigSnapshot &config) {
   if (!config.lua_strict_key_accessing) {
     return flags | kCmdExclusive;
   }

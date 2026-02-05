@@ -825,6 +825,8 @@ void Config::initFieldCallback() {
       field_iter->second->callback = iter.second;
     }
   }
+
+  UpdateRuntimeSnapshot();
 }
 
 std::string Config::NodesFilePath() const { return dir + "/nodes.conf"; }
@@ -839,6 +841,7 @@ void Config::SetMaster(const std::string &host, uint32_t port) {
       error("Failed to set the value of 'slaveof' setting: {}", s.Msg());
     }
   }
+  UpdateRuntimeSnapshot();
 }
 
 void Config::ClearMaster() {
@@ -851,6 +854,7 @@ void Config::ClearMaster() {
       error("Failed to clear the value of 'slaveof' setting: {}", s.Msg());
     }
   }
+  UpdateRuntimeSnapshot();
 }
 
 Status Config::parseConfigFromPair(const std::pair<std::string, std::string> &input, int line_number) {
@@ -971,7 +975,9 @@ Status Config::Load(const CLIOptions &opts) {
       }
     }
   }
-  return finish();
+  auto s = finish();
+  if (s.IsOK()) UpdateRuntimeSnapshot();
+  return s;
 }
 
 void Config::Get(const std::string &key, std::vector<std::string> *values) const {
@@ -1017,10 +1023,81 @@ Status Config::Set(Server *srv, std::string key, const std::string &value) {
         return set_status.Prefixed("failed to rollback the value");
       }
     }
+    if (s.IsOK()) UpdateRuntimeSnapshot();
     return s;
   }
 
+  UpdateRuntimeSnapshot();
   return Status::OK();
+}
+
+std::shared_ptr<Config::RuntimeConfigSnapshot> Config::BuildRuntimeSnapshot() const {
+  auto snapshot = std::make_shared<RuntimeConfigSnapshot>();
+  snapshot->masterauth = masterauth;
+  snapshot->requirepass = requirepass;
+  snapshot->master_host = master_host;
+  snapshot->master_port = master_port;
+
+  snapshot->resp3_enabled = resp3_enabled;
+  snapshot->proto_max_bulk_len = proto_max_bulk_len;
+  snapshot->lua_strict_key_accessing = lua_strict_key_accessing;
+  snapshot->lua_time_limit = lua_time_limit;
+
+  snapshot->maxclients = maxclients;
+  snapshot->acceptor_queue_limit = acceptor_queue_limit;
+  snapshot->sni_max_workers_percent = sni_max_workers_percent;
+  snapshot->sni_overdraft_percent = sni_overdraft_percent;
+  snapshot->timeout = timeout;
+
+  snapshot->replication_connect_timeout_ms = replication_connect_timeout_ms;
+  snapshot->replication_recv_timeout_ms = replication_recv_timeout_ms;
+  snapshot->max_replication_delay_bytes = max_replication_delay_bytes;
+  snapshot->max_replication_delay_updates = max_replication_delay_updates;
+  snapshot->max_replication_mb = max_replication_mb;
+  snapshot->replication_group_sync = replication_group_sync;
+  snapshot->replication_no_slowdown = replication_no_slowdown;
+  snapshot->master_use_repl_port = master_use_repl_port;
+  snapshot->replica_announce_ip = replica_announce_ip;
+  snapshot->replica_announce_port = replica_announce_port;
+  snapshot->slave_readonly = slave_readonly;
+  snapshot->slave_serve_stale_data = slave_serve_stale_data;
+  snapshot->slave_empty_db_before_fullsync = slave_empty_db_before_fullsync;
+  snapshot->fullsync_recv_file_delay = fullsync_recv_file_delay;
+  snapshot->migrate_speed = migrate_speed;
+  snapshot->pipeline_size = pipeline_size;
+  snapshot->sequence_gap = sequence_gap;
+  snapshot->migrate_type = migrate_type;
+  snapshot->migrate_batch_size_kb = migrate_batch_size_kb;
+  snapshot->migrate_batch_rate_limit_mb = migrate_batch_rate_limit_mb;
+
+  snapshot->json_max_nesting_depth = json_max_nesting_depth;
+  snapshot->json_storage_format = json_storage_format;
+  snapshot->max_bitmap_to_string_mb = max_bitmap_to_string_mb;
+  snapshot->profiling_sample_ratio = profiling_sample_ratio;
+  snapshot->profiling_sample_all_commands = profiling_sample_all_commands;
+  snapshot->profiling_sample_commands = profiling_sample_commands;
+  snapshot->profiling_sample_record_threshold_ms = profiling_sample_record_threshold_ms;
+
+  snapshot->rocks_db = rocks_db;
+  snapshot->force_compact_file_age = force_compact_file_age;
+  snapshot->force_compact_file_min_deleted_percentage = force_compact_file_min_deleted_percentage;
+
+  snapshot->repl_namespace_enabled = repl_namespace_enabled;
+  snapshot->persist_cluster_nodes_enabled = persist_cluster_nodes_enabled;
+
+  snapshot->is_slave = !master_host.empty();
+  return snapshot;
+}
+
+void Config::UpdateRuntimeSnapshot() {
+  auto snapshot = BuildRuntimeSnapshot();
+  std::atomic_store_explicit(&runtime_snapshot_,
+                             std::static_pointer_cast<const RuntimeConfigSnapshot>(std::move(snapshot)),
+                             std::memory_order_release);
+}
+
+std::shared_ptr<const Config::RuntimeConfigSnapshot> Config::GetSnapshot() const {
+  return std::atomic_load_explicit(&runtime_snapshot_, std::memory_order_acquire);
 }
 
 bool Config::checkFieldValueIsDefault(const std::string &key, const std::string &value) const {

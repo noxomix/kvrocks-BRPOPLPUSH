@@ -452,7 +452,7 @@ bool Connection::IsSubscribed() const {
 }
 
 bool Connection::IsProfilingEnabled(const std::string &cmd) {
-  auto config = srv_->GetConfig();
+  auto config = srv_->GetConfig()->GetSnapshot();
   if (config->profiling_sample_ratio == 0) return false;
 
   if (!config->profiling_sample_all_commands &&
@@ -471,7 +471,7 @@ bool Connection::IsProfilingEnabled(const std::string &cmd) {
 }
 
 void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration) {
-  int threshold = srv_->GetConfig()->profiling_sample_record_threshold_ms;
+  int threshold = srv_->GetConfig()->GetSnapshot()->profiling_sample_record_threshold_ms;
   if (threshold > 0 && static_cast<int>(duration / 1000) < threshold) {
     rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
     return;
@@ -535,14 +535,15 @@ static bool IsAllowedInSubscribedMode(const std::string &cmd_name) {
 }
 
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
-  const Config *config = srv_->GetConfig();
   std::string reply;
-  const std::string &password = config->requirepass;
 
   while (!to_process_cmds->empty()) {
     CommandTokens cmd_tokens = std::move(to_process_cmds->front());
     to_process_cmds->pop_front();
     if (cmd_tokens.empty()) continue;
+    auto config = srv_->GetConfig()->GetSnapshot();
+    bool cluster_enabled = srv_->GetConfig()->cluster_enabled;
+    const std::string &password = config->requirepass;
 
     bool is_multi_exec = IsFlagEnabled(Connection::kMultiExec);
     if (IsFlagEnabled(redis::Connection::kCloseAfterReply) && !is_multi_exec) break;
@@ -647,7 +648,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
 
-    if (config->cluster_enabled) {
+    if (cluster_enabled) {
       s = srv_->cluster->CanExecByMySelf(attributes, cmd_tokens, this);
       if (!s.IsOK()) {
         Reply(redis::Error(s));
@@ -714,7 +715,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
 
       std::vector<GlobalIndexer::RecordResult> index_records;
       if (!srv_->index_mgr.index_map.empty() && IsCmdForIndexing(cmd_flags, attributes->category) &&
-          !config->cluster_enabled) {
+          !cluster_enabled) {
         attributes->ForEachKeyRange(
             [&, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
               key_range.ForEachKey(

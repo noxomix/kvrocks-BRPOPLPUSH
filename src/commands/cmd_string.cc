@@ -47,7 +47,7 @@ class CommandGet : public Commander {
     // which we need to fall back to the bitmap's GetString according
     // to the `max-bitmap-to-string-mb` configuration.
     if (s.IsInvalidArgument()) {
-      Config *config = srv->GetConfig();
+      auto config = srv->GetConfig()->GetSnapshot();
       uint32_t max_btos_size = static_cast<uint32_t>(config->max_bitmap_to_string_mb) * MiB;
       redis::Bitmap bitmap_db(srv->storage, conn->GetNamespace());
       s = bitmap_db.GetString(ctx, args_[1], max_btos_size, &value);
@@ -88,7 +88,7 @@ class CommandGetEx : public Commander {
     // which we need to fall back to the bitmap's GetString according
     // to the `max-bitmap-to-string-mb` configuration.
     if (s.IsInvalidArgument()) {
-      Config *config = srv->GetConfig();
+      auto config = srv->GetConfig()->GetSnapshot();
       uint32_t max_btos_size = static_cast<uint32_t>(config->max_bitmap_to_string_mb) * MiB;
       redis::Bitmap bitmap_db(srv->storage, conn->GetNamespace());
       s = bitmap_db.GetString(ctx, args_[1], max_btos_size, &value);
@@ -235,7 +235,7 @@ class CommandSetRange : public Commander {
     redis::String string_db(srv->storage, conn->GetNamespace());
 
     auto total = offset_ + args_[3].size();
-    if (total > srv->GetConfig()->proto_max_bulk_len) {
+    if (total > srv->GetConfig()->GetSnapshot()->proto_max_bulk_len) {
       return {Status::RedisExecErr, "string exceeds maximum allowed size"};
     }
 

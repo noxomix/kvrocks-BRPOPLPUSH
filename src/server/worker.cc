@@ -133,7 +133,7 @@ std::map<int, redis::Connection *> Worker::GetConnectionsSnapshot() {
 }
 
 void Worker::TimerCB(int, [[maybe_unused]] int16_t events) {
-  auto config = srv->GetConfig();
+  auto config = srv->GetConfig()->GetSnapshot();
   if (config->timeout == 0) return;
   KickoutIdleClients(config->timeout);
 }
@@ -371,7 +371,7 @@ Status Worker::AddConnection(redis::Connection *c) {
     return {Status::NotOK, "connection was exists"};
   }
 
-  int max_clients = srv->GetConfig()->maxclients;
+  int max_clients = srv->GetConfig()->GetSnapshot()->maxclients;
   if (srv->IncrClientNum() >= max_clients) {
     srv->DecrClientNum();
     return {Status::NotOK, "max number of clients reached"};
@@ -904,7 +904,7 @@ void Worker::DispatchConnection(PendingConnection conn) {
     return;
   }
 
-  size_t limit = srv->GetConfig()->acceptor_queue_limit;
+  size_t limit = srv->GetConfig()->GetSnapshot()->acceptor_queue_limit;
   bool drop = false;
   {
     std::lock_guard<std::mutex> lock(pending_conns_mu_);

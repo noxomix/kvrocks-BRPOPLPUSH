@@ -205,7 +205,7 @@
 ## Offen
 
 ### Hoch
-- [ ] **CONFIG SET Race** - Config-Felder ohne globalen Lock, Background-Threads lesen parallel
+- [x] **CONFIG SET Race** - Config-Felder ohne globalen Lock, Background-Threads lesen parallel
 - [x] **Lock-freier Accept-Hot-Path** - keine per-accept Mutex- oder Rebuild-Kosten
 
 ### Mittel - O(n) Noisy-Neighbor Commands

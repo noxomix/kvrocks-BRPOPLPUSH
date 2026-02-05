@@ -74,7 +74,8 @@ void LuaTimeoutHook(lua_State *lua, lua_Debug *) {
   }
 
   // Check timeout
-  int limit = ctx->conn->GetServer()->GetConfig()->lua_time_limit;
+  auto cfg = ctx->conn->GetServer()->GetConfig()->GetSnapshot();
+  int limit = cfg->lua_time_limit;
   if (limit > 0) {
     uint64_t elapsed = util::GetTimeStampMS() - worker->GetLuaScriptStartMs();
     if (elapsed > static_cast<uint64_t>(limit)) {
@@ -895,7 +896,7 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
 
   auto *conn = script_run_ctx->conn;
   auto *srv = conn->GetServer();
-  Config *config = srv->GetConfig();
+  auto config = srv->GetConfig()->GetSnapshot();
 
   auto cmd_flags = attributes->GenerateFlags(args, *config);
 
@@ -939,7 +940,7 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
         args);
   }
 
-  if (config->cluster_enabled) {
+  if (srv->GetConfig()->cluster_enabled) {
     if (script_run_ctx->flags & ScriptFlagType::kScriptNoCluster) {
       PushError(lua, "Can not run script on cluster, 'no-cluster' flag is set");
       return raise_error ? RaiseError(lua) : 1;
@@ -1076,7 +1077,7 @@ int RedisSetResp(lua_State *lua) {
     return RaiseError(lua);
   }
   conn->SetProtocolVersion(resp == 2 ? redis::RESP::v2 : redis::RESP::v3);
-  if (resp == 3 && !srv->GetConfig()->resp3_enabled) {
+  if (resp == 3 && !srv->GetConfig()->GetSnapshot()->resp3_enabled) {
     PushError(lua, "You need set resp3-enabled to yes to enable RESP3.");
     return RaiseError(lua);
   }

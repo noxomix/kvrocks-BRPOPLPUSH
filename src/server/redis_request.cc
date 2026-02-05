@@ -125,7 +125,7 @@ Status Request::Tokenize(evbuffer *input) {
         }
 
         bulk_len_ = *parse_result;
-        if (bulk_len_ > srv_->GetConfig()->proto_max_bulk_len) {
+        if (bulk_len_ > srv_->GetConfig()->GetSnapshot()->proto_max_bulk_len) {
           return {Status::NotOK, "Protocol error: invalid bulk length"};
         }
 

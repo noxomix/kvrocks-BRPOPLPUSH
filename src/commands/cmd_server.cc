@@ -67,8 +67,9 @@ class CommandNamespace : public Commander {
  public:
   Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     Config *config = srv->GetConfig();
+    auto snapshot = config->GetSnapshot();
     std::string sub_command = util::ToLower(args_[1]);
-    if (config->repl_namespace_enabled && config->IsSlave() && sub_command != "get") {
+    if (snapshot->repl_namespace_enabled && config->IsSlave() && sub_command != "get") {
       return {Status::RedisExecErr, "namespace is read-only for slave"};
     }
     if (args_.size() == 3 && sub_command == "get") {
@@ -80,7 +81,7 @@ class CommandNamespace : public Commander {
           namespaces.emplace_back(token.first);   // token
         }
         namespaces.emplace_back(kDefaultNamespace);
-        namespaces.emplace_back(config->requirepass);
+        namespaces.emplace_back(snapshot->requirepass);
         *output = ArrayOfBulkStrings(namespaces);
       } else {
         auto token = srv->GetNamespace()->Get(args_[2]);
@@ -914,7 +915,7 @@ class CommandHello final : public Commander {
     // What the client want is the Redis compatible version instead of the Kvrocks version.
     output_list.push_back(redis::BulkString(REDIS_VERSION));
     output_list.push_back(redis::BulkString("proto"));
-    if (srv->GetConfig()->resp3_enabled) {
+    if (srv->GetConfig()->GetSnapshot()->resp3_enabled) {
       output_list.push_back(redis::Integer(protocol));
       conn->SetProtocolVersion(protocol == 3 ? RESP::v3 : RESP::v2);
     } else {

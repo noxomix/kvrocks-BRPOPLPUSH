@@ -182,8 +182,10 @@ using CommandKeyRangeGen = std::function<CommandKeyRange(const std::vector<std::
 
 using CommandKeyRangeVecGen = std::function<std::vector<CommandKeyRange>(const std::vector<std::string> &)>;
 
-struct AdditionalFlagGen : std::function<uint64_t(uint64_t, const std::vector<std::string> &, const Config &)> {
-  using BaseType = std::function<uint64_t(uint64_t, const std::vector<std::string> &, const Config &)>;
+struct AdditionalFlagGen
+    : std::function<uint64_t(uint64_t, const std::vector<std::string> &, const Config::RuntimeConfigSnapshot &)> {
+  using BaseType =
+      std::function<uint64_t(uint64_t, const std::vector<std::string> &, const Config::RuntimeConfigSnapshot &)>;
 
   AdditionalFlagGen() = default;
 
@@ -191,7 +193,9 @@ struct AdditionalFlagGen : std::function<uint64_t(uint64_t, const std::vector<st
   static auto Make(F &&func) {
     if constexpr (std::is_invocable_r_v<uint64_t, F, uint64_t, const std::vector<std::string> &>) {
       return BaseType(
-          [=](uint64_t flag, const std::vector<std::string> &args, const Config &) { return func(flag, args); });
+          [=](uint64_t flag, const std::vector<std::string> &args, const Config::RuntimeConfigSnapshot &) {
+            return func(flag, args);
+          });
     } else {
       return BaseType(std::forward<F>(func));
     }
@@ -271,7 +275,7 @@ struct CommandAttributes {
 
   static std::vector<std::string> FlagsToString(uint64_t flags);
 
-  auto GenerateFlags(const std::vector<std::string> &args, const Config &config) const {
+  auto GenerateFlags(const std::vector<std::string> &args, const Config::RuntimeConfigSnapshot &config) const {
     uint64_t res = flags_;
     if (flag_gen_) res = flag_gen_(res, args, config);
     return res;

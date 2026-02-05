@@ -34,7 +34,7 @@ rocksdb::Status Json::write(engine::Context &ctx, Slice ns_key, JsonMetadata *me
   auto s = batch->PutLogData(log_data.Encode());
   if (!s.ok()) return s;
 
-  auto format = storage_->GetConfig()->json_storage_format;
+  auto format = storage_->GetConfig()->GetSnapshot()->json_storage_format;
   metadata->format = format;
 
   std::string val;
@@ -42,9 +42,9 @@ rocksdb::Status Json::write(engine::Context &ctx, Slice ns_key, JsonMetadata *me
 
   Status redis_status;
   if (format == JsonStorageFormat::JSON) {
-    redis_status = json_val.Dump(&val, storage_->GetConfig()->json_max_nesting_depth);
+    redis_status = json_val.Dump(&val, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
   } else if (format == JsonStorageFormat::CBOR) {
-    redis_status = json_val.DumpCBOR(&val, storage_->GetConfig()->json_max_nesting_depth);
+    redis_status = json_val.DumpCBOR(&val, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
   } else {
     return rocksdb::Status::InvalidArgument("JSON storage format not supported");
   }
@@ -86,7 +86,7 @@ rocksdb::Status Json::read(engine::Context &ctx, const Slice &ns_key, JsonMetada
 
 rocksdb::Status Json::create(engine::Context &ctx, const std::string &ns_key, JsonMetadata &metadata,
                              const std::string &value) {
-  auto json_res = JsonValue::FromString(value, storage_->GetConfig()->json_max_nesting_depth);
+  auto json_res = JsonValue::FromString(value, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
   if (!json_res) return rocksdb::Status::InvalidArgument(json_res.Msg());
   auto json_val = *std::move(json_res);
 
@@ -136,7 +136,7 @@ rocksdb::Status Json::Set(engine::Context &ctx, const std::string &user_key, con
 
   if (!s.ok()) return s;
 
-  auto new_res = JsonValue::FromString(value, storage_->GetConfig()->json_max_nesting_depth);
+  auto new_res = JsonValue::FromString(value, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
   if (!new_res) return rocksdb::Status::InvalidArgument(new_res.Msg());
   auto new_val = *std::move(new_res);
 
@@ -182,7 +182,7 @@ rocksdb::Status Json::ArrAppend(engine::Context &ctx, const std::string &user_ke
   std::vector<jsoncons::json> append_values;
   append_values.reserve(values.size());
   for (auto &v : values) {
-    auto value_res = JsonValue::FromString(v, storage_->GetConfig()->json_max_nesting_depth);
+    auto value_res = JsonValue::FromString(v, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     if (!value_res) return rocksdb::Status::InvalidArgument(value_res.Msg());
     auto value = *std::move(value_res);
     append_values.emplace_back(std::move(value.value));
@@ -208,7 +208,7 @@ rocksdb::Status Json::ArrIndex(engine::Context &ctx, const std::string &user_key
                                const std::string &needle, ssize_t start, ssize_t end, Optionals<ssize_t> *results) {
   auto ns_key = AppendNamespacePrefix(user_key);
 
-  auto needle_res = JsonValue::FromString(needle, storage_->GetConfig()->json_max_nesting_depth);
+  auto needle_res = JsonValue::FromString(needle, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
   if (!needle_res) return rocksdb::Status::InvalidArgument(needle_res.Msg());
   auto needle_value = *std::move(needle_res);
 
@@ -313,7 +313,7 @@ rocksdb::Status Json::ArrInsert(engine::Context &ctx, const std::string &user_ke
   std::vector<jsoncons::json> insert_values;
   insert_values.reserve(values.size());
   for (auto &v : values) {
-    auto value_res = JsonValue::FromString(v, storage_->GetConfig()->json_max_nesting_depth);
+    auto value_res = JsonValue::FromString(v, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     if (!value_res) return rocksdb::Status::InvalidArgument(value_res.Msg());
     auto value = *std::move(value_res);
     insert_values.emplace_back(std::move(value.value));
@@ -565,7 +565,7 @@ rocksdb::Status Json::MSet(engine::Context &ctx, const std::vector<std::string> 
   if (!s.ok()) return s;
 
   for (size_t i = 0; i < user_keys.size(); i++) {
-    auto json_res = JsonValue::FromString(values[i], storage_->GetConfig()->json_max_nesting_depth);
+    auto json_res = JsonValue::FromString(values[i], storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     if (!json_res) return rocksdb::Status::InvalidArgument(json_res.Msg());
 
     JsonMetadata metadata;
@@ -593,7 +593,7 @@ rocksdb::Status Json::MSet(engine::Context &ctx, const std::vector<std::string> 
 
   for (auto &[ns_key, updated_object] : dirty_keys) {
     auto &[value, metadata] = updated_object;
-    auto format = storage_->GetConfig()->json_storage_format;
+    auto format = storage_->GetConfig()->GetSnapshot()->json_storage_format;
     metadata.format = format;
 
     std::string val;
@@ -601,9 +601,9 @@ rocksdb::Status Json::MSet(engine::Context &ctx, const std::vector<std::string> 
 
     Status res;
     if (format == JsonStorageFormat::JSON) {
-      res = value.Dump(&val, storage_->GetConfig()->json_max_nesting_depth);
+      res = value.Dump(&val, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     } else if (format == JsonStorageFormat::CBOR) {
-      res = value.DumpCBOR(&val, storage_->GetConfig()->json_max_nesting_depth);
+      res = value.DumpCBOR(&val, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     } else {
       return rocksdb::Status::InvalidArgument("JSON storage format not supported");
     }
@@ -653,7 +653,7 @@ rocksdb::Status Json::DebugMemory(engine::Context &ctx, const std::string &user_
     JsonValue json_val;
     auto s = read(ctx, ns_key, &metadata, &json_val);
     if (!s.ok()) return s;
-    auto str_bytes = json_val.GetBytes(path, metadata.format, storage_->GetConfig()->json_max_nesting_depth);
+    auto str_bytes = json_val.GetBytes(path, metadata.format, storage_->GetConfig()->GetSnapshot()->json_max_nesting_depth);
     if (!str_bytes) return rocksdb::Status::InvalidArgument(str_bytes.Msg());
     *results = std::move(*str_bytes);
   }

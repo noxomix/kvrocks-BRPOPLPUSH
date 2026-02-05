@@ -321,7 +321,7 @@ Status Server::AddMaster(const std::string &host, uint32_t port, bool force_reco
   // For master using old version, it uses replication thread to implement
   // replication, and uses 'listen-port + 1' as thread listening port.
   uint32_t master_listen_port = port;
-  if (GetConfig()->master_use_repl_port) master_listen_port += 1;
+  if (GetConfig()->GetSnapshot()->master_use_repl_port) master_listen_port += 1;
 
   replication_thread_ = std::make_unique<ReplicationThread>(host, master_listen_port, this);
   auto s = replication_thread_->Start([this]() { return PrepareRestoreDB(); },
@@ -2665,8 +2665,9 @@ void Server::updateAllWatchedKeys() {
 }
 
 void Server::UpdateWatchedKeysFromArgs(const std::string &ns, const std::vector<std::string> &args,
-                                        const redis::CommandAttributes &attr) {
-  if ((attr.GenerateFlags(args, *GetConfig()) & redis::kCmdWrite) && watched_key_size_ > 0) {
+                                       const redis::CommandAttributes &attr) {
+  auto config = GetConfig()->GetSnapshot();
+  if ((attr.GenerateFlags(args, *config) & redis::kCmdWrite) && watched_key_size_ > 0) {
     attr.ForEachKeyRange([this, &ns](const std::vector<std::string> &args,
                                      redis::CommandKeyRange range) { updateWatchedKeysFromRange(ns, args, range); },
                          args, [this](const std::vector<std::string> &) { updateAllWatchedKeys(); });
@@ -2791,7 +2792,7 @@ std::string Server::GetKeyNameFromCursor(const std::string &cursor, CursorType c
 }
 
 AuthResult Server::AuthenticateUser(const std::string &user_password, std::string *ns) {
-  const auto &requirepass = GetConfig()->requirepass;
+  const auto &requirepass = GetConfig()->GetSnapshot()->requirepass;
   if (requirepass.empty()) {
     return AuthResult::NO_REQUIRE_PASS;
   }
