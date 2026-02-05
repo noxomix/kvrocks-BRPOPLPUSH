@@ -158,144 +158,77 @@
 - [x] `monitor_namespaces_mu_` - Per-NS Monitor (`server.h:496`)
 - [x] `LogCollector` - Per-NS Deque + Mutex
 
+### Concurrency
+- [x] **LockManager Hash-Kollisionen** - `lock_mgr_(20)` = 1M Buckets (`storage.cc:82`)
+- [x] **GetConnections() Data-Race** - `GetConnectionsSnapshot()` unter `conns_mu_`
+- [x] **Worker Destruktor UB** - Zwei-Phasen-Cleanup
+- [x] **Cross-Thread Conn Reads** - thread-sichere `Connection::ClientInfo` Snapshots
+- [x] **PubSub Subscribe-State Race** - atomare Subscribe-Counter
+- [x] **FD-Reuse Misrouting** - async Reply/Wakeup via `(fd + conn_id)` validiert
+- [x] **DBScan Map Race** - reads unter `db_job_mu_`
+- [x] **BGSAVE/Compact Flags Race** - INFO/Persistence reads unter `db_job_mu_`
+- [x] **TLS Repl SSL Race** - Feed-Thread pausiert `EV_READ` unter `bufferevent`-Lock
+
+### FairScheduler (SNI)
+- [x] **UAF Risk** - `CleanupInactiveSNIs()` / `SelectWorker()` Race behoben
+- [x] **Clamp-UB** - `active_snis > total_workers` korrigiert
+- [x] **Counter-Leak** - `active_connections`/`active_sni_count_` Leak behoben
+- [x] **Empty-SNI Leak** - `OnConnectionClosed()` dekrementiert jetzt korrekt
+- [x] **Rebalance Drift** - Lazy `RefreshPreferredWorkers()` bei Select
+- [x] **Per-SNI Mutex Contention** - lockfreier immutable Snapshot
+- [x] **TLS-SNI Flaky Erkennung** - bounded Retry in `ExtractSNIFromClientHello()`
+- [x] **Throughput Rework** - Concentration-Gating entfernt, Fair Pool strikt über Share+Overdraft
+- [x] **Config-Bereinigung** - nur noch `sni-max-workers-percent` + `sni-overdraft-percent`
+- [x] **Observability** - INFO `Scheduler` zeigt pro-SNI Stats
+
+### PubSub/RESP
+- [x] **Subscribed-Mode Guard** - RESP2-kompatibel implementiert
+- [x] **RESET für PubSub** - ruft `SUnsubscribeAll()` auf
+- [x] **Client-Type** - berücksichtigt `SSUBSCRIBE`
+- [x] **TimeSeries RESP3** - RESP2-Clients korrekt bedient
+- [x] **COMMAND INFO Null-Typ** - korrigiert
+
+### Accept-Dispatch Architecture
+- [x] **Phase 1** - Worker-Seite + Acceptor-Seite vollständig
+- [x] **Phase 2** - Lua-Aware Routing (`SelectWorker()` überspringt blockierte Worker)
+- [x] **Phase 3** - SNI-basiertes Fair Scheduling (FairScheduler Klasse)
+- [x] **Accept-Dispatch Hardening** - Worker-Snapshot (RCU), StopAccepting, bounded queue
+
+### Bereits geschützt (O(n) Commands)
+- [x] SORT - `SORT_LENGTH_LIMIT = 512` (`redis_db.h:39`)
+- [x] XRANGE/XREVRANGE - COUNT Option
+- [x] GEORADIUS/GEOSEARCH - COUNT Option
+- [x] EVAL/FCALL - `WorkExclusivityGuard(ns)`
+
 ---
 
 ## Offen
 
-### Hoch - LockManager
-- [x] **LockManager Hash-Kollisionen** (`storage.cc:82`)
-  - Problem: 65,536 Buckets → 86% Kollision bei 512 Workers
-  - Fix: `lock_mgr_(20)` = 1M Buckets → ~12% Kollision
-  - Hinweis: Hash war bereits namespace-aware (ns_key), nur zu wenige Buckets
+### Hoch
+- [ ] **CONFIG SET Race** - Config-Felder ohne globalen Lock, Background-Threads lesen parallel
+- [x] **Lock-freier Accept-Hot-Path** - keine per-accept Mutex- oder Rebuild-Kosten
 
-### Hoch - Concurrency
-- [x] **GetConnections() Data-Race** → Resize nutzt jetzt `GetConnectionsSnapshot()` unter `conns_mu_`
-- [x] **Worker Destruktor UB** → Zwei-Phasen-Cleanup (Map unter Lock leeren, danach kontrolliert freigeben)
-- [x] **Cross-Thread Conn Reads** → `GetClientsStr/GetClientCounts/KillClient` nutzen thread-sichere `Connection::ClientInfo` Snapshots
-- [x] **PubSub Subscribe-State Race (UB)** → geloest via atomare Subscribe-Counter (cross-thread Leser ohne Vektorzugriff)
-- [x] **FD-Reuse Misrouting (PubSub/Blocking/Streams/WAIT)** → async Reply/Wakeup jetzt via `(fd + conn_id)` validiert
-- [x] **DBScan Map Race** → `db_scan_infos_` reads jetzt immer unter `db_job_mu_` (GetLatestKeyNumStats/GetLastScanTime)
-- [x] **BGSAVE/Compact Flags Race** → INFO/Persistence reads unter `db_job_mu_`; async `TryPublish`-Fehler rollen Flags sauber zurueck
-- [ ] **CONFIG SET Race** → Config-Felder ohne globalen Lock, Background-Threads lesen parallel
-- [x] **TLS Repl SSL Race** → Feed-Thread pausiert `EV_READ` unter `bufferevent`-Lock waehrend TLS-Send (kein paralleles `SSL_read`/`SSL_write` auf gleicher SSL-Session)
-
-### Hoch - FairScheduler (SNI)
-- [x] **UAF Risk:** `CleanupInactiveSNIs()` loescht `SNIState` waehrend `SelectWorker()` mit rohem Pointer arbeitet
-- [x] **Clamp-UB:** `active_snis > total_workers` kann `max < min` erzeugen (`std::clamp` UB)
-- [x] **Counter-Leak:** `active_connections`/`active_sni_count_` steigt, wenn SelectWorker scheitert oder FD geschlossen wird
-- [x] **Empty-SNI Leak:** leeres Scheduling-Key zaehlt hoch, `OnConnectionClosed()` dekrementiert nicht
-
-### Mittel - FairScheduler (SNI)
-- [x] **Rebalance Drift:** `preferred_workers` bleibt nach Aenderungen von `active_sni_count_`/Worker-Count stale
-  - Fix: Lazy `RefreshPreferredWorkers()` bei Select, wenn Worker-Count/Fair-Share geaendert ist
-- [x] **Per-SNI Mutex Contention:** `SelectFromPreferred()` lockt pro Accept (hot SNI kann bottlenecken)
-  - Fix: `preferred_workers` als lockfreier immutable Snapshot (`atomic_load/store` auf `shared_ptr`)
-- [x] **TLS-SNI Flaky Erkennung bei Accept:** sofortiges `MSG_PEEK` konnte ClientHello sporadisch verpassen → gemischte Scheduling-Keys
-  - Fix: bounded Retry (1x/1ms) in `ExtractSNIFromClientHello()`, plus "voller TLS-Record ohne SNI" fast-exit
-
-### Hoch - FairScheduler (SNI) Throughput Rework (2026-02-04)
-- [x] **Concentration-Gating entfernen**: keine "Worker erst ab N Connections freischalten" Logik mehr (`needed_for_load`, `sni-connections-per-worker`, `sni-min-workers`)
-- [x] **Fair Pool strikt ueber Share+Overdraft**: pro SNI `fair_share` als Basis, optional `overdraft` als Burst-Kapazitaet; Round-Robin ueber den zugewiesenen Pool
-- [x] **2-Phasen Auswahl im Hot Path**: zuerst innerhalb Fair-Share Pool, nur bei Block/Backpressure auf Overdraft-Bereich ausweichen
-- [ ] **Lock/Allocation-freier Accept-Hot-Path behalten**: keine per-accept Mutex- oder Rebuild-Kosten
-- [x] **Config-Bereinigung**: alte Konzentrations-Parameter entfernt; nur `sni-max-workers-percent` + `sni-overdraft-percent`
-- [x] **Observability ergaenzen**: INFO `Scheduler` zeigt `active_snis` sowie pro-SNI `fair_share`, `overdraft_limit`, `target_pool_size`
-- [x] **Tests erweitern**:
-  - non-TLS single-key (`default.domain`) verteilt frueh breit statt auf wenige Worker zu konzentrieren
-  - Multi-SNI Fairness bleibt erhalten (kein Starvation)
-  - Lua-blocked Worker werden weiterhin vermieden
-### Mittel - O(n) Noisy-Neighbor Commands (Audit 2026-02-01)
-
-**Problem:** Diese Commands blockieren einen Worker während der gesamten Iteration.
-Ein böser Tenant kann mit großen Datenstrukturen andere Tenants verlangsamen.
-
-**Lösung:** Config `max_elements_in_response` (0 = unlimited, default)
-**Pattern:** `if (limit > 0 && result.size() > limit) return Error;`
-
-- [ ] **Hash O(n):** HGETALL, HKEYS, HVALS (`cmd_hash.cc`)
-- [ ] **Set O(n):** SMEMBERS (`cmd_set.cc`)
-- [ ] **Set O(n*m):** SINTER, SUNION, SDIFF, SINTERSTORE, SUNIONSTORE, SDIFFSTORE (`cmd_set.cc`)
-- [ ] **ZSet O(n*k):** ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE (`cmd_zset.cc`)
-- [ ] **List O(n):** LRANGE, LINSERT, LREM (`cmd_list.cc`)
-- [ ] **ZSet O(n):** ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE (`cmd_zset.cc`)
-- [ ] **Keys O(n):** KEYS (`cmd_server.cc`)
-
-### Mittel - PubSub/RESP Semantik
-- [x] **Subscribed-Mode Guard fehlt** → auf abonnierter Connection sind Nicht-PubSub-Commands aktuell nicht strikt geblockt (RESP2/Kompatibilitaet)
-- [x] **RESET unvollstaendig fuer PubSub** → `RESET` ruft jetzt auch `SUnsubscribeAll()` auf
-- [x] **Client-Type unvollstaendig** → `GetClientType()/GetFlags()/CanMigrate()` beruecksichtigen `SSUBSCRIBE`
-
-### Mittel - RESP2/RESP3 Kompatibilitaet
-- [x] **TimeSeries antwortet immer RESP3** → `cmd_timeseries.cc` nutzt harte `RESP::v3` (RESP2-Clients bekommen falsche Typen)
-- [x] **COMMAND INFO Null-Typ** → `CommandTable::GetCommandsInfo()` nutzt `NilString(RESP::v2)` ohne Conn-Kontext
+### Mittel - O(n) Noisy-Neighbor Commands
+Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && result.size() > limit) return Error;`
+- [ ] Hash: HGETALL, HKEYS, HVALS (`cmd_hash.cc`)
+- [ ] Set: SMEMBERS (`cmd_set.cc`)
+- [ ] Set O(n*m): SINTER, SUNION, SDIFF + Store-Varianten (`cmd_set.cc`)
+- [ ] ZSet O(n*k): ZUNION, ZINTER, ZDIFF + Store-Varianten (`cmd_zset.cc`)
+- [ ] List: LRANGE, LINSERT, LREM (`cmd_list.cc`)
+- [ ] ZSet: ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE (`cmd_zset.cc`)
+- [ ] Keys: KEYS (`cmd_server.cc`)
 
 ### Niedrig - Concurrency Follow-up
-- [ ] **GetClientInfo Lock-Zeit verkuerzen** → in `GetClientInfo(true)` `client_mu_` nicht waehrend Buffer-Reads (`OutputBufferSize()/InputBufferSize()`) halten
-- [ ] **KillClient Lock-Reacquire reduzieren** → Kandidaten pro Worker gruppieren und nicht pro Kandidat `conns_mu_` neu locken
-- [ ] **GetNamespace API haerten** → `GetNamespace()` liefert `const std::string&`; fuer cross-thread-safe Nutzung auf Snapshot/Kopie umstellen
-
-**Bereits geschützt:**
-- [x] SORT - Hat `SORT_LENGTH_LIMIT = 512` (`redis_db.h:39`)
-- [x] XRANGE/XREVRANGE - Hat COUNT Option
-- [x] GEORADIUS/GEOSEARCH - Hat COUNT Option
-- [x] EVAL/FCALL - Namespace-aware via `WorkExclusivityGuard(ns)` (kein Cross-Tenant-Problem)
+- [ ] **GetClientInfo Lock-Zeit** - `client_mu_` nicht während Buffer-Reads halten
+- [ ] **KillClient Lock-Reacquire** - Kandidaten pro Worker gruppieren
+- [ ] **GetNamespace API** - cross-thread-safe Snapshot/Kopie
 
 ### Later
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
-- [x] **Accept-Dispatch Hardening (Race/FD-Leak)**
-  - Worker-Snapshot (RCU) statt direktem `worker_threads_` Zugriff
-  - StopAccepting + Queue-Drain (keine geparkten FDs)
-  - `acceptor-queue-limit` (bounded pending queue)
-  - Start-Reihenfolge: Workers vor Acceptors
-- [x] **Lua Timeout/Kill - Accept-Dispatch Architecture (Phase 1+2 DONE)**
-  - Ziel: SCRIPT KILL immer erreichbar, auch wenn Worker in lua_pcall blockiert
-  - Konzept: 1..N Accept-Threads nehmen Verbindungen an und verteilen FD an Worker
-  - Worker-Auswahl: round-robin, aber Worker mit `lua_script_running_` ueberspringen (fallback auf any)
-  - **Phase 1 - Worker-Seite (DONE):**
-    - [x] `PendingConnection` struct in worker.h
-    - [x] Dispatch-Queue + eventfd in Worker
-    - [x] `DispatchConnection()` - thread-safe, wakeup via eventfd
-    - [x] `onDispatchEvent()` - batch processing
-    - [x] `createConnectionFromDispatch()` - Connection aus dispatched FD
-  - **Phase 1 - Acceptor-Seite (DONE):**
-    - [x] `StartAcceptors()`, `AcceptorLoop()`, `SelectWorker()` in server.cc
-    - [x] TCP-Listen aus Worker-Konstruktor entfernen (nur Unix-Socket Worker0)
-    - [x] `acceptor-threads` Config (1-16, default 1)
-    - [x] Graceful Shutdown: Threads erst joinen, dann FDs schließen
-    - [x] systemd socket_fd: dup() für sauberes Shutdown
-  - **Phase 2 - Lua-Aware Routing (DONE):**
-    - [x] `SelectWorker()` prüft `IsLuaScriptRunning()` und überspringt blockierte Worker
-    - [x] `lua_sethook` + `LuaTimeoutHook` für Timeout/Kill Detection
-    - [x] `SCRIPT KILL` Command mit `kCmdNoLock` Flag
-    - [x] `lua_time_limit` Config (Default 5000ms)
-    - **Limitierung:** SCRIPT KILL funktioniert nur von NEUER Connection (bestehende Connection auf blockiertem Worker kann nichts senden)
-  - **Phase 3 - SNI-basiertes Fair Scheduling (DONE):**
-    - [x] Config-Optionen in `config.h/cc`:
-      - `sni-max-workers-percent` (Default: 0 = auto) - Maximum
-      - `sni-overdraft-percent` (Default: 30) - Überziehung im Burst
-    - [x] `FairScheduler` Klasse (`fair_scheduler.h/cc`)
-    - [x] SNI-Extraktion aus TLS ClientHello (`tls_util.h/cc`)
-    - [x] `SelectWorker(sni)` mit Fair Share + Overdraft
-    - [x] Connection Tracking (`OnConnectionClosed()`)
-    - [x] `CleanupInactiveSNIs()` in Server::cron() eingehängt
-    - [ ] Go-Tests für Fair Scheduling
-    - Details: siehe `SCHEDULE.md`
-- [ ] **Per-NS Heavy-Command Budget (verhindert Noisy-Neighbor durch O(n)/Lua)**
-  - Idee: neuer Flag `kCmdHeavy` (oder reuse `kCmdSlow`) + Config `max-heavy-per-namespace`
-  - Check in `Connection::ExecuteCommands` vor Ausfuehrung:
-    - wenn heavy und counter(ns) >= limit → `BUSY/TRYAGAIN` (oder custom error)
-    - sonst counter++ und per ScopeExit counter--
-  - Heavy-Kandidaten: O(n)/O(n*m) Commands aus TODO (HGETALL, SMEMBERS, LRANGE, KEYS, Z*RANGE, SINTER/UNION/DIFF, Z*UNION/INTER/DIFF), plus EVAL/FCALL (Lua)
-  - Multi/EXEC: Budget beim EXEC verbrauchen (nicht beim Queue)
-  - Ziel: ein Tenant kann nicht alle Worker mit langen Commands blockieren
-- [ ] **Lua Key-Level Locking** - Wie DragonflyDB: Nur deklarierte Keys locken statt ganzen Namespacep
+- [ ] **Go-Tests für Fair Scheduling**
+- [ ] **Per-NS Heavy-Command Budget** - `kCmdHeavy` Flag + `max-heavy-per-namespace` Config
+- [ ] **Lua Key-Level Locking** - Nur deklarierte Keys locken (wie DragonflyDB)
 - [ ] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
-  - Neue Commands: `EVAL_TX`, `EVALSHA_TX`, `FCALL_TX` (analog zu `_RO` Suffix)
-  - Standalone: Eigenes `BeginTxn`/`CommitTxn`, bei Fehler `DiscardTxn`
-  - In MULTI: Nutzt MULTI's WriteBatch (kein eigenes Rollback)
-  - Redis-kompatibel: EVAL/FCALL bleiben unverändert (kein Rollback)
-  - Aufwand: ~20 Zeilen in `scripting.cc`, ~20 Zeilen in `cmd_function.cc`
-  - Dateien: `cmd_script.cc`, `scripting.cc`, `cmd_function.cc`, `storage.cc`
 
 ---
 

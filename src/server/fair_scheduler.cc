@@ -76,19 +76,17 @@ uint32_t FairScheduler::GetFairWorkerCount(uint32_t total_workers, uint32_t acti
 }
 
 std::shared_ptr<SNIState> FairScheduler::GetOrCreateState(const std::string& sni) {
-  // Fast path: shared lock for lookup
+  auto& shard = sni_shards_[std::hash<std::string>{}(sni) % sni_shards_.size()];
   {
-    std::shared_lock lock(sni_states_mu_);
-    auto it = sni_states_.find(sni);
-    if (it != sni_states_.end()) {
+    std::shared_lock lock(shard.mu);
+    auto it = shard.map.find(sni);
+    if (it != shard.map.end()) {
       return it->second;
     }
   }
 
-  // Slow path: unique lock for insert
-  std::unique_lock lock(sni_states_mu_);
-  // Double-check after acquiring unique lock
-  auto [it, inserted] = sni_states_.try_emplace(sni, std::make_shared<SNIState>(sni));
+  std::unique_lock lock(shard.mu);
+  auto [it, inserted] = shard.map.try_emplace(sni, std::make_shared<SNIState>(sni));
   (void)inserted;
   return it->second;
 }
@@ -238,11 +236,10 @@ void FairScheduler::OnConnectionClosed(const std::string& sni) {
 
   std::shared_ptr<SNIState> state;
   {
-    std::shared_lock lock(sni_states_mu_);
-    auto it = sni_states_.find(sni);
-    if (it != sni_states_.end()) {
-      state = it->second;
-    }
+    auto& shard = sni_shards_[std::hash<std::string>{}(sni) % sni_shards_.size()];
+    std::shared_lock lock(shard.mu);
+    auto it = shard.map.find(sni);
+    if (it != shard.map.end()) state = it->second;
   }
   if (!state) return;
 
@@ -263,15 +260,17 @@ void FairScheduler::CleanupInactiveSNIs() {
   uint64_t now = util::GetTimeStampMS();
   constexpr uint64_t cleanup_timeout_ms = 300000;  // 5 minutes
 
-  std::unique_lock lock(sni_states_mu_);
-  for (auto it = sni_states_.begin(); it != sni_states_.end();) {
-    auto& state = it->second;
-    bool is_dead = state->active_connections.load(std::memory_order_relaxed) == 0 &&
-                   (now - state->last_activity_ms.load(std::memory_order_relaxed)) > cleanup_timeout_ms;
-    if (is_dead) {
-      it = sni_states_.erase(it);
-    } else {
-      ++it;
+  for (auto& shard : sni_shards_) {
+    std::unique_lock lock(shard.mu);
+    for (auto it = shard.map.begin(); it != shard.map.end();) {
+      auto& state = it->second;
+      bool is_dead = state->active_connections.load(std::memory_order_relaxed) == 0 &&
+                     (now - state->last_activity_ms.load(std::memory_order_relaxed)) > cleanup_timeout_ms;
+      if (is_dead) {
+        it = shard.map.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 }
@@ -283,18 +282,19 @@ std::vector<SNIStats> FairScheduler::GetSNIStats() const {
   uint32_t total_workers = snapshot ? static_cast<uint32_t>(snapshot->size()) : 0;
   uint32_t active_snis = GetActiveSNICount();
 
-  std::shared_lock lock(sni_states_mu_);
-  result.reserve(sni_states_.size());
-
-  for (const auto& [sni, state] : sni_states_) {
-    SNIStats stats;
-    stats.sni = sni;
-    stats.active_connections = state->active_connections.load(std::memory_order_relaxed);
-    stats.fair_share = GetFairWorkerCount(total_workers, active_snis);
-    stats.overdraft_limit = GetMaxWorkerCount(total_workers, active_snis);
-    auto preferred = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
-    stats.target_pool_size = preferred ? static_cast<uint32_t>(preferred->size()) : 0;
-    result.push_back(std::move(stats));
+  for (const auto& shard : sni_shards_) {
+    std::shared_lock lock(shard.mu);
+    result.reserve(result.size() + shard.map.size());
+    for (const auto& [sni, state] : shard.map) {
+      SNIStats stats;
+      stats.sni = sni;
+      stats.active_connections = state->active_connections.load(std::memory_order_relaxed);
+      stats.fair_share = GetFairWorkerCount(total_workers, active_snis);
+      stats.overdraft_limit = GetMaxWorkerCount(total_workers, active_snis);
+      auto preferred = std::atomic_load_explicit(&state->preferred_workers, std::memory_order_acquire);
+      stats.target_pool_size = preferred ? static_cast<uint32_t>(preferred->size()) : 0;
+      result.push_back(std::move(stats));
+    }
   }
 
   return result;

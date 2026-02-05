@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
@@ -94,8 +95,12 @@ class FairScheduler {
   Server* srv_;
   FairSchedulerConfig config_;
 
-  mutable std::shared_mutex sni_states_mu_;
-  std::unordered_map<std::string, std::shared_ptr<SNIState>> sni_states_;
+  struct SNIStateShard {
+    mutable std::shared_mutex mu;
+    std::unordered_map<std::string, std::shared_ptr<SNIState>> map;
+  };
+  static constexpr size_t kShardCount = 64;
+  std::array<SNIStateShard, kShardCount> sni_shards_;
 
   // Cached active SNI count (updated on state changes) - O(1) instead of O(n)
   std::atomic<uint32_t> active_sni_count_{0};
