@@ -120,6 +120,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   Status EnsureBatchContext(const std::string &ns);
   void CloseIdleBatchContext();
   bool OnBatchWrite(size_t estimated_bytes);
+  void EnqueueBatchWatchUpdate(bool mark_all_keys, std::vector<std::string> keys);
   void EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply);
   void FlushBatchReplies();
 
@@ -202,6 +203,8 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
     uint64_t ops = 0;
     uint64_t bytes = 0;
     uint64_t deadline_us = 0;
+    bool pending_watch_all_keys = false;
+    std::vector<std::string> pending_watch_keys;
     std::vector<DeferredReply> deferred_replies;
   };
   BatchState batch_state_;

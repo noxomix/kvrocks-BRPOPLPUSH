@@ -5,7 +5,7 @@
 ### Grundregeln
 - **Ziel:** 5-10 Tenants pro Instanz, je 10.000 writes = 50-100k Connections
 - **Admin:** Nur default namespace (`__namespace`). Bei tenant-aware Functions abwägen: global oder eigener Tenant?
-- **Worker:** Nicht für Tenants reserviert, eine Connection aktiv pro Worker (Eventloop)
+- **Worker:** Nicht für Tenants reserviert; pro Callback ist genau eine Connection aktiv, mit Yield rotiert der Worker fair zwischen Connections
 - **Noisy-Neighbor:** Cross-Worker Aggregation darf andere Worker nicht blockieren, auch nicht bei seltenen befehlen, weil es gibt auch böse nachbarn.
 
 ### Auth & Namespace
@@ -51,6 +51,18 @@
 ### Blocking vs. Locking
 - **Blocking:** Connection WARTET (BLPOP, XREAD BLOCK) - pausiert bis Event
 - **Locking:** MULTI/EXEC - Connection AKTIV, Commands gequeued
+
+### Event-Loop Slice & Batching
+- `read-event-max-commands`, `read-event-max-time-us`, `read-event-max-heavy` sind Fairness/Latency-Knobs pro Connection-Slice
+- Zu kleine Slices senken Write-Throughput (mehr Resume/Callback-Overhead, mehr timer-getriebene Commits)
+- Zu große Slices verschlechtern Fairness/p99 bei vielen aktiven Connections auf einem Worker
+- Batch-State ist **worker-lokal + namespace-gebunden**: Writes aus mehreren Connections im selben Namespace koennen im selben Batch landen
+- Batch-Commit triggert durch Barrier oder `batching-max-ops` / `batching-max-bytes` / `batching-max-delay-us`
+- Praxisregel: `read-event-max-commands` nicht deutlich kleiner als `batching-max-ops` setzen
+
+### Fair Scheduler Defaults
+- Default ist strikt fair: `sni-overdraft-percent = 0` (kein Burst/Overdraft)
+- Burst-Verhalten nur explizit per Config aktivieren
 
 ### Konzepte (Akzeptiert)
 - **Cluster vs. Namespaces:** Schließen sich gegenseitig aus
@@ -212,11 +224,13 @@
 - [x] **Batching: Reply-Deferral + Flush nach Commit**
 - [x] **Batching: Storage::Write merge in ns-batch** (reuse `BeginTxn/CommitTxn`, kein db->Write im hot-path)
 - [x] **Batching: Barriers** (MULTI/EXEC/WATCH, EVAL/FCALL, Blocking, CONFIG/DEBUG/CLUSTER)
-- [ ] **Batching: WATCH dirty erst nach erfolgreichem Commit** (aktuell potenziell false-dirty bei Commit-Fehler)
-- [ ] **Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (keine Fehl-/Delay-Propagation auf unbeteiligte Commands am Worker)
+- [x] **Batching: Hardening-Barriers** (`APPLYBATCH`, `AUTH`, `HELLO AUTH`, `RESET`)
+- [x] **Batching: WATCH dirty erst nach erfolgreichem Commit** (batched write-path defered, apply nur bei erfolgreichem Commit)
+- [ ] **[LATER] Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
 - [ ] **Batching: Commit-Fehler semantisch präzisieren** (nicht nur generisches `ERR batch commit failed` für alle deferred Replies)
 - [ ] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
 - [x] **Batching: Annahme dokumentieren** (kein 1NS=1Worker nötig; aktiver Batch hält `WorkExclusivityGuard(ns)`)
+- [ ] **[LATER] WATCH dirty in EXEC/MULTI commit-sensitiv machen** (aktueller EXEC-Pfad markiert WATCH sofort waehrend Command-Loop; bei seltenem Commit-Fehler potenziell false-dirty)
 
 ### Mittel - O(n) Noisy-Neighbor Commands
 Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && result.size() > limit) return Error;`

@@ -23,6 +23,7 @@
 #include <event2/util.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -172,6 +173,8 @@ Status Worker::EnsureBatchContext(const std::string &ns) {
 
   batch_state_.txn_active = true;
   batch_state_.active_ns = ns;
+  batch_state_.pending_watch_all_keys = false;
+  batch_state_.pending_watch_keys.clear();
   return Status::OK();
 }
 
@@ -191,6 +194,8 @@ void Worker::CloseIdleBatchContext() {
   batch_state_.ops = 0;
   batch_state_.bytes = 0;
   batch_state_.deadline_us = 0;
+  batch_state_.pending_watch_all_keys = false;
+  batch_state_.pending_watch_keys.clear();
   batch_state_.deferred_replies.clear();
   batch_state_.ns_guard = std::unique_lock<std::shared_mutex>();
 }
@@ -230,6 +235,22 @@ bool Worker::OnBatchWrite(size_t estimated_bytes) {
   return reach_ops || reach_bytes;
 }
 
+void Worker::EnqueueBatchWatchUpdate(bool mark_all_keys, std::vector<std::string> keys) {
+  if (!batch_state_.txn_active) return;
+  if (!batch_state_.active) return;
+
+  if (mark_all_keys) {
+    batch_state_.pending_watch_all_keys = true;
+    batch_state_.pending_watch_keys.clear();
+    return;
+  }
+
+  if (batch_state_.pending_watch_all_keys || keys.empty()) return;
+  auto old_size = batch_state_.pending_watch_keys.size();
+  batch_state_.pending_watch_keys.resize(old_size + keys.size());
+  std::move(keys.begin(), keys.end(), batch_state_.pending_watch_keys.begin() + static_cast<std::ptrdiff_t>(old_size));
+}
+
 void Worker::EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply) {
   if (!batch_state_.active) {
     std::ignore = ReplyByID(fd, conn_id, reply);
@@ -248,6 +269,8 @@ void Worker::FlushBatchReplies() {
 
   auto deferred_replies = std::move(batch_state_.deferred_replies);
   auto ns = batch_state_.active_ns;
+  auto pending_watch_all_keys = batch_state_.pending_watch_all_keys;
+  auto pending_watch_keys = std::move(batch_state_.pending_watch_keys);
   bool should_commit = batch_state_.txn_active && batch_state_.active;
   Status commit_status = Status::OK();
   if (batch_state_.txn_active) {
@@ -265,12 +288,22 @@ void Worker::FlushBatchReplies() {
   batch_state_.ops = 0;
   batch_state_.bytes = 0;
   batch_state_.deadline_us = 0;
+  batch_state_.pending_watch_all_keys = false;
+  batch_state_.pending_watch_keys.clear();
   batch_state_.active_ns.clear();
   batch_state_.txn_active = false;
   batch_state_.ns_guard = std::unique_lock<std::shared_mutex>();
 
   if (!commit_status.IsOK()) {
     error("[worker] Failed to commit namespace batch for ns={}: {}", ns, commit_status.Msg());
+  }
+
+  if (should_commit && commit_status.IsOK() && srv->HasWatchedKeys()) {
+    if (pending_watch_all_keys) {
+      srv->MarkAllWatchedKeysModified();
+    } else if (!pending_watch_keys.empty()) {
+      srv->UpdateWatchedKeysManually(ns, pending_watch_keys);
+    }
   }
 
   std::string batch_commit_err;

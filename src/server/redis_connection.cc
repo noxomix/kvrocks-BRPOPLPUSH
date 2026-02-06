@@ -611,11 +611,42 @@ static const CommandAttributes *LookupCommandAttributesByName(const std::string 
   return iter->second;
 }
 
+static bool HelloHasAuthOption(const CommandTokens &cmd_tokens) {
+  if (cmd_tokens.size() < 2) return false;
+
+  size_t next_arg = 1;
+  auto protocol = ParseInt<int>(cmd_tokens[next_arg], 10);
+  if (!protocol) {
+    return false;
+  }
+  ++next_arg;
+
+  for (; next_arg < cmd_tokens.size(); ++next_arg) {
+    size_t more_args = cmd_tokens.size() - next_arg - 1;
+    const auto &opt = cmd_tokens[next_arg];
+    if (util::EqualICase(opt, "auth") && more_args != 0) {
+      return true;
+    }
+    if (util::EqualICase(opt, "setname") && more_args != 0) {
+      ++next_arg;
+      continue;
+    }
+    return false;
+  }
+
+  return false;
+}
+
 static bool IsBatchBarrierCommand(const std::string &cmd_name, const CommandAttributes *attributes,
-                                  uint64_t cmd_flags) {
+                                  uint64_t cmd_flags, const CommandTokens &cmd_tokens) {
   if ((cmd_flags & kCmdBlocking) != 0) return true;
   if ((cmd_flags & kCmdExclusive) != 0) return true;
-  if (cmd_name == "multi" || cmd_name == "exec" || cmd_name == "watch" || cmd_name == "unwatch") return true;
+  if (cmd_name == "auth" || cmd_name == "reset") return true;
+  if (cmd_name == "hello" && HelloHasAuthOption(cmd_tokens)) return true;
+  if (cmd_name == "multi" || cmd_name == "exec" || cmd_name == "watch" || cmd_name == "unwatch" ||
+      cmd_name == "applybatch") {
+    return true;
+  }
   if (attributes->category == CommandCategory::Script || attributes->category == CommandCategory::Function) return true;
   return false;
 }
@@ -626,6 +657,24 @@ static size_t EstimateCommandBytes(const CommandTokens &cmd_tokens) {
     bytes += token.size();
   }
   return bytes;
+}
+
+static void CollectWatchKeysFromCommand(const CommandAttributes &attr, const std::vector<std::string> &args,
+                                        bool *mark_all_keys, std::vector<std::string> *keys) {
+  *mark_all_keys = false;
+  keys->clear();
+  attr.ForEachKeyRange(
+      [keys](const std::vector<std::string> &tokens, const CommandKeyRange &range) {
+        for (size_t i = range.first_key;
+             range.last_key > 0 ? i <= size_t(range.last_key) : i <= tokens.size() + range.last_key;
+             i += range.key_step) {
+          keys->emplace_back(tokens[i]);
+        }
+      },
+      args, [mark_all_keys](const std::vector<std::string> &) { *mark_all_keys = true; });
+  if (*mark_all_keys) {
+    keys->clear();
+  }
 }
 
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
@@ -756,7 +805,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       }
     }
 
-    bool batch_barrier = IsBatchBarrierCommand(cmd_name, attributes, cmd_flags);
+    bool batch_barrier = IsBatchBarrierCommand(cmd_name, attributes, cmd_flags, cmd_tokens);
     if (config->batching_enabled && owner_->IsBatchReplyDeferralActive() && batch_barrier) {
       owner_->FlushBatchReplies();
     }
@@ -944,7 +993,17 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       continue;
     }
 
-    srv_->UpdateWatchedKeysFromArgs(GetNamespace(), cmd_tokens, *attributes);
+    if (srv_->HasWatchedKeys() && (cmd_flags & kCmdWrite)) {
+      bool deferred_watch_update = config->batching_enabled && (cmd_flags & kCmdWrite) && !in_exec_ && !batch_barrier;
+      if (deferred_watch_update) {
+        bool mark_all_keys = false;
+        std::vector<std::string> watched_keys;
+        CollectWatchKeysFromCommand(*attributes, cmd_tokens, &mark_all_keys, &watched_keys);
+        owner_->EnqueueBatchWatchUpdate(mark_all_keys, std::move(watched_keys));
+      } else {
+        srv_->UpdateWatchedKeysFromArgs(GetNamespace(), cmd_tokens, *attributes);
+      }
+    }
 
     if (!reply.empty()) Reply(reply);
     reply.clear();

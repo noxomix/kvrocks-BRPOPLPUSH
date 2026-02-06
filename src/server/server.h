@@ -420,6 +420,8 @@ class Server {
   void UpdateWatchedKeysFromArgs(const std::string &ns, const std::vector<std::string> &args,
                                   const redis::CommandAttributes &attr);
   void UpdateWatchedKeysManually(const std::string &ns, const std::vector<std::string> &keys);
+  void MarkAllWatchedKeysModified();
+  bool HasWatchedKeys() const { return watched_key_size_.load(std::memory_order_relaxed) > 0; }
   void WatchKey(redis::Connection *conn, const std::vector<std::string> &keys);
   static bool IsWatchedKeysModified(redis::Connection *conn);
   void ResetWatchedKeys(redis::Connection *conn);

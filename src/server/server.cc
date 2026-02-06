@@ -2687,6 +2687,8 @@ void Server::UpdateWatchedKeysManually(const std::string &ns, const std::vector<
   }
 }
 
+void Server::MarkAllWatchedKeysModified() { updateAllWatchedKeys(); }
+
 void Server::WatchKey(redis::Connection *conn, const std::vector<std::string> &keys) {
   std::unique_lock lock(watched_key_mutex_);
 
