@@ -216,11 +216,17 @@ class Connection : public EvbufCallbackBase<Connection> {
   bool CanMigrate() const;
 
   // Multi exec
-  void SetInExec() { in_exec_ = true; }
+  void SetInExec() {
+    in_exec_ = true;
+    deferred_exec_watch_all_keys_ = false;
+    deferred_exec_watch_keys_.clear();
+  }
   bool IsInExec() const { return in_exec_; }
   bool IsInScript() const { return in_script_; }
   bool IsMultiError() const { return multi_error_; }
   void ResetMultiExec();
+  void ApplyDeferredExecWatchUpdates();
+  void UpdateWatchedKeysManually(const std::vector<std::string> &keys);
   std::deque<redis::CommandTokens> *GetMultiExecCommands() { return &multi_cmds_; }
 
   std::function<void(int)> close_cb = nullptr;
@@ -237,6 +243,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   void ScheduleResume();
   void PauseReadForQuota();
   void ResumeReadIfPaused();
+  void EnqueueDeferredExecWatchUpdate(bool mark_all_keys, std::vector<std::string> keys);
 
   std::atomic<uint64_t> id_{0};
   std::atomic<int> flags_ = 0;
@@ -275,6 +282,8 @@ class Connection : public EvbufCallbackBase<Connection> {
   std::atomic<bool> has_pending_cmds_ = false;
   std::deque<redis::CommandTokens> multi_cmds_;
   bool in_script_ = false;
+  bool deferred_exec_watch_all_keys_ = false;
+  std::vector<std::string> deferred_exec_watch_keys_;
 
   bool importing_ = false;
   RESP protocol_version_ = RESP::v2;

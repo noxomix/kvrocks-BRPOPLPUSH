@@ -256,6 +256,46 @@ void Connection::Reply(const std::string &msg) {
 
 const std::vector<std::string> &Connection::GetQueuedReplies() const { return queued_replies_; }
 
+void Connection::EnqueueDeferredExecWatchUpdate(bool mark_all_keys, std::vector<std::string> keys) {
+  if (!in_exec_) return;
+
+  if (mark_all_keys) {
+    deferred_exec_watch_all_keys_ = true;
+    deferred_exec_watch_keys_.clear();
+    return;
+  }
+
+  if (deferred_exec_watch_all_keys_ || keys.empty()) return;
+  auto old_size = deferred_exec_watch_keys_.size();
+  deferred_exec_watch_keys_.resize(old_size + keys.size());
+  std::move(keys.begin(), keys.end(), deferred_exec_watch_keys_.begin() + static_cast<std::ptrdiff_t>(old_size));
+}
+
+void Connection::ApplyDeferredExecWatchUpdates() {
+  if (!srv_->HasWatchedKeys()) {
+    deferred_exec_watch_all_keys_ = false;
+    deferred_exec_watch_keys_.clear();
+    return;
+  }
+
+  if (deferred_exec_watch_all_keys_) {
+    srv_->MarkAllWatchedKeysModified();
+  } else if (!deferred_exec_watch_keys_.empty()) {
+    srv_->UpdateWatchedKeysManually(GetNamespace(), deferred_exec_watch_keys_);
+  }
+  deferred_exec_watch_all_keys_ = false;
+  deferred_exec_watch_keys_.clear();
+}
+
+void Connection::UpdateWatchedKeysManually(const std::vector<std::string> &keys) {
+  if (keys.empty() || !srv_->HasWatchedKeys()) return;
+  if (in_exec_) {
+    EnqueueDeferredExecWatchUpdate(false, std::vector<std::string>(keys.begin(), keys.end()));
+    return;
+  }
+  srv_->UpdateWatchedKeysManually(GetNamespace(), keys);
+}
+
 void Connection::SendFile(int fd) {
   // NOTE: we don't need to close the fd, the libevent will do that
   auto output = bufferevent_get_output(bev_);
@@ -994,12 +1034,16 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
     }
 
     if (srv_->HasWatchedKeys() && (cmd_flags & kCmdWrite)) {
-      bool deferred_watch_update = config->batching_enabled && (cmd_flags & kCmdWrite) && !in_exec_ && !batch_barrier;
+      bool deferred_watch_update = in_exec_ || (config->batching_enabled && !in_exec_ && !batch_barrier);
       if (deferred_watch_update) {
         bool mark_all_keys = false;
         std::vector<std::string> watched_keys;
         CollectWatchKeysFromCommand(*attributes, cmd_tokens, &mark_all_keys, &watched_keys);
-        owner_->EnqueueBatchWatchUpdate(mark_all_keys, std::move(watched_keys));
+        if (in_exec_) {
+          EnqueueDeferredExecWatchUpdate(mark_all_keys, std::move(watched_keys));
+        } else {
+          owner_->EnqueueBatchWatchUpdate(mark_all_keys, std::move(watched_keys));
+        }
       } else {
         srv_->UpdateWatchedKeysFromArgs(GetNamespace(), cmd_tokens, *attributes);
       }
@@ -1020,6 +1064,8 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
 
 void Connection::ResetMultiExec() {
   in_exec_ = false;
+  deferred_exec_watch_all_keys_ = false;
+  deferred_exec_watch_keys_.clear();
   multi_error_ = false;
   multi_cmds_.clear();
   DisableFlag(Connection::kMultiExec);

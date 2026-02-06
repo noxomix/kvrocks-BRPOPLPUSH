@@ -226,11 +226,11 @@
 - [x] **Batching: Barriers** (MULTI/EXEC/WATCH, EVAL/FCALL, Blocking, CONFIG/DEBUG/CLUSTER)
 - [x] **Batching: Hardening-Barriers** (`APPLYBATCH`, `AUTH`, `HELLO AUTH`, `RESET`)
 - [x] **Batching: WATCH dirty erst nach erfolgreichem Commit** (batched write-path defered, apply nur bei erfolgreichem Commit)
-- [ ] **[LATER] Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
+- [LATER] **[LATER] Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
 - [ ] **Batching: Commit-Fehler semantisch präzisieren** (nicht nur generisches `ERR batch commit failed` für alle deferred Replies)
-- [ ] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
+- [LATER] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
 - [x] **Batching: Annahme dokumentieren** (kein 1NS=1Worker nötig; aktiver Batch hält `WorkExclusivityGuard(ns)`)
-- [ ] **[LATER] WATCH dirty in EXEC/MULTI commit-sensitiv machen** (aktueller EXEC-Pfad markiert WATCH sofort waehrend Command-Loop; bei seltenem Commit-Fehler potenziell false-dirty)
+- [x] **[LATER] WATCH dirty in EXEC/MULTI commit-sensitiv machen** (EXEC deferred WATCH-Updates, apply nur nach erfolgreichem Commit; inkl. manueller WATCH-Updates aus List-Pfaden)
 
 ### Mittel - O(n) Noisy-Neighbor Commands
 Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && result.size() > limit) return Error;`

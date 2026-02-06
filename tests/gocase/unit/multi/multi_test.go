@@ -227,6 +227,25 @@ func TestMulti(t *testing.T) {
 		require.Equal(t, rdb.Do(ctx, "EXEC").Val(), nil)
 	})
 
+	t.Run("EXEC list pop touches WATCHed keys", func(t *testing.T) {
+		writer := srv.NewClient()
+		defer func() { require.NoError(t, writer.Close()) }()
+		watcher := srv.NewClient()
+		defer func() { require.NoError(t, watcher.Close()) }()
+
+		require.NoError(t, writer.Del(ctx, "watch_exec_list").Err())
+		require.NoError(t, writer.LPush(ctx, "watch_exec_list", "v1").Err())
+		require.NoError(t, watcher.Do(ctx, "WATCH", "watch_exec_list").Err())
+
+		require.NoError(t, writer.Do(ctx, "MULTI").Err())
+		require.NoError(t, writer.Do(ctx, "BLPOP", "watch_exec_list", "0").Err())
+		require.NoError(t, writer.Do(ctx, "EXEC").Err())
+
+		require.NoError(t, watcher.Do(ctx, "MULTI").Err())
+		require.NoError(t, watcher.Do(ctx, "PING").Err())
+		require.Equal(t, watcher.Do(ctx, "EXEC").Val(), nil)
+	})
+
 	t.Run("After successful EXEC key is no longer watched", func(t *testing.T) {
 		require.NoError(t, rdb.Set(ctx, "x", 30, 0).Err())
 		require.NoError(t, rdb.Do(ctx, "WATCH", "x").Err())

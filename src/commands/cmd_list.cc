@@ -303,7 +303,7 @@ class CommandBPop : public BlockingCommander {
       if (!last_key_ptr) {
         conn_->Reply(conn_->MultiBulkString({"", ""}));
       } else {
-        conn_->GetServer()->UpdateWatchedKeysManually(conn_->GetNamespace(), {*last_key_ptr});
+        conn_->UpdateWatchedKeysManually({*last_key_ptr});
         conn_->Reply(conn_->MultiBulkString({*last_key_ptr, std::move(elem)}));
       }
     } else if (!s.IsNotFound()) {
@@ -423,7 +423,7 @@ class CommandBLMPop : public BlockingCommander {
 
     if (s.ok()) {
       if (!elems.empty()) {
-        conn_->GetServer()->UpdateWatchedKeysManually(conn_->GetNamespace(), {chosen_key});
+        conn_->UpdateWatchedKeysManually({chosen_key});
         std::string elems_bulk = conn_->MultiBulkString(elems);
         conn_->Reply(redis::Array({redis::BulkString(chosen_key), std::move(elems_bulk)}));
       }

@@ -89,6 +89,9 @@ class CommandExec : public Commander {
       // the transaction.
       // So, if conn->IsMultiError(), the transaction should still be committed.
       s = storage->CommitTxn(ns);
+      if (s.IsOK()) {
+        conn->ApplyDeferredExecWatchUpdates();
+      }
     }
 
     conn->ResetMultiExec();
