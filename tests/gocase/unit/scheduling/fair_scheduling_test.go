@@ -113,7 +113,7 @@ func TestFairSchedulerConfigDefaults(t *testing.T) {
 	require.Equal(t, "0", val["sni-max-workers-percent"])
 
 	val = rdb.ConfigGet(ctx, "sni-overdraft-percent").Val()
-	require.Equal(t, "30", val["sni-overdraft-percent"])
+	require.Equal(t, "0", val["sni-overdraft-percent"])
 }
 
 func TestFairSchedulerWorkerDistribution(t *testing.T) {

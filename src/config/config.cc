@@ -257,7 +257,7 @@ Config::Config() {
 
       /* SNI-based Fair Scheduling */
       {"sni-max-workers-percent", false, new IntField(&sni_max_workers_percent, 0, 0, 100)},
-      {"sni-overdraft-percent", false, new IntField(&sni_overdraft_percent, 30, 0, 200)},
+      {"sni-overdraft-percent", false, new IntField(&sni_overdraft_percent, 0, 0, 200)},
 
       /* rocksdb options */
       {"rocksdb.compression", false,
