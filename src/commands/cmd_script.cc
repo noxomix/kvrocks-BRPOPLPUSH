@@ -26,7 +26,7 @@
 
 namespace redis {
 
-template <bool evalsha, bool read_only>
+template <bool evalsha, bool read_only, bool atomic_tx = false>
 class CommandEvalImpl : public Commander {
  public:
   Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
@@ -44,7 +44,7 @@ class CommandEvalImpl : public Commander {
 
     return lua::EvalGenericCommand(
         conn, &ctx, args_[1], std::vector<std::string>(args_.begin() + 3, args_.begin() + 3 + numkeys),
-        std::vector<std::string>(args_.begin() + 3 + numkeys, args_.end()), evalsha, output, read_only);
+        std::vector<std::string>(args_.begin() + 3 + numkeys, args_.end()), evalsha, output, read_only, atomic_tx);
   }
 };
 
@@ -55,6 +55,8 @@ class CommandEvalSHA : public CommandEvalImpl<true, false> {};
 class CommandEvalRO : public CommandEvalImpl<false, true> {};
 
 class CommandEvalSHARO : public CommandEvalImpl<true, true> {};
+
+class CommandEvalTX : public CommandEvalImpl<false, false, true> {};
 
 class CommandScript : public Commander {
  public:
@@ -103,9 +105,7 @@ class CommandScript : public Commander {
 
       *output = redis::BulkString(sha);
     } else if (args_.size() == 2 && subcommand_ == "kill") {
-      info("[DEBUG] SCRIPT KILL Execute called, ns={}", conn->GetNamespace());
       auto s = srv->KillLuaScript(conn->GetNamespace());
-      info("[DEBUG] SCRIPT KILL KillLuaScript returned: {}", s.Msg());
       if (!s.IsOK()) {
         return s;
       }
@@ -160,6 +160,8 @@ REDIS_REGISTER_COMMANDS(
                                 GenerateEvalFlags),
     MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange),
     MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange),
+    MakeCmdAttr<CommandEvalTX>("eval_tx", -3, "write exclusive no-multi no-script skip-monitor heavy",
+                               GetScriptEvalKeyRange),
     MakeCmdAttr<CommandScript>("script", -2, "no-script skip-monitor", NO_KEY, GenerateScriptFlags), )
 
 }  // namespace redis

@@ -316,6 +316,50 @@ var testFunctions = func(t *testing.T, config util.KvrocksServerConfigs) {
 	})
 }
 
+func TestFunctionTx(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{"resp3-enabled": "no"})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	require.NoError(t, rdb.Do(ctx, "FUNCTION", "LOAD",
+		`#!lua name=txlib
+redis.register_function('set_and_get_tx', function(keys, args)
+	redis.call('set', keys[1], args[1])
+	return redis.call('get', keys[1])
+end)
+redis.register_function('set_then_error_tx', function(keys, args)
+	redis.call('set', keys[1], args[1])
+	error('boom')
+end)
+redis.register_function('publish_tx', function(keys, args)
+	return redis.call('publish', args[1], args[2])
+end)
+`).Err())
+
+	t.Run("FCALL_TX commits all writes on success", func(t *testing.T) {
+		require.NoError(t, rdb.Del(ctx, "fcall_tx_ok").Err())
+		r := rdb.Do(ctx, "FCALL_TX", "set_and_get_tx", 1, "fcall_tx_ok", "v1")
+		require.NoError(t, r.Err())
+		require.Equal(t, "v1", r.Val())
+		require.Equal(t, "v1", rdb.Get(ctx, "fcall_tx_ok").Val())
+	})
+
+	t.Run("FCALL_TX rolls back writes on runtime error", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "fcall_tx_rollback", "old", 0).Err())
+		r := rdb.Do(ctx, "FCALL_TX", "set_then_error_tx", 1, "fcall_tx_rollback", "new")
+		require.ErrorContains(t, r.Err(), "boom")
+		require.Equal(t, "old", rdb.Get(ctx, "fcall_tx_rollback").Val())
+	})
+
+	t.Run("FCALL_TX blocks pubsub side effects", func(t *testing.T) {
+		r := rdb.Do(ctx, "FCALL_TX", "publish_tx", 0, "txch", "m1")
+		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
+	})
+}
+
 func TestFunctionScriptFlags(t *testing.T) {
 	srv := util.StartServer(t, map[string]string{})
 	defer srv.Close()

@@ -71,7 +71,7 @@ Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lu
 
 Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const std::string &body_or_sha,
                           const std::vector<std::string> &keys, const std::vector<std::string> &argv, bool evalsha,
-                          std::string *output, bool read_only = false);
+                          std::string *output, bool read_only = false, bool atomic_tx = false);
 
 bool ScriptExists(lua_State *lua, const std::string &ns, const std::string &sha);
 
@@ -79,7 +79,7 @@ Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::st
                     bool replace, std::string *lib_name);
 Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::string &name,
                     const std::vector<std::string> &keys, const std::vector<std::string> &argv, std::string *output,
-                    bool read_only = false);
+                    bool read_only = false, bool atomic_tx = false);
 Status FunctionList(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &libname,
                     bool with_code, std::string *output);
 Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &funcname,
@@ -162,6 +162,8 @@ struct ScriptRunCtx {
   redis::Connection *conn = nullptr;
   // the storage context
   engine::Context *ctx = nullptr;
+  // when true, script runs in an all-or-nothing transaction (used by *_TX commands)
+  bool atomic_tx = false;
 };
 
 /// SaveOnRegistry saves user-defined data to lua REGISTRY

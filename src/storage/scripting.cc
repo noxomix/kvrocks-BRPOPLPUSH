@@ -86,6 +86,43 @@ void LuaTimeoutHook(lua_State *lua, lua_Debug *) {
 
 namespace lua {
 
+class AtomicScriptTxnScope {
+ public:
+  AtomicScriptTxnScope(Server *srv, std::string ns, bool enabled)
+      : srv_(srv), ns_(std::move(ns)), enabled_(enabled) {}
+
+  Status Begin() {
+    if (!enabled_) return Status::OK();
+    auto s = srv_->storage->BeginTxn(ns_);
+    if (!s.IsOK()) {
+      return s;
+    }
+    active_ = true;
+    return Status::OK();
+  }
+
+  Status Commit() {
+    if (!enabled_ || !active_) return Status::OK();
+    auto s = srv_->storage->CommitTxn(ns_);
+    active_ = false;
+    return s;
+  }
+
+  void Rollback() {
+    if (!enabled_ || !active_) return;
+    srv_->storage->DiscardTxn(ns_);
+    active_ = false;
+  }
+
+  ~AtomicScriptTxnScope() { Rollback(); }
+
+ private:
+  Server *srv_ = nullptr;
+  std::string ns_;
+  bool enabled_ = false;
+  bool active_ = false;
+};
+
 lua_State *CreateState() {
   lua_State *lua = lua_open();
   LoadLibraries(lua);
@@ -429,7 +466,7 @@ bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std
 // if it is not found, it will try to load the library where the function is located from storage
 Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::string &name,
                     const std::vector<std::string> &keys, const std::vector<std::string> &argv, std::string *output,
-                    bool read_only) {
+                    bool read_only, bool atomic_tx) {
   // Check if Lua state needs reset before accessing it
   conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
 
@@ -461,6 +498,7 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
   script_run_ctx.conn = conn;
   script_run_ctx.ctx = ctx;
   script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
+  script_run_ctx.atomic_tx = atomic_tx;
   lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_name).c_str());
   if (!lua_isnil(lua, -1)) {
     // It should be ensured that the conversion is successful
@@ -470,34 +508,49 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
   lua_pop(lua, 1);
 
   SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &script_run_ctx);
+  auto cleanup_script_ctx = MakeScopeExit([lua] {
+    RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
+    RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  });
 
   // save keys on registry the to perform key touching check
   SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
+
+  AtomicScriptTxnScope atomic_tx_scope(srv, ns, atomic_tx && !read_only);
+  auto tx_begin_status = atomic_tx_scope.Begin();
+  if (!tx_begin_status.IsOK()) {
+    lua_pop(lua, 2);
+    return tx_begin_status;
+  }
 
   // Setup timeout/kill hook (always needed for SCRIPT KILL)
   auto *worker = conn->Owner();
   worker->StartLuaScript(ns, util::GetTimeStampMS());
   lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
+  auto cleanup_script_hook = MakeScopeExit([lua, worker] {
+    lua_sethook(lua, nullptr, 0, 0);
+    worker->StopLuaScript();
+  });
 
   PushArray(lua, keys);
   PushArray(lua, argv);
   int pcall_result = lua_pcall(lua, 2, 1, -4);
 
-  // Cleanup timeout hook
-  lua_sethook(lua, nullptr, 0, 0);
-  worker->StopLuaScript();
-
   if (pcall_result) {
+    atomic_tx_scope.Rollback();
     std::string err_msg = lua_tostring(lua, -1);
     lua_pop(lua, 2);
     return {Status::NotOK, fmt::format("Error while running function `{}`: {}", name, err_msg)};
-  } else {
-    *output = ReplyToRedisReply(conn, lua);
-    lua_pop(lua, 2);
   }
 
-  RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
-  RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  auto tx_commit_status = atomic_tx_scope.Commit();
+  if (!tx_commit_status.IsOK()) {
+    lua_pop(lua, 2);
+    return tx_commit_status.Prefixed(fmt::format("Error while committing function `{}`: ", name));
+  }
+
+  *output = ReplyToRedisReply(conn, lua);
+  lua_pop(lua, 2);
 
   /* Call the Lua garbage collector from time to time to avoid a
    * full cycle performed by Lua, which adds too latency.
@@ -719,7 +772,7 @@ Status FunctionFlush(redis::Connection *conn, engine::Context *ctx) {
 
 Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const std::string &body_or_sha,
                           const std::vector<std::string> &keys, const std::vector<std::string> &argv, bool evalsha,
-                          std::string *output, bool read_only) {
+                          std::string *output, bool read_only, bool atomic_tx) {
   // Check if Lua state needs reset before accessing it
   conn->Owner()->CheckAndResetIfNeeded(conn->GetNamespace());
 
@@ -772,6 +825,7 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   current_script_run_ctx.conn = conn;
   current_script_run_ctx.ctx = ctx;
   current_script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
+  current_script_run_ctx.atomic_tx = atomic_tx;
   lua_getglobal(lua, (funcname + "_flags_").c_str());
   if (!lua_isnil(lua, -1)) {
     // It should be ensured that the conversion is successful
@@ -781,6 +835,10 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   lua_pop(lua, 1);
 
   SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &current_script_run_ctx);
+  auto cleanup_script_ctx = MakeScopeExit([lua] {
+    RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
+    RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  });
 
   // For the Lua script, should be always run with RESP2 protocol,
   // unless users explicitly set the protocol version in the script via `redis.setresp`.
@@ -788,42 +846,56 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   // and then restore it after the script execution.
   auto saved_protocol_version = conn->GetProtocolVersion();
   conn->SetProtocolVersion(redis::RESP::v2);
+  auto restore_protocol = MakeScopeExit([conn, saved_protocol_version] { conn->SetProtocolVersion(saved_protocol_version); });
   /* Populate the argv and keys table accordingly to the arguments that
    * EVAL received. */
   SetGlobalArray(lua, "KEYS", keys);
   SetGlobalArray(lua, "ARGV", argv);
+  auto cleanup_script_globals = MakeScopeExit([lua] {
+    lua_pushnil(lua);
+    lua_setglobal(lua, "KEYS");
+    lua_pushnil(lua);
+    lua_setglobal(lua, "ARGV");
+  });
 
   // save keys on registry the to perform key touching check
   SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
+
+  AtomicScriptTxnScope atomic_tx_scope(srv, ns, atomic_tx && !read_only);
+  auto tx_begin_status = atomic_tx_scope.Begin();
+  if (!tx_begin_status.IsOK()) {
+    lua_pop(lua, 2);
+    return tx_begin_status;
+  }
 
   // Setup timeout/kill hook (always needed for SCRIPT KILL)
   auto *worker = conn->Owner();
   worker->StartLuaScript(ns, util::GetTimeStampMS());
   lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
+  auto cleanup_script_hook = MakeScopeExit([lua, worker] {
+    lua_sethook(lua, nullptr, 0, 0);
+    worker->StopLuaScript();
+  });
 
   int pcall_result = lua_pcall(lua, 0, 1, -2);
 
-  // Cleanup timeout hook
-  lua_sethook(lua, nullptr, 0, 0);
-  worker->StopLuaScript();
-
   if (pcall_result) {
+    atomic_tx_scope.Rollback();
     auto msg = fmt::format("running script (call to {}): {}", funcname, lua_tostring(lua, -1));
-    *output = redis::Error({Status::NotOK, msg});
     lua_pop(lua, 2);
+    if (atomic_tx) {
+      return {Status::NotOK, msg};
+    }
+    *output = redis::Error({Status::NotOK, msg});
   } else {
+    auto tx_commit_status = atomic_tx_scope.Commit();
+    if (!tx_commit_status.IsOK()) {
+      lua_pop(lua, 2);
+      return tx_commit_status.Prefixed(fmt::format("Error while committing script `{}`: ", funcname));
+    }
     *output = ReplyToRedisReply(conn, lua);
     lua_pop(lua, 2);
   }
-  conn->SetProtocolVersion(saved_protocol_version);
-
-  // clean global variables to prevent information leak in function commands
-  lua_pushnil(lua);
-  lua_setglobal(lua, "KEYS");
-  lua_pushnil(lua);
-  lua_setglobal(lua, "ARGV");
-  RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
-  RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
 
   /* Call the Lua garbage collector from time to time to avoid a
    * full cycle performed by Lua, which adds too latency.
@@ -911,6 +983,10 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
   }
 
   std::string cmd_name = attributes->name;
+  if (script_run_ctx->atomic_tx && (cmd_name == "publish" || cmd_name == "mpublish")) {
+    PushError(lua, "This Redis command is not allowed from atomic scripts");
+    return raise_error ? RaiseError(lua) : 1;
+  }
   cmd->SetArgs(args);
   auto s = cmd->Parse();
   if (!s) {

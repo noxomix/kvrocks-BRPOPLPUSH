@@ -140,6 +140,13 @@ func TestMulti(t *testing.T) {
 		require.Equal(t, "PONG", rdb.Ping(ctx).Val())
 	})
 
+	t.Run("EVAL_TX and FCALL_TX are not allowed in MULTI", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+		require.ErrorContains(t, rdb.Do(ctx, "EVAL_TX", "return 1", "0").Err(), "inside MULTI is not allowed")
+		require.ErrorContains(t, rdb.Do(ctx, "FCALL_TX", "unknown", "0").Err(), "inside MULTI is not allowed")
+		require.EqualError(t, rdb.Do(ctx, "EXEC").Err(), "EXECABORT Transaction discarded")
+	})
+
 	func() {
 		newSrv := util.StartServer(t, map[string]string{})
 		defer newSrv.Close()

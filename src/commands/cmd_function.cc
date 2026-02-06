@@ -93,7 +93,7 @@ struct CommandFunction : Commander {
   }
 };
 
-template <bool read_only = false>
+template <bool read_only = false, bool atomic_tx = false>
 struct CommandFCall : Commander {
   Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
                  std::string *output) override {
@@ -106,7 +106,8 @@ struct CommandFCall : Commander {
 
     return lua::FunctionCall(conn, &ctx, args_[1],
                              std::vector<std::string>(args_.begin() + 3, args_.begin() + 3 + numkeys),
-                             std::vector<std::string>(args_.begin() + 3 + numkeys, args_.end()), output, read_only);
+                             std::vector<std::string>(args_.begin() + 3 + numkeys, args_.end()), output, read_only,
+                             atomic_tx);
   }
 };
 
@@ -133,6 +134,8 @@ REDIS_REGISTER_COMMANDS(
     Function, MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", NO_KEY, GenerateFunctionFlags),
     MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script skip-monitor heavy", GetScriptEvalKeyRange,
                                 GenerateFCallFlags),
-    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange));
+    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor heavy", GetScriptEvalKeyRange),
+    MakeCmdAttr<CommandFCall<false, true>>("fcall_tx", -3, "write exclusive no-multi no-script skip-monitor heavy",
+                                           GetScriptEvalKeyRange));
 
 }  // namespace redis

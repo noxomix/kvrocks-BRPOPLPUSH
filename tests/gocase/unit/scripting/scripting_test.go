@@ -925,3 +925,36 @@ func TestEvalScriptInStrictMode(t *testing.T) {
 		require.NoError(t, rdb.Eval(ctx, "return redis.call('set', 'a', 1)", []string{}).Err())
 	})
 }
+
+func TestEvalTx(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{"resp3-enabled": "no"})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("EVAL_TX commits all writes on success", func(t *testing.T) {
+		require.NoError(t, rdb.Del(ctx, "eval_tx_ok").Err())
+		r := rdb.Do(ctx, "EVAL_TX",
+			`redis.call('set', KEYS[1], ARGV[1]); return redis.call('get', KEYS[1])`,
+			"1", "eval_tx_ok", "v1")
+		require.NoError(t, r.Err())
+		require.Equal(t, "v1", r.Val())
+		require.Equal(t, "v1", rdb.Get(ctx, "eval_tx_ok").Val())
+	})
+
+	t.Run("EVAL_TX rolls back writes on runtime error", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "eval_tx_rollback", "old", 0).Err())
+		r := rdb.Do(ctx, "EVAL_TX",
+			`redis.call('set', KEYS[1], 'new'); error('boom')`,
+			"1", "eval_tx_rollback")
+		require.ErrorContains(t, r.Err(), "boom")
+		require.Equal(t, "old", rdb.Get(ctx, "eval_tx_rollback").Val())
+	})
+
+	t.Run("EVAL_TX blocks pubsub side effects", func(t *testing.T) {
+		r := rdb.Do(ctx, "EVAL_TX", `return redis.call('publish', ARGV[1], ARGV[2])`, "0", "txch", "m1")
+		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
+	})
+}
