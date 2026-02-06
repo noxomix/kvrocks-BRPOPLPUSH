@@ -114,6 +114,10 @@ struct Config {
   int read_event_max_commands = 256;  // 0 = unlimited
   int read_event_max_time_us = 2000;  // 0 = unlimited
   int read_event_max_heavy = 1;  // 0 = unlimited
+  bool batching_enabled = true;
+  int batching_max_ops = 128;
+  int batching_max_bytes = 1024 * 1024;
+  int batching_max_delay_us = 3000;
   int timeout = 0;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;
@@ -298,6 +302,10 @@ struct Config {
     int read_event_max_commands = 0;
     int read_event_max_time_us = 0;
     int read_event_max_heavy = 0;
+    bool batching_enabled = false;
+    int batching_max_ops = 0;
+    int batching_max_bytes = 0;
+    int batching_max_delay_us = 0;
     int sni_max_workers_percent = 0;
     int sni_overdraft_percent = 0;
     int timeout = 0;

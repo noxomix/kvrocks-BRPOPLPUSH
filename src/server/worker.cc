@@ -53,6 +53,7 @@
 
 #include "redis_connection.h"
 #include "redis_request.h"
+#include "redis_reply.h"
 #include "server.h"
 #include "storage/scripting.h"
 
@@ -62,6 +63,8 @@ Worker::Worker(Server *srv, [[maybe_unused]] Config *config) : srv(srv), base_(e
   timer_.reset(NewEvent(base_, -1, EV_PERSIST));
   timeval tm = {10, 0};
   evtimer_add(timer_.get(), &tm);
+
+  batch_timer_.reset(evtimer_new(base_, EventCallbackFunc<&Worker::OnBatchTimer>, this));
 
   // Accept-Dispatch: Create eventfd for wakeup when Acceptor dispatches connections
   dispatch_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -110,6 +113,7 @@ Worker::~Worker() {
   }
 
   timer_.reset();
+  batch_timer_.reset();
   dispatch_event_.reset();
 
   // Close dispatch eventfd
@@ -136,6 +140,151 @@ void Worker::TimerCB(int, [[maybe_unused]] int16_t events) {
   auto config = srv->GetConfig()->GetSnapshot();
   if (config->timeout == 0) return;
   KickoutIdleClients(config->timeout);
+}
+
+void Worker::OnBatchTimer(int, [[maybe_unused]] int16_t events) {
+  batch_timer_armed_ = false;
+  FlushBatchReplies();
+}
+
+Status Worker::EnsureBatchContext(const std::string &ns) {
+  auto config = srv->GetConfig()->GetSnapshot();
+  if (!config->batching_enabled) return Status::OK();
+  if (ns.empty()) {
+    return {Status::NotOK, "batching requires authenticated namespace"};
+  }
+
+  if (batch_state_.txn_active) {
+    if (batch_state_.active_ns == ns) {
+      return Status::OK();
+    }
+    // Keep reply/commit ordering strict when a worker switches namespace.
+    FlushBatchReplies();
+    CloseIdleBatchContext();
+  }
+
+  batch_state_.ns_guard = srv->WorkExclusivityGuard(ns);
+  auto s = srv->storage->BeginTxn(ns);
+  if (!s.IsOK()) {
+    batch_state_.ns_guard = std::unique_lock<std::shared_mutex>();
+    return s;
+  }
+
+  batch_state_.txn_active = true;
+  batch_state_.active_ns = ns;
+  return Status::OK();
+}
+
+void Worker::CloseIdleBatchContext() {
+  if (!batch_state_.txn_active || batch_state_.active) {
+    return;
+  }
+
+  if (batch_timer_armed_) {
+    evtimer_del(batch_timer_.get());
+    batch_timer_armed_ = false;
+  }
+
+  srv->storage->DiscardTxn(batch_state_.active_ns);
+  batch_state_.active_ns.clear();
+  batch_state_.txn_active = false;
+  batch_state_.ops = 0;
+  batch_state_.bytes = 0;
+  batch_state_.deadline_us = 0;
+  batch_state_.deferred_replies.clear();
+  batch_state_.ns_guard = std::unique_lock<std::shared_mutex>();
+}
+
+bool Worker::OnBatchWrite(size_t estimated_bytes) {
+  auto config = srv->GetConfig()->GetSnapshot();
+  if (!config->batching_enabled) return false;
+  if (!batch_state_.txn_active) return false;
+
+  const bool has_ops_limit = config->batching_max_ops > 0;
+  const bool has_bytes_limit = config->batching_max_bytes > 0;
+  const bool has_delay_limit = config->batching_max_delay_us > 0;
+
+  if (!batch_state_.active) {
+    batch_state_.active = true;
+    batch_state_.ops = 0;
+    batch_state_.bytes = 0;
+    batch_state_.deadline_us = 0;
+
+    if (has_delay_limit) {
+      timeval tv{config->batching_max_delay_us / 1000000, config->batching_max_delay_us % 1000000};
+      evtimer_add(batch_timer_.get(), &tv);
+      batch_timer_armed_ = true;
+    }
+  }
+
+  batch_state_.ops++;
+  batch_state_.bytes += estimated_bytes;
+
+  // Avoid unbounded reply buffering when all thresholds are disabled.
+  if (!has_ops_limit && !has_bytes_limit && !has_delay_limit) {
+    return true;
+  }
+
+  bool reach_ops = has_ops_limit && batch_state_.ops >= static_cast<uint64_t>(config->batching_max_ops);
+  bool reach_bytes = has_bytes_limit && batch_state_.bytes >= static_cast<uint64_t>(config->batching_max_bytes);
+  return reach_ops || reach_bytes;
+}
+
+void Worker::EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply) {
+  if (!batch_state_.active) {
+    std::ignore = ReplyByID(fd, conn_id, reply);
+    return;
+  }
+  batch_state_.deferred_replies.push_back({fd, conn_id, std::move(reply)});
+}
+
+void Worker::FlushBatchReplies() {
+  if (!batch_state_.txn_active && batch_state_.deferred_replies.empty()) return;
+
+  if (batch_timer_armed_) {
+    evtimer_del(batch_timer_.get());
+    batch_timer_armed_ = false;
+  }
+
+  auto deferred_replies = std::move(batch_state_.deferred_replies);
+  auto ns = batch_state_.active_ns;
+  bool should_commit = batch_state_.txn_active && batch_state_.active;
+  Status commit_status = Status::OK();
+  if (batch_state_.txn_active) {
+    if (should_commit) {
+      commit_status = srv->storage->CommitTxn(ns);
+      if (!commit_status.IsOK()) {
+        srv->storage->DiscardTxn(ns);
+      }
+    } else {
+      srv->storage->DiscardTxn(ns);
+    }
+  }
+
+  batch_state_.active = false;
+  batch_state_.ops = 0;
+  batch_state_.bytes = 0;
+  batch_state_.deadline_us = 0;
+  batch_state_.active_ns.clear();
+  batch_state_.txn_active = false;
+  batch_state_.ns_guard = std::unique_lock<std::shared_mutex>();
+
+  if (!commit_status.IsOK()) {
+    error("[worker] Failed to commit namespace batch for ns={}: {}", ns, commit_status.Msg());
+  }
+
+  std::string batch_commit_err;
+  if (!commit_status.IsOK()) {
+    batch_commit_err = redis::Error({Status::NotOK, "batch commit failed: " + commit_status.Msg()});
+  }
+
+  for (const auto &deferred : deferred_replies) {
+    if (commit_status.IsOK()) {
+      std::ignore = ReplyByID(deferred.fd, deferred.conn_id, deferred.reply);
+    } else {
+      std::ignore = ReplyByID(deferred.fd, deferred.conn_id, batch_commit_err);
+    }
+  }
 }
 
 void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, [[maybe_unused]] sockaddr *address,
@@ -343,6 +492,8 @@ void Worker::Run(std::thread::id tid) {
   if (event_base_dispatch(base_) != 0) {
     error("[worker] Failed to run server, err: {}", strerror(errno));
   }
+  FlushBatchReplies();
+  CloseIdleBatchContext();
   is_terminated_ = true;
   state_.store(WorkerState::kStopped, std::memory_order_release);
 }

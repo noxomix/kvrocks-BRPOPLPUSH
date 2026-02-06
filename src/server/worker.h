@@ -46,6 +46,9 @@
 #include "redis_connection.h"
 
 class Server;
+namespace rocksdb {
+class WriteBatchWithIndex;
+}  // namespace rocksdb
 
 struct ClientCounts {
   int connected = 0;
@@ -109,6 +112,16 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void DispatchConnection(PendingConnection conn);
 
   void TimerCB(int, int16_t events);
+  void OnBatchTimer(int, int16_t events);
+  bool IsBatchReplyDeferralActive() const { return batch_state_.active; }
+  bool HasBatchContextForNamespace(const std::string &ns) const {
+    return batch_state_.txn_active && batch_state_.active_ns == ns;
+  }
+  Status EnsureBatchContext(const std::string &ns);
+  void CloseIdleBatchContext();
+  bool OnBatchWrite(size_t estimated_bytes);
+  void EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply);
+  void FlushBatchReplies();
 
   lua_State *Lua() { return lua_; }
   void LuaReset();
@@ -161,6 +174,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
   event_base *base_;
   UniqueEvent timer_;
+  UniqueEvent batch_timer_;
   std::thread::id tid_;
   std::vector<evconnlistener *> listen_events_;
   std::mutex conns_mu_;
@@ -173,6 +187,25 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::atomic<bool> is_terminated_ = false;
   std::atomic<WorkerState> state_{WorkerState::kRunning};
   uint32_t index_ = 0;  // Worker index in server's worker array (for CLIENT LIST)
+
+  struct BatchState {
+    struct DeferredReply {
+      int fd = -1;
+      uint64_t conn_id = 0;
+      std::string reply;
+    };
+
+    bool txn_active = false;
+    std::string active_ns;
+    std::unique_lock<std::shared_mutex> ns_guard;
+    bool active = false;
+    uint64_t ops = 0;
+    uint64_t bytes = 0;
+    uint64_t deadline_us = 0;
+    std::vector<DeferredReply> deferred_replies;
+  };
+  BatchState batch_state_;
+  bool batch_timer_armed_ = false;
 
   // Lua script timeout state
   std::atomic<bool> lua_script_running_{false};

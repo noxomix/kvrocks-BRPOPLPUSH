@@ -169,6 +169,10 @@ Config::Config() {
       {"read-event-max-commands", false, new IntField(&read_event_max_commands, 256, 0, INT_MAX)},
       {"read-event-max-time-us", false, new IntField(&read_event_max_time_us, 2000, 0, INT_MAX)},
       {"read-event-max-heavy", false, new IntField(&read_event_max_heavy, 1, 0, INT_MAX)},
+      {"batching-enabled", true, new YesNoField(&batching_enabled, true)},
+      {"batching-max-ops", true, new IntField(&batching_max_ops, 128, 0, INT_MAX)},
+      {"batching-max-bytes", true, new IntField(&batching_max_bytes, 1024 * 1024, 0, INT_MAX)},
+      {"batching-max-delay-us", true, new IntField(&batching_max_delay_us, 3000, 0, INT_MAX)},
       {"timeout", false, new IntField(&timeout, 0, 0, INT_MAX)},
       {"tcp-backlog", true, new IntField(&backlog, 511, 0, INT_MAX)},
       {"maxclients", false, new IntField(&maxclients, 10240, 0, INT_MAX)},
@@ -1051,6 +1055,10 @@ std::shared_ptr<Config::RuntimeConfigSnapshot> Config::BuildRuntimeSnapshot() co
   snapshot->read_event_max_commands = read_event_max_commands;
   snapshot->read_event_max_time_us = read_event_max_time_us;
   snapshot->read_event_max_heavy = read_event_max_heavy;
+  snapshot->batching_enabled = batching_enabled;
+  snapshot->batching_max_ops = batching_max_ops;
+  snapshot->batching_max_bytes = batching_max_bytes;
+  snapshot->batching_max_delay_us = batching_max_delay_us;
   snapshot->sni_max_workers_percent = sni_max_workers_percent;
   snapshot->sni_overdraft_percent = sni_overdraft_percent;
   snapshot->timeout = timeout;

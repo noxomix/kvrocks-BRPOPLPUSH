@@ -207,6 +207,16 @@
 ### Hoch
 - [x] **CONFIG SET Race** - Config-Felder ohne globalen Lock, Background-Threads lesen parallel
 - [x] **Lock-freier Accept-Hot-Path** - keine per-accept Mutex- oder Rebuild-Kosten
+- [x] **Batching: Config & Defaults** (enabled/max_ops/max_bytes/max_delay_us)
+- [x] **Batching: Worker Batch-State + Timer** (ops/bytes/timer + WriteBatchWithIndex)
+- [x] **Batching: Reply-Deferral + Flush nach Commit**
+- [x] **Batching: Storage::Write merge in ns-batch** (reuse `BeginTxn/CommitTxn`, kein db->Write im hot-path)
+- [x] **Batching: Barriers** (MULTI/EXEC/WATCH, EVAL/FCALL, Blocking, CONFIG/DEBUG/CLUSTER)
+- [ ] **Batching: WATCH dirty erst nach erfolgreichem Commit** (aktuell potenziell false-dirty bei Commit-Fehler)
+- [ ] **Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (keine Fehl-/Delay-Propagation auf unbeteiligte Commands am Worker)
+- [ ] **Batching: Commit-Fehler semantisch präzisieren** (nicht nur generisches `ERR batch commit failed` für alle deferred Replies)
+- [ ] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
+- [x] **Batching: Annahme dokumentieren** (kein 1NS=1Worker nötig; aktiver Batch hält `WorkExclusivityGuard(ns)`)
 
 ### Mittel - O(n) Noisy-Neighbor Commands
 Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && result.size() > limit) return Error;`
@@ -255,3 +265,18 @@ Problem mit HGETALL/HSET mit Milliarden Elementen - am Ende iteriert man über g
 Wir sollten die Datenstrukturen selbst NICHT begrenzen (außer redis/kvrocks default max value size),
 aber wir können pro Namespace generelle Limits wie `max_response_size` definieren um die Iterationen
 zu begrenzen. So kann ein Tenant nicht unbegrenzt große Responses erzeugen die Memory/CPU fressen.
+
+**Namespace-Batching (Valkey-Style, sync=true):**
+Annahme: mehrere Worker sind ok; aktiver Batch hält **persistenten** `WorkExclusivityGuard(ns)` bis Commit.
+Ziel: Group-Commit mit `sync=true`, Replies erst nach fsync, Semantik pro Namespace korrekt.
+Plan:
+- Config: `batching.enabled`, `batching.max_ops`, `batching.max_bytes`, `batching.max_delay_us`
+- Worker hält Batch-State (ops/bytes/timer + `active_ns` + persistenter NS-Lock), Timer triggert Commit
+- Reply-Deferral: Write-Replies sammeln, nach Commit flushen
+- Reads bei aktivem Batch: aus Overlay; Antworten bleiben bei aktivem Batch deferred
+- Storage::Write mergen: via bestehendem `BeginTxn/CommitTxn`-Pfad, kein db->Write im hot-path
+- Barriers: vor MULTI/EXEC/WATCH, EVAL/FCALL, Blocking, CONFIG/DEBUG/CLUSTER immer Batch flush
+- Tests: Basis vorhanden (`unit/connection`), weitere Barrier/Fehlerfälle offen
+
+!! wichtig, ich bin mir nicht sicher aber akutell sollen reads nicht gebatched werden sondern sofort zurcgegbeen. hier müssen wir
+sicherstellen das nichts zurckgegebenwird was noch nicht garantiert persisitiert ist (in rocksdb). !! 

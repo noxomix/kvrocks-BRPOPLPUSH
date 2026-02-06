@@ -247,6 +247,8 @@ void Connection::Reply(const std::string &msg) {
   }
   if (in_exec_) {
     queued_replies_.push_back(msg);
+  } else if (owner_->IsBatchReplyDeferralActive()) {
+    owner_->EnqueueBatchReply(GetFD(), GetID(), msg);
   } else {
     redis::Reply(bufferevent_get_output(bev_), msg);
   }
@@ -609,6 +611,23 @@ static const CommandAttributes *LookupCommandAttributesByName(const std::string 
   return iter->second;
 }
 
+static bool IsBatchBarrierCommand(const std::string &cmd_name, const CommandAttributes *attributes,
+                                  uint64_t cmd_flags) {
+  if ((cmd_flags & kCmdBlocking) != 0) return true;
+  if ((cmd_flags & kCmdExclusive) != 0) return true;
+  if (cmd_name == "multi" || cmd_name == "exec" || cmd_name == "watch" || cmd_name == "unwatch") return true;
+  if (attributes->category == CommandCategory::Script || attributes->category == CommandCategory::Function) return true;
+  return false;
+}
+
+static size_t EstimateCommandBytes(const CommandTokens &cmd_tokens) {
+  size_t bytes = 0;
+  for (const auto &token : cmd_tokens) {
+    bytes += token.size();
+  }
+  return bytes;
+}
+
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
   ExecuteCommandsWithBudget(to_process_cmds, 0, 0, false);
 }
@@ -676,6 +695,11 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
     if (cmd_tokens.empty()) continue;
     processed++;
     auto config = srv_->GetConfig()->GetSnapshot();
+    auto close_idle_batch = MakeScopeExit([this, &config] {
+      if (config->batching_enabled) {
+        owner_->CloseIdleBatchContext();
+      }
+    });
     bool cluster_enabled = srv_->GetConfig()->cluster_enabled;
     const std::string &password = config->requirepass;
 
@@ -732,6 +756,20 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       }
     }
 
+    bool batch_barrier = IsBatchBarrierCommand(cmd_name, attributes, cmd_flags);
+    if (config->batching_enabled && owner_->IsBatchReplyDeferralActive() && batch_barrier) {
+      owner_->FlushBatchReplies();
+    }
+    bool batch_candidate = config->batching_enabled && (cmd_flags & kCmdWrite) && !in_exec_ && !batch_barrier;
+    if (batch_candidate) {
+      auto ensure_batch = owner_->EnsureBatchContext(ns_);
+      if (!ensure_batch.IsOK()) {
+        Reply(redis::Error(ensure_batch));
+        continue;
+      }
+    }
+    bool in_namespace_batch = config->batching_enabled && owner_->HasBatchContextForNamespace(ns_);
+
     std::shared_lock<std::shared_mutex> concurrency;  // Allow concurrency
     std::unique_lock<std::shared_mutex> exclusivity;  // Need exclusivity
     // If the command needs to process exclusively, we need to get 'ExclusivityGuard'
@@ -745,14 +783,14 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
     } else if (cmd_flags & kCmdNoLock) {
       // No lock needed - command only sets atomic flags (e.g., SCRIPT KILL)
-    } else if (cmd_flags & kCmdExclusive) {
+    } else if (!in_namespace_batch && (cmd_flags & kCmdExclusive)) {
       // Use namespace-specific lock if namespace is set, otherwise use global lock
       if (!ns_.empty()) {
         exclusivity = srv_->WorkExclusivityGuard(ns_);
       } else {
         exclusivity = srv_->WorkExclusivityGuard();
       }
-    } else {
+    } else if (!in_namespace_batch) {
       // Use namespace-specific concurrency guard if namespace is set
       if (!ns_.empty()) {
         concurrency = srv_->WorkConcurrencyGuard(ns_);
@@ -879,6 +917,11 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       }
     }
 
+    bool flush_batch_after_reply = false;
+    if (s.IsOK() && config->batching_enabled && (cmd_flags & kCmdWrite) && !in_exec_ && !batch_barrier) {
+      flush_batch_after_reply = owner_->OnBatchWrite(EstimateCommandBytes(cmd_tokens));
+    }
+
     if (!(cmd_flags & redis::kCmdSkipMonitor)) {
       srv_->FeedMonitorConns(this, cmd_tokens);
     }
@@ -905,6 +948,9 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
 
     if (!reply.empty()) Reply(reply);
     reply.clear();
+    if (flush_batch_after_reply) {
+      owner_->FlushBatchReplies();
+    }
   }
 
   has_pending_cmds_.store(!to_process_cmds->empty(), std::memory_order_relaxed);
