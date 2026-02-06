@@ -2450,22 +2450,17 @@ Status Server::ExecPropagatedCommand(const std::vector<std::string> &tokens) {
 }
 
 Status Server::KillLuaScript(const std::string &ns) {
-  info("[DEBUG] KillLuaScript called for ns={}", ns);
   bool found = false;
   for (const auto &wt : worker_threads_) {
     auto *w = wt->GetWorker();
-    info("[DEBUG] Worker: running={} script_ns={}", w->IsLuaScriptRunning(), w->GetLuaScriptNs());
-    if (w->IsLuaScriptRunning() && w->GetLuaScriptNs() == ns) {
-      w->RequestLuaScriptKill();
-      found = true;
-      info("[DEBUG] Requested kill for worker");
-    }
+    if (!w->IsLuaScriptRunning()) continue;
+    if (w->GetLuaScriptNs() != ns) continue;
+    w->RequestLuaScriptKill();
+    found = true;
   }
   if (!found) {
-    info("[DEBUG] No scripts found");
     return {Status::NotOK, "No scripts in execution right now."};
   }
-  info("[DEBUG] Kill requested, returning OK");
   return Status::OK();
 }
 
@@ -2688,6 +2683,16 @@ void Server::UpdateWatchedKeysManually(const std::string &ns, const std::vector<
 }
 
 void Server::MarkAllWatchedKeysModified() { updateAllWatchedKeys(); }
+
+void Server::ApplyDeferredWatchKeysUpdate(const std::string &ns, const redis::DeferredWatchKeysUpdate &update) {
+  if (!HasWatchedKeys() || update.Empty()) return;
+
+  if (update.mark_all_keys) {
+    MarkAllWatchedKeysModified();
+  } else {
+    UpdateWatchedKeysManually(ns, update.keys);
+  }
+}
 
 void Server::WatchKey(redis::Connection *conn, const std::vector<std::string> &keys) {
   std::unique_lock lock(watched_key_mutex_);

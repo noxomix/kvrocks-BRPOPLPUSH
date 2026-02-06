@@ -44,6 +44,7 @@
 #include "stats/stats.h"
 #include "event_util.h"
 #include "redis_connection.h"
+#include "server/watched_keys_update.h"
 
 class Server;
 namespace rocksdb {
@@ -133,16 +134,26 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
   // Lua script timeout support
   void StartLuaScript(const std::string &ns, uint64_t start_ms) {
-    lua_script_ns_ = ns;
+    {
+      std::lock_guard<std::mutex> guard(lua_script_mu_);
+      lua_script_ns_ = ns;
+    }
     lua_script_start_ms_.store(start_ms, std::memory_order_relaxed);
     lua_script_kill_requested_.store(false, std::memory_order_relaxed);
     lua_script_running_.store(true, std::memory_order_release);
   }
-  void StopLuaScript() { lua_script_running_.store(false, std::memory_order_release); }
+  void StopLuaScript() {
+    lua_script_running_.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> guard(lua_script_mu_);
+    lua_script_ns_.clear();
+  }
   bool IsLuaScriptRunning() const { return lua_script_running_.load(std::memory_order_acquire); }
   bool IsLuaScriptKillRequested() const { return lua_script_kill_requested_.load(std::memory_order_acquire); }
   uint64_t GetLuaScriptStartMs() const { return lua_script_start_ms_.load(std::memory_order_relaxed); }
-  std::string GetLuaScriptNs() const { return lua_script_ns_; }  // Copy for thread-safety
+  std::string GetLuaScriptNs() const {
+    std::lock_guard<std::mutex> guard(lua_script_mu_);
+    return lua_script_ns_;
+  }
   void RequestLuaScriptKill() { lua_script_kill_requested_.store(true, std::memory_order_release); }
 
   std::map<int, redis::Connection *> GetConnectionsSnapshot();
@@ -203,8 +214,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
     uint64_t ops = 0;
     uint64_t bytes = 0;
     uint64_t deadline_us = 0;
-    bool pending_watch_all_keys = false;
-    std::vector<std::string> pending_watch_keys;
+    redis::DeferredWatchKeysUpdate pending_watch_update;
     std::vector<DeferredReply> deferred_replies;
   };
   BatchState batch_state_;
@@ -214,7 +224,8 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   std::atomic<bool> lua_script_running_{false};
   std::atomic<bool> lua_script_kill_requested_{false};
   std::atomic<uint64_t> lua_script_start_ms_{0};
-  std::string lua_script_ns_;  // Protected by lua_script_running_ memory ordering
+  mutable std::mutex lua_script_mu_;
+  std::string lua_script_ns_;
 
   // Async script reset support
   std::mutex ns_reset_mutex_;

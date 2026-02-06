@@ -36,6 +36,7 @@
 #include "event_util.h"
 #include "redis_request.h"
 #include "server/redis_reply.h"
+#include "server/watched_keys_update.h"
 
 class Worker;
 
@@ -218,8 +219,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   // Multi exec
   void SetInExec() {
     in_exec_ = true;
-    deferred_exec_watch_all_keys_ = false;
-    deferred_exec_watch_keys_.clear();
+    deferred_exec_watch_update_.Reset();
   }
   bool IsInExec() const { return in_exec_; }
   bool IsInScript() const { return in_script_; }
@@ -282,8 +282,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   std::atomic<bool> has_pending_cmds_ = false;
   std::deque<redis::CommandTokens> multi_cmds_;
   bool in_script_ = false;
-  bool deferred_exec_watch_all_keys_ = false;
-  std::vector<std::string> deferred_exec_watch_keys_;
+  DeferredWatchKeysUpdate deferred_exec_watch_update_;
 
   bool importing_ = false;
   RESP protocol_version_ = RESP::v2;

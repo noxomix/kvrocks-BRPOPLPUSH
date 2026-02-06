@@ -326,18 +326,27 @@ func TestFunctionTx(t *testing.T) {
 
 	require.NoError(t, rdb.Do(ctx, "FUNCTION", "LOAD",
 		`#!lua name=txlib
-redis.register_function('set_and_get_tx', function(keys, args)
-	redis.call('set', keys[1], args[1])
-	return redis.call('get', keys[1])
-end)
-redis.register_function('set_then_error_tx', function(keys, args)
-	redis.call('set', keys[1], args[1])
-	error('boom')
-end)
-redis.register_function('publish_tx', function(keys, args)
-	return redis.call('publish', args[1], args[2])
-end)
-`).Err())
+	redis.register_function('set_and_get_tx', function(keys, args)
+		redis.call('set', keys[1], args[1])
+		return redis.call('get', keys[1])
+	end)
+	redis.register_function('set_then_error_tx', function(keys, args)
+		redis.call('set', keys[1], args[1])
+		error('boom')
+	end)
+	redis.register_function('publish_tx', function(keys, args)
+		return redis.call('publish', args[1], args[2])
+	end)
+	redis.register_function('applybatch_tx', function(keys, args)
+		return redis.call('applybatch', 'set', keys[1], args[1])
+	end)
+	redis.register_function('auth_ctx_change', function(keys, args)
+		return redis.call('auth', args[1])
+	end)
+	redis.register_function('hello_auth_ctx_change', function(keys, args)
+		return redis.call('hello', '3', 'auth', 'default', args[1])
+	end)
+	`).Err())
 
 	t.Run("FCALL_TX commits all writes on success", func(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "fcall_tx_ok").Err())
@@ -357,6 +366,19 @@ end)
 	t.Run("FCALL_TX blocks pubsub side effects", func(t *testing.T) {
 		r := rdb.Do(ctx, "FCALL_TX", "publish_tx", 0, "txch", "m1")
 		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
+	})
+
+	t.Run("FCALL_TX blocks APPLYBATCH", func(t *testing.T) {
+		r := rdb.Do(ctx, "FCALL_TX", "applybatch_tx", 1, "fcall_tx_ab", "v1")
+		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
+	})
+
+	t.Run("FCALL blocks auth context changes from scripts", func(t *testing.T) {
+		r := rdb.Do(ctx, "FCALL", "auth_ctx_change", 0, "dummy")
+		require.ErrorContains(t, r.Err(), "not allowed from scripts")
+
+		r = rdb.Do(ctx, "FCALL", "hello_auth_ctx_change", 0, "dummy")
+		require.ErrorContains(t, r.Err(), "not allowed from scripts")
 	})
 }
 

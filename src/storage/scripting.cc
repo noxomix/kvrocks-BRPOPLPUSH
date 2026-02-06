@@ -29,6 +29,7 @@
 #include <cctype>
 #include <string>
 
+#include "commands/command_policy.h"
 #include "commands/commander.h"
 #include "commands/error_constants.h"
 #include "common/time_util.h"
@@ -122,6 +123,96 @@ class AtomicScriptTxnScope {
   bool enabled_ = false;
   bool active_ = false;
 };
+
+class ScriptRegistryGuard {
+ public:
+  ScriptRegistryGuard(lua_State *lua, ScriptRunCtx *script_run_ctx, const std::vector<std::string> *keys) : lua_(lua) {
+    SaveOnRegistry(lua_, REGISTRY_SCRIPT_RUN_CTX_NAME, script_run_ctx);
+    SaveOnRegistry(lua_, REGISTRY_KEYS_NAME, keys);
+  }
+
+  ~ScriptRegistryGuard() {
+    RemoveFromRegistry(lua_, REGISTRY_KEYS_NAME);
+    RemoveFromRegistry(lua_, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  }
+
+ private:
+  lua_State *lua_ = nullptr;
+};
+
+class ScriptRuntimeGuard {
+ public:
+  ScriptRuntimeGuard(redis::Connection *conn, lua_State *lua, const std::string &ns, bool atomic_tx_enabled)
+      : conn_(conn),
+        lua_(lua),
+        worker_(conn->Owner()),
+        atomic_tx_scope_(conn->GetServer(), ns, atomic_tx_enabled) {}
+
+  Status Begin() {
+    auto s = atomic_tx_scope_.Begin();
+    if (!s.IsOK()) return s;
+    worker_->StartLuaScript(conn_->GetNamespace(), util::GetTimeStampMS());
+    lua_sethook(lua_, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
+    hook_installed_ = true;
+    return Status::OK();
+  }
+
+  void Rollback() { atomic_tx_scope_.Rollback(); }
+
+  Status Commit() { return atomic_tx_scope_.Commit(); }
+
+  ~ScriptRuntimeGuard() {
+    if (!hook_installed_) return;
+    lua_sethook(lua_, nullptr, 0, 0);
+    worker_->StopLuaScript();
+  }
+
+ private:
+  redis::Connection *conn_ = nullptr;
+  lua_State *lua_ = nullptr;
+  Worker *worker_ = nullptr;
+  bool hook_installed_ = false;
+  AtomicScriptTxnScope atomic_tx_scope_;
+};
+
+class EvalRespScope {
+ public:
+  EvalRespScope(redis::Connection *conn, lua_State *lua, const std::vector<std::string> &keys,
+                const std::vector<std::string> &argv)
+      : conn_(conn), lua_(lua), saved_protocol_version_(conn->GetProtocolVersion()) {
+    conn_->SetProtocolVersion(redis::RESP::v2);
+    SetGlobalArray(lua_, "KEYS", keys);
+    SetGlobalArray(lua_, "ARGV", argv);
+  }
+
+  ~EvalRespScope() {
+    conn_->SetProtocolVersion(saved_protocol_version_);
+    lua_pushnil(lua_);
+    lua_setglobal(lua_, "KEYS");
+    lua_pushnil(lua_);
+    lua_setglobal(lua_, "ARGV");
+  }
+
+ private:
+  redis::Connection *conn_ = nullptr;
+  lua_State *lua_ = nullptr;
+  redis::RESP saved_protocol_version_ = redis::RESP::v2;
+};
+
+void LoadScriptFlagsFromGlobal(lua_State *lua, const std::string &flags_global_name, ScriptRunCtx *script_run_ctx) {
+  lua_getglobal(lua, flags_global_name.c_str());
+  if (!lua_isnil(lua, -1)) {
+    script_run_ctx->flags |= lua_tointeger(lua, -1);
+  }
+  lua_pop(lua, 1);
+}
+
+void MaybeRunLuaGc(lua_State *lua, int64_t *gc_count) {
+  (*gc_count)++;
+  if (*gc_count != LUA_GC_CYCLE_PERIOD) return;
+  lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
+  *gc_count = 0;
+}
 
 lua_State *CreateState() {
   lua_State *lua = lua_open();
@@ -499,51 +590,28 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
   script_run_ctx.ctx = ctx;
   script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
   script_run_ctx.atomic_tx = atomic_tx;
-  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_name).c_str());
-  if (!lua_isnil(lua, -1)) {
-    // It should be ensured that the conversion is successful
-    auto function_flags = lua_tointeger(lua, -1);
-    script_run_ctx.flags |= function_flags;
-  }
-  lua_pop(lua, 1);
+  LoadScriptFlagsFromGlobal(lua, REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + ns_prefixed_name, &script_run_ctx);
 
-  SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &script_run_ctx);
-  auto cleanup_script_ctx = MakeScopeExit([lua] {
-    RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
-    RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
-  });
-
-  // save keys on registry the to perform key touching check
-  SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
-
-  AtomicScriptTxnScope atomic_tx_scope(srv, ns, atomic_tx && !read_only);
-  auto tx_begin_status = atomic_tx_scope.Begin();
+  ScriptRegistryGuard script_registry_guard(lua, &script_run_ctx, &keys);
+  ScriptRuntimeGuard script_runtime_guard(conn, lua, ns, atomic_tx && !read_only);
+  auto tx_begin_status = script_runtime_guard.Begin();
   if (!tx_begin_status.IsOK()) {
     lua_pop(lua, 2);
     return tx_begin_status;
   }
-
-  // Setup timeout/kill hook (always needed for SCRIPT KILL)
-  auto *worker = conn->Owner();
-  worker->StartLuaScript(ns, util::GetTimeStampMS());
-  lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
-  auto cleanup_script_hook = MakeScopeExit([lua, worker] {
-    lua_sethook(lua, nullptr, 0, 0);
-    worker->StopLuaScript();
-  });
 
   PushArray(lua, keys);
   PushArray(lua, argv);
   int pcall_result = lua_pcall(lua, 2, 1, -4);
 
   if (pcall_result) {
-    atomic_tx_scope.Rollback();
+    script_runtime_guard.Rollback();
     std::string err_msg = lua_tostring(lua, -1);
     lua_pop(lua, 2);
     return {Status::NotOK, fmt::format("Error while running function `{}`: {}", name, err_msg)};
   }
 
-  auto tx_commit_status = atomic_tx_scope.Commit();
+  auto tx_commit_status = script_runtime_guard.Commit();
   if (!tx_commit_status.IsOK()) {
     lua_pop(lua, 2);
     return tx_commit_status.Prefixed(fmt::format("Error while committing function `{}`: ", name));
@@ -559,12 +627,7 @@ Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::st
    * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
    * for every command uses too much CPU. */
   static int64_t gc_count = 0;
-
-  gc_count++;
-  if (gc_count == LUA_GC_CYCLE_PERIOD) {
-    lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
-    gc_count = 0;
-  }
+  MaybeRunLuaGc(lua, &gc_count);
   return Status::OK();
 }
 
@@ -826,61 +889,28 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
   current_script_run_ctx.ctx = ctx;
   current_script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
   current_script_run_ctx.atomic_tx = atomic_tx;
-  lua_getglobal(lua, (funcname + "_flags_").c_str());
-  if (!lua_isnil(lua, -1)) {
-    // It should be ensured that the conversion is successful
-    auto script_flags = lua_tointeger(lua, -1);
-    current_script_run_ctx.flags |= script_flags;
-  }
-  lua_pop(lua, 1);
+  LoadScriptFlagsFromGlobal(lua, funcname + "_flags_", &current_script_run_ctx);
 
-  SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &current_script_run_ctx);
-  auto cleanup_script_ctx = MakeScopeExit([lua] {
-    RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
-    RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
-  });
+  ScriptRegistryGuard script_registry_guard(lua, &current_script_run_ctx, &keys);
 
   // For the Lua script, should be always run with RESP2 protocol,
   // unless users explicitly set the protocol version in the script via `redis.setresp`.
   // So we need to save the current protocol version and set it to RESP2,
   // and then restore it after the script execution.
-  auto saved_protocol_version = conn->GetProtocolVersion();
-  conn->SetProtocolVersion(redis::RESP::v2);
-  auto restore_protocol = MakeScopeExit([conn, saved_protocol_version] { conn->SetProtocolVersion(saved_protocol_version); });
+  EvalRespScope eval_resp_scope(conn, lua, keys, argv);
   /* Populate the argv and keys table accordingly to the arguments that
    * EVAL received. */
-  SetGlobalArray(lua, "KEYS", keys);
-  SetGlobalArray(lua, "ARGV", argv);
-  auto cleanup_script_globals = MakeScopeExit([lua] {
-    lua_pushnil(lua);
-    lua_setglobal(lua, "KEYS");
-    lua_pushnil(lua);
-    lua_setglobal(lua, "ARGV");
-  });
-
-  // save keys on registry the to perform key touching check
-  SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
-
-  AtomicScriptTxnScope atomic_tx_scope(srv, ns, atomic_tx && !read_only);
-  auto tx_begin_status = atomic_tx_scope.Begin();
+  ScriptRuntimeGuard script_runtime_guard(conn, lua, ns, atomic_tx && !read_only);
+  auto tx_begin_status = script_runtime_guard.Begin();
   if (!tx_begin_status.IsOK()) {
     lua_pop(lua, 2);
     return tx_begin_status;
   }
 
-  // Setup timeout/kill hook (always needed for SCRIPT KILL)
-  auto *worker = conn->Owner();
-  worker->StartLuaScript(ns, util::GetTimeStampMS());
-  lua_sethook(lua, LuaTimeoutHook, LUA_MASKCOUNT, 100000);
-  auto cleanup_script_hook = MakeScopeExit([lua, worker] {
-    lua_sethook(lua, nullptr, 0, 0);
-    worker->StopLuaScript();
-  });
-
   int pcall_result = lua_pcall(lua, 0, 1, -2);
 
   if (pcall_result) {
-    atomic_tx_scope.Rollback();
+    script_runtime_guard.Rollback();
     auto msg = fmt::format("running script (call to {}): {}", funcname, lua_tostring(lua, -1));
     lua_pop(lua, 2);
     if (atomic_tx) {
@@ -888,7 +918,7 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
     }
     *output = redis::Error({Status::NotOK, msg});
   } else {
-    auto tx_commit_status = atomic_tx_scope.Commit();
+    auto tx_commit_status = script_runtime_guard.Commit();
     if (!tx_commit_status.IsOK()) {
       lua_pop(lua, 2);
       return tx_commit_status.Prefixed(fmt::format("Error while committing script `{}`: ", funcname));
@@ -904,12 +934,7 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
    * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
    * for every command uses too much CPU. */
   static int64_t gc_count = 0;
-
-  gc_count++;
-  if (gc_count == LUA_GC_CYCLE_PERIOD) {
-    lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
-    gc_count = 0;
-  }
+  MaybeRunLuaGc(lua, &gc_count);
 
   return Status::OK();
 }
@@ -972,21 +997,25 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
 
   auto cmd_flags = attributes->GenerateFlags(args, *config);
 
-  if ((script_run_ctx->flags & ScriptFlagType::kScriptNoWrites) && !(cmd_flags & redis::kCmdReadOnly)) {
-    PushError(lua, "Write commands are not allowed from read-only scripts");
-    return raise_error ? RaiseError(lua) : 1;
-  }
-
-  if ((cmd_flags & redis::kCmdNoScript) || (cmd_flags & redis::kCmdExclusive)) {
-    PushError(lua, "This Redis command is not allowed from scripts");
-    return raise_error ? RaiseError(lua) : 1;
-  }
-
   std::string cmd_name = attributes->name;
-  if (script_run_ctx->atomic_tx && (cmd_name == "publish" || cmd_name == "mpublish")) {
-    PushError(lua, "This Redis command is not allowed from atomic scripts");
+  bool script_no_writes = (script_run_ctx->flags & ScriptFlagType::kScriptNoWrites) != 0;
+  auto policy_violation =
+      redis::GetScriptCommandPolicyViolation(script_no_writes, script_run_ctx->atomic_tx, cmd_flags, cmd_name, args);
+  if (policy_violation != redis::ScriptCommandPolicyViolation::kNone) {
+    if (policy_violation == redis::ScriptCommandPolicyViolation::kReadOnlyScriptWrite) {
+      PushError(lua, "Write commands are not allowed from read-only scripts");
+    } else if (policy_violation == redis::ScriptCommandPolicyViolation::kNoScriptOrExclusive ||
+               policy_violation == redis::ScriptCommandPolicyViolation::kScriptAuthStateChange) {
+      PushError(lua, "This Redis command is not allowed from scripts");
+    } else if (policy_violation == redis::ScriptCommandPolicyViolation::kAtomicScriptPublish ||
+               policy_violation == redis::ScriptCommandPolicyViolation::kAtomicScriptApplyBatch) {
+      PushError(lua, "This Redis command is not allowed from atomic scripts");
+    } else {
+      PushError(lua, "This Redis command is not allowed from scripts");
+    }
     return raise_error ? RaiseError(lua) : 1;
   }
+
   cmd->SetArgs(args);
   auto s = cmd->Parse();
   if (!s) {

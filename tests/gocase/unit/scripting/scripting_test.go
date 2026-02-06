@@ -202,6 +202,14 @@ return {type(foo),foo == false}
 		require.ErrorContains(t, r.Err(), "not allowed")
 	})
 
+	t.Run("EVAL - Scripts can't change auth context", func(t *testing.T) {
+		r := rdb.Eval(ctx, `return redis.call('auth', 'dummy')`, []string{})
+		require.ErrorContains(t, r.Err(), "not allowed from scripts")
+
+		r = rdb.Eval(ctx, `return redis.call('hello', '3', 'auth', 'default', 'dummy')`, []string{})
+		require.ErrorContains(t, r.Err(), "not allowed from scripts")
+	})
+
 	t.Run("EVAL - Scripts can run blocking commands and get immediate result", func(t *testing.T) {
 		r := rdb.Eval(ctx, `return redis.pcall('blpop', KEYS[1], 0)`, []string{"key_for_blpop_script"})
 		require.Equal(t, r.Val(), nil)
@@ -955,6 +963,11 @@ func TestEvalTx(t *testing.T) {
 
 	t.Run("EVAL_TX blocks pubsub side effects", func(t *testing.T) {
 		r := rdb.Do(ctx, "EVAL_TX", `return redis.call('publish', ARGV[1], ARGV[2])`, "0", "txch", "m1")
+		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
+	})
+
+	t.Run("EVAL_TX blocks APPLYBATCH", func(t *testing.T) {
+		r := rdb.Do(ctx, "EVAL_TX", `return redis.call('applybatch', 'set', KEYS[1], ARGV[1])`, "1", "eval_tx_ab", "v")
 		require.ErrorContains(t, r.Err(), "not allowed from atomic scripts")
 	})
 }

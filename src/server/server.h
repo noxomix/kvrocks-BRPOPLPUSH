@@ -52,6 +52,7 @@
 #include "server/redis_connection.h"
 #include "stats/log_collector.h"
 #include "stats/stats.h"
+#include "server/watched_keys_update.h"
 #include "storage/redis_metadata.h"
 #include "storage/storage.h"
 #include "task_runner.h"
@@ -421,6 +422,7 @@ class Server {
                                   const redis::CommandAttributes &attr);
   void UpdateWatchedKeysManually(const std::string &ns, const std::vector<std::string> &keys);
   void MarkAllWatchedKeysModified();
+  void ApplyDeferredWatchKeysUpdate(const std::string &ns, const redis::DeferredWatchKeysUpdate &update);
   bool HasWatchedKeys() const { return watched_key_size_.load(std::memory_order_relaxed) > 0; }
   void WatchKey(redis::Connection *conn, const std::vector<std::string> &keys);
   static bool IsWatchedKeysModified(redis::Connection *conn);

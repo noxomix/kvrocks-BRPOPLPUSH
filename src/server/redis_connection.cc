@@ -24,6 +24,7 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include "commands/command_policy.h"
 #include "commands/commander.h"
 #include "commands/error_constants.h"
 #include "fmt/format.h"
@@ -258,39 +259,22 @@ const std::vector<std::string> &Connection::GetQueuedReplies() const { return qu
 
 void Connection::EnqueueDeferredExecWatchUpdate(bool mark_all_keys, std::vector<std::string> keys) {
   if (!in_exec_) return;
-
-  if (mark_all_keys) {
-    deferred_exec_watch_all_keys_ = true;
-    deferred_exec_watch_keys_.clear();
-    return;
-  }
-
-  if (deferred_exec_watch_all_keys_ || keys.empty()) return;
-  auto old_size = deferred_exec_watch_keys_.size();
-  deferred_exec_watch_keys_.resize(old_size + keys.size());
-  std::move(keys.begin(), keys.end(), deferred_exec_watch_keys_.begin() + static_cast<std::ptrdiff_t>(old_size));
+  deferred_exec_watch_update_.Enqueue(mark_all_keys, std::move(keys));
 }
 
 void Connection::ApplyDeferredExecWatchUpdates() {
-  if (!srv_->HasWatchedKeys()) {
-    deferred_exec_watch_all_keys_ = false;
-    deferred_exec_watch_keys_.clear();
-    return;
-  }
-
-  if (deferred_exec_watch_all_keys_) {
-    srv_->MarkAllWatchedKeysModified();
-  } else if (!deferred_exec_watch_keys_.empty()) {
-    srv_->UpdateWatchedKeysManually(GetNamespace(), deferred_exec_watch_keys_);
-  }
-  deferred_exec_watch_all_keys_ = false;
-  deferred_exec_watch_keys_.clear();
+  srv_->ApplyDeferredWatchKeysUpdate(GetNamespace(), deferred_exec_watch_update_);
+  deferred_exec_watch_update_.Reset();
 }
 
 void Connection::UpdateWatchedKeysManually(const std::vector<std::string> &keys) {
   if (keys.empty() || !srv_->HasWatchedKeys()) return;
   if (in_exec_) {
     EnqueueDeferredExecWatchUpdate(false, std::vector<std::string>(keys.begin(), keys.end()));
+    return;
+  }
+  if (owner_ != nullptr && owner_->HasBatchContextForNamespace(GetNamespace())) {
+    owner_->EnqueueBatchWatchUpdate(false, std::vector<std::string>(keys.begin(), keys.end()));
     return;
   }
   srv_->UpdateWatchedKeysManually(GetNamespace(), keys);
@@ -633,62 +617,12 @@ static bool IsCmdForIndexing(uint64_t cmd_flags, CommandCategory cmd_cat) {
           cmd_cat == CommandCategory::Script || cmd_cat == CommandCategory::Function);
 }
 
-static bool IsCmdAllowedInStaleData(const std::string &cmd_name) {
-  return cmd_name == "info" || cmd_name == "slaveof" || cmd_name == "config";
-}
-
-static bool IsAllowedInSubscribedMode(const std::string &cmd_name) {
-  return cmd_name == "subscribe" || cmd_name == "unsubscribe" || cmd_name == "psubscribe" ||
-         cmd_name == "punsubscribe" || cmd_name == "ssubscribe" || cmd_name == "sunsubscribe" ||
-         cmd_name == "ping" || cmd_name == "quit" || cmd_name == "reset";
-}
-
 static const CommandAttributes *LookupCommandAttributesByName(const std::string &cmd_name) {
   if (cmd_name.empty()) return nullptr;
   auto commands = redis::CommandTable::Get();
   auto iter = commands->find(util::ToLower(cmd_name));
   if (iter == commands->end()) return nullptr;
   return iter->second;
-}
-
-static bool HelloHasAuthOption(const CommandTokens &cmd_tokens) {
-  if (cmd_tokens.size() < 2) return false;
-
-  size_t next_arg = 1;
-  auto protocol = ParseInt<int>(cmd_tokens[next_arg], 10);
-  if (!protocol) {
-    return false;
-  }
-  ++next_arg;
-
-  for (; next_arg < cmd_tokens.size(); ++next_arg) {
-    size_t more_args = cmd_tokens.size() - next_arg - 1;
-    const auto &opt = cmd_tokens[next_arg];
-    if (util::EqualICase(opt, "auth") && more_args != 0) {
-      return true;
-    }
-    if (util::EqualICase(opt, "setname") && more_args != 0) {
-      ++next_arg;
-      continue;
-    }
-    return false;
-  }
-
-  return false;
-}
-
-static bool IsBatchBarrierCommand(const std::string &cmd_name, const CommandAttributes *attributes,
-                                  uint64_t cmd_flags, const CommandTokens &cmd_tokens) {
-  if ((cmd_flags & kCmdBlocking) != 0) return true;
-  if ((cmd_flags & kCmdExclusive) != 0) return true;
-  if (cmd_name == "auth" || cmd_name == "reset") return true;
-  if (cmd_name == "hello" && HelloHasAuthOption(cmd_tokens)) return true;
-  if (cmd_name == "multi" || cmd_name == "exec" || cmd_name == "watch" || cmd_name == "unwatch" ||
-      cmd_name == "applybatch") {
-    return true;
-  }
-  if (attributes->category == CommandCategory::Script || attributes->category == CommandCategory::Function) return true;
-  return false;
 }
 
 static size_t EstimateCommandBytes(const CommandTokens &cmd_tokens) {
@@ -900,7 +834,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       continue;
     }
 
-    if (is_multi_exec && (cmd_flags & kCmdNoMulti)) {
+    if (is_multi_exec && !IsCommandAllowedInMulti(cmd_flags)) {
       Reply(redis::Error({Status::NotOK, fmt::format("{} inside MULTI is not allowed", util::ToUpper(cmd_name))}));
       continue;
     }
@@ -944,7 +878,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
       continue;
     }
 
-    if (!config->slave_serve_stale_data && srv_->IsSlave() && !IsCmdAllowedInStaleData(cmd_name) &&
+    if (!config->slave_serve_stale_data && srv_->IsSlave() && !IsCommandAllowedInStaleData(cmd_name) &&
         srv_->GetReplicationState() != kReplConnected) {
       Reply(redis::Error({Status::RedisMasterDown,
                           "Link with MASTER is down "
@@ -1064,8 +998,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
 
 void Connection::ResetMultiExec() {
   in_exec_ = false;
-  deferred_exec_watch_all_keys_ = false;
-  deferred_exec_watch_keys_.clear();
+  deferred_exec_watch_update_.Reset();
   multi_error_ = false;
   multi_cmds_.clear();
   DisableFlag(Connection::kMultiExec);

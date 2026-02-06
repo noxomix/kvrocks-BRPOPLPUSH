@@ -82,6 +82,33 @@ func TestScriptTimeout(t *testing.T) {
 		rdb.FunctionDelete(ctx, "timeoutlib")
 	})
 
+	t.Run("EVAL_TX timeout rolls back writes", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "eval_tx_timeout_rb", "old", 0).Err())
+		err := rdb.Do(ctx, "EVAL_TX",
+			`redis.call('set', KEYS[1], ARGV[1]); while true do end`,
+			"1", "eval_tx_timeout_rb", "new").Err()
+		require.Error(t, err)
+		require.True(t, strings.Contains(err.Error(), "timed out"), "Expected timeout error, got: %v", err)
+		require.Equal(t, "old", rdb.Get(ctx, "eval_tx_timeout_rb").Val())
+	})
+
+	t.Run("FCALL_TX timeout rolls back writes", func(t *testing.T) {
+		_, err := rdb.FunctionLoad(ctx, `#!lua name=timeouttxlib
+redis.register_function('set_then_loop_tx', function(keys, args)
+  redis.call('set', keys[1], args[1])
+  while true do end
+end)`).Result()
+		require.NoError(t, err)
+		require.NoError(t, rdb.Set(ctx, "fcall_tx_timeout_rb", "old", 0).Err())
+
+		err = rdb.Do(ctx, "FCALL_TX", "set_then_loop_tx", 1, "fcall_tx_timeout_rb", "new").Err()
+		require.Error(t, err)
+		require.True(t, strings.Contains(err.Error(), "timed out"), "Expected timeout error, got: %v", err)
+		require.Equal(t, "old", rdb.Get(ctx, "fcall_tx_timeout_rb").Val())
+
+		require.NoError(t, rdb.FunctionDelete(ctx, "timeouttxlib").Err())
+	})
+
 	t.Run("Normal script completes without timeout", func(t *testing.T) {
 		result, err := rdb.Eval(ctx, "return 'hello'", []string{}).Result()
 		require.NoError(t, err)
@@ -170,6 +197,61 @@ func TestScriptKill(t *testing.T) {
 
 		// Cleanup
 		rdb.FunctionDelete(ctx, "killtest")
+	})
+
+	t.Run("SCRIPT KILL rolls back EVAL_TX writes", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "eval_tx_kill_rb", "old", 0).Err())
+		errCh := make(chan error, 1)
+
+		go func() {
+			errCh <- rdb.Do(ctx, "EVAL_TX",
+				`redis.call('set', KEYS[1], ARGV[1]); while true do end`,
+				"1", "eval_tx_kill_rb", "new").Err()
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+		tc := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc.Close()) }()
+		require.NoError(t, tc.WriteArgs("SCRIPT", "KILL"))
+		tc.MustRead(t, "+OK")
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("EVAL_TX did not terminate after SCRIPT KILL")
+		}
+		require.Equal(t, "old", rdb.Get(ctx, "eval_tx_kill_rb").Val())
+	})
+
+	t.Run("SCRIPT KILL rolls back FCALL_TX writes", func(t *testing.T) {
+		_, err := rdb.FunctionLoad(ctx, `#!lua name=killtxlib
+redis.register_function('set_then_loop_tx', function(keys, args)
+  redis.call('set', keys[1], args[1])
+  while true do end
+end)`).Result()
+		require.NoError(t, err)
+		require.NoError(t, rdb.Set(ctx, "fcall_tx_kill_rb", "old", 0).Err())
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- rdb.Do(ctx, "FCALL_TX", "set_then_loop_tx", 1, "fcall_tx_kill_rb", "new").Err()
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+		tc := srv.NewTCPClient()
+		defer func() { require.NoError(t, tc.Close()) }()
+		require.NoError(t, tc.WriteArgs("SCRIPT", "KILL"))
+		tc.MustRead(t, "+OK")
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("FCALL_TX did not terminate after SCRIPT KILL")
+		}
+		require.Equal(t, "old", rdb.Get(ctx, "fcall_tx_kill_rb").Val())
+		require.NoError(t, rdb.FunctionDelete(ctx, "killtxlib").Err())
 	})
 }
 

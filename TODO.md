@@ -82,6 +82,9 @@
 - **Timeout/Kill Limitierungen:** Hook greift nur in Lua-Bytecode, nicht während C++ in `redis.call()` läuft
 - **SCRIPT KILL:** setzt nur Worker-Flag; funktioniert nur wenn Kill-Command auf anderem Worker läuft
 - **SO_REUSEPORT Risiko:** beide Connections koennen auf demselben Worker landen → SCRIPT KILL haengt (Go-Test: i/o timeout)
+- `EVAL_TX` / `FCALL_TX`: DB-Writes sind atomar (BeginTxn/CommitTxn, Rollback bei Runtime-Fehler)
+- Konstitutions-Regel: In atomic scripts nur Commands erlauben, deren Side-Effects im NS-Txn liegen; alles andere explizit sperren
+- Hard-Block-Kandidaten in Script-Context (fuer Atomik/Kontext-Sicherheit): `PUBLISH/MPUBLISH`, `APPLYBATCH`, `AUTH`, `HELLO AUTH`
 
 ### Transaktionen & Atomizität
 
@@ -249,11 +252,21 @@ Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && 
 - [x] **OnRead Yield/Quota** - Long Pipelines blockieren Worker: pro Tick max N Commands oder Zeitbudget, dann via event reschedulen; Re-Entry-Guard (`is_running_`), Backpressure (EV_READ off/on), kein Yield innerhalb EXEC
 
 ### Later
+- [ ] **CONFIG RELOAD** - Config-Datei Hot-Reload ohne Restart (`Config::Load()` über neuen Subcommand; Validierung für nicht-änderbare Felder wie `bind`, `port`, `dir`)
 - [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
 - [ ] **Go-Tests für Fair Scheduling**
 - [ ] **Per-NS Heavy-Command Budget** - `kCmdHeavy` Flag + `max-heavy-per-namespace` Config
 - [ ] **Lua Key-Level Locking** - Nur deklarierte Keys locken (wie DragonflyDB)
-- [ ] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
+- [x] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
+- [x] **EVAL_TX/FCALL_TX Hardening:** `APPLYBATCH` aus Script-Context sperren (umgeht DB-Txn, kann Rollback aushebeln)
+
+### Later - Reuse/Refactor
+- [x] **Command-Policy zentralisieren** - eine gemeinsame Policy-Matrix fuer Barrier/Script/Subscribed/MULTI statt Checks an mehreren Stellen
+- [x] **Gemeinsamer Script-Runner** - `EVAL/FCALL/EVAL_TX/FCALL_TX` ueber denselben Guard+Txn-Pfad fuehren (weniger Drift-Risiko)
+- [ ] **[LATER] Einheitlicher Batch-Lifecycle Helper** - Begin/Defer/Commit/Fail-Reply in eine wiederverwendbare Komponente ziehen
+- [x] **WATCH-dirty Pfad vereinheitlichen** - batched und EXEC nutzen denselben commit-sensitiven Apply-Mechanismus (`DeferredWatchKeysUpdate` + `Server::ApplyDeferredWatchKeysUpdate`)
+- [x] **Script-Context Hardening:** `AUTH` + `HELLO AUTH` in Scripts sperren (Namespace/Auth-Wechsel mitten im Script)
+- [x] **Tests:** `EVAL_TX`/`FCALL_TX` mit `lua-time-limit` und `SCRIPT KILL` auf Rollback verifizieren
 
 ---
 
