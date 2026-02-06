@@ -184,6 +184,14 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void createConnectionFromDispatch(const PendingConnection &pc);
   void DrainPendingConnections();
 
+  enum class BatchFlushReason : uint8_t { kExplicit, kTimer };
+  Status BatchEnsureContext(const std::string &ns);
+  bool BatchOnWrite(size_t estimated_bytes, const Config::RuntimeConfigSnapshot &config);
+  void BatchCloseIdleContext();
+  void BatchFlushInternal(BatchFlushReason reason);
+  void BatchDisarmTimer();
+  void BatchResetState();
+
   event_base *base_;
   UniqueEvent timer_;
   UniqueEvent batch_timer_;

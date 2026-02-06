@@ -263,7 +263,7 @@ Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && 
 ### Later - Reuse/Refactor
 - [x] **Command-Policy zentralisieren** - eine gemeinsame Policy-Matrix fuer Barrier/Script/Subscribed/MULTI statt Checks an mehreren Stellen
 - [x] **Gemeinsamer Script-Runner** - `EVAL/FCALL/EVAL_TX/FCALL_TX` ueber denselben Guard+Txn-Pfad fuehren (weniger Drift-Risiko)
-- [ ] **[LATER] Einheitlicher Batch-Lifecycle Helper** - Begin/Defer/Commit/Fail-Reply in eine wiederverwendbare Komponente ziehen
+- [x] **Einheitlicher Batch-Lifecycle Helper** - Begin/Defer/Commit/Fail-Reply in Worker-internen Lifecycle-Helfer zentralisiert (no-behavior-change Refactor)
 - [x] **WATCH-dirty Pfad vereinheitlichen** - batched und EXEC nutzen denselben commit-sensitiven Apply-Mechanismus (`DeferredWatchKeysUpdate` + `Server::ApplyDeferredWatchKeysUpdate`)
 - [x] **Script-Context Hardening:** `AUTH` + `HELLO AUTH` in Scripts sperren (Namespace/Auth-Wechsel mitten im Script)
 - [x] **Tests:** `EVAL_TX`/`FCALL_TX` mit `lua-time-limit` und `SCRIPT KILL` auf Rollback verifizieren
