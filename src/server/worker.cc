@@ -180,6 +180,26 @@ void Worker::EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply) {
     std::ignore = ReplyByID(fd, conn_id, reply);
     return;
   }
+
+  if (batch_state_.reply_overflow) {
+    batch_state_.deferred_replies.push_back({fd, conn_id, ""});
+    return;
+  }
+
+  auto config = srv->GetConfig()->GetSnapshot();
+  const uint64_t reply_limit = config->batching_max_reply_bytes > 0
+                                   ? static_cast<uint64_t>(config->batching_max_reply_bytes)
+                                   : 0;
+  if (reply_limit > 0 && reply.size() > reply_limit) {
+    batch_state_.reply_overflow = true;
+    for (auto &deferred : batch_state_.deferred_replies) {
+      deferred.reply.clear();
+      deferred.reply.shrink_to_fit();
+    }
+    batch_state_.deferred_replies.push_back({fd, conn_id, ""});
+    return;
+  }
+
   batch_state_.deferred_replies.push_back({fd, conn_id, std::move(reply)});
 }
 
@@ -271,7 +291,8 @@ void Worker::BatchFlushInternal(BatchFlushReason reason) {
   auto ns = batch_state_.active_ns;
   auto pending_watch_update = std::move(batch_state_.pending_watch_update);
   auto pending_publishes = std::move(batch_state_.pending_publishes);
-  bool should_commit = batch_state_.txn_active && batch_state_.active;
+  const bool reply_overflow = batch_state_.reply_overflow;
+  bool should_commit = batch_state_.txn_active && batch_state_.active && !reply_overflow;
   Status commit_status = Status::OK();
   if (batch_state_.txn_active) {
     if (should_commit) {
@@ -286,7 +307,9 @@ void Worker::BatchFlushInternal(BatchFlushReason reason) {
 
   BatchResetState();
 
-  if (!commit_status.IsOK()) {
+  if (reply_overflow) {
+    warn("[worker] Discard namespace batch for ns={} due to deferred reply bytes overflow", ns);
+  } else if (!commit_status.IsOK()) {
     error("[worker] Failed to commit namespace batch for ns={}: {}", ns, commit_status.Msg());
   }
 
@@ -299,12 +322,15 @@ void Worker::BatchFlushInternal(BatchFlushReason reason) {
   }
 
   std::string batch_commit_err;
-  if (!commit_status.IsOK()) {
+  if (reply_overflow) {
+    batch_commit_err = redis::Error({Status::NotOK, "batch reply too large"});
+  } else if (!commit_status.IsOK()) {
     batch_commit_err = redis::Error({Status::NotOK, "batch commit failed: " + commit_status.Msg()});
   }
 
+  const bool batch_succeeded = !reply_overflow && commit_status.IsOK();
   for (const auto &deferred : deferred_replies) {
-    if (commit_status.IsOK()) {
+    if (batch_succeeded) {
       std::ignore = ReplyByID(deferred.fd, deferred.conn_id, deferred.reply);
     } else {
       std::ignore = ReplyByID(deferred.fd, deferred.conn_id, batch_commit_err);
@@ -323,6 +349,7 @@ void Worker::BatchResetState() {
   batch_state_.ops = 0;
   batch_state_.bytes = 0;
   batch_state_.deadline_us = 0;
+  batch_state_.reply_overflow = false;
   batch_state_.pending_watch_update.Reset();
   batch_state_.pending_publishes.clear();
   batch_state_.deferred_replies.clear();

@@ -224,6 +224,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
     uint64_t ops = 0;
     uint64_t bytes = 0;
     uint64_t deadline_us = 0;
+    bool reply_overflow = false;
     redis::DeferredWatchKeysUpdate pending_watch_update;
     std::vector<redis::DeferredPublishIntent> pending_publishes;
     std::vector<DeferredReply> deferred_replies;

@@ -87,6 +87,8 @@
 - Hard-Block-Kandidaten in Script-Context (fuer Atomik/Kontext-Sicherheit): `PUBLISH/MPUBLISH`, `APPLYBATCH`, `AUTH`, `HELLO AUTH`
 - Semantik-Regel fuer PubSub: `EVAL/FCALL` (Redis-kompatible Pfade) duerfen `PUBLISH` sofort ausfuehren; `EVAL_TX/FCALL_TX` behalten `PUBLISH/MPUBLISH` gesperrt, solange kein explizites "publish-after-commit" mit dokumentierter Rueckgabesemantik umgesetzt ist
 - Batch/EXEC-Regel fuer PubSub: `PUBLISH/MPUBLISH` Side-Effects werden bis nach erfolgreichem Commit aufgestaut (defer-until-commit), damit keine Zustellung vor DB-Commit sichtbar wird
+- Rueckgabewert-Regel fuer defered `PUBLISH/MPUBLISH` (Batch/EXEC): Integer basiert auf Subscriber-Snapshot zum Collect-Zeitpunkt (namespace-isoliert), nicht auf spaeterer Live-Zustellung zum Delivery-Zeitpunkt
+- Konfig-Regel: aktuell **kein** separater Schalter fuer `publish-after-commit`; Verhalten ist fest aktiv in Batch/EXEC und sofortig ausserhalb dieser Kontexte
 
 ### Transaktionen & Atomizität
 
@@ -233,6 +235,7 @@
 - [x] **Batching: WATCH dirty erst nach erfolgreichem Commit** (batched write-path defered, apply nur bei erfolgreichem Commit)
 - [LATER] **Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
 - [LATER] **Batching: Commit-Fehler semantisch präzisieren** (nicht nur generisches `ERR batch commit failed` für alle deferred Replies)
+- [x] **Batching: Deferred-Reply-Bytes Cap (pro Reply)** (`batching-max-reply-bytes`, 0=unlimited) - wenn eine einzelne deferred Reply das Limit ueberschreitet, vor `CommitTxn` abbrechen (`DiscardTxn`) und einheitlichen Fehler an alle deferred Replies senden
 - [LATER] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
 - [x] **Batching/EXEC + PUBLISH Side-Effects semantisch klarziehen** (`PUBLISH/MPUBLISH` werden in Batch/EXEC bis Commit aufgestaut; `EVAL_TX/FCALL_TX` behalten `PUBLISH/MPUBLISH` gesperrt)
 - [x] **Batching: Annahme dokumentieren** (kein 1NS=1Worker nötig; aktiver Batch hält `WorkExclusivityGuard(ns)`)
@@ -247,11 +250,16 @@ Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && 
 - [ ] List: LRANGE, LINSERT, LREM (`cmd_list.cc`)
 - [ ] ZSet: ZRANGE, ZRANGEBYLEX, ZRANGEBYSCORE (`cmd_zset.cc`)
 - [ ] Keys: KEYS (`cmd_server.cc`)
+- [ ] Stream (high): XRANGE, XREVRANGE, XPENDING, XREAD, XREADGROUP (`cmd_stream.cc`)
+- [ ] Geo (high): GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER (`cmd_geo.cc`)
+- [ ] PubSub (medium): PUBSUB CHANNELS, PUBSUB SHARDCHANNELS (`cmd_pubsub.cc`)
+- [ ] Introspection (medium): CLIENT LIST, COMMAND/COMMAND INFO (`cmd_server.cc`)
+- [ ] Scan family (low): SCAN, HSCAN, SSCAN, ZSCAN (COUNT weiterhin client-kontrolliert, trotzdem globale Cap sinnvoll) (`scan_base.h`, `cmd_hash.cc`, `cmd_set.cc`, `cmd_zset.cc`, `cmd_server.cc`)
 
 ### Niedrig - Concurrency Follow-up
-- [ ] **GetClientInfo Lock-Zeit** - `client_mu_` nicht während Buffer-Reads halten
-- [ ] **KillClient Lock-Reacquire** - Kandidaten pro Worker gruppieren
-- [ ] **GetNamespace API** - cross-thread-safe Snapshot/Kopie
+- [MAYBE LATER] **GetClientInfo Lock-Zeit** - `client_mu_` nicht während Buffer-Reads halten (aktuell vor allem Perf-Thema auf CLIENT-Introspection-Pfaden, kein akuter Correctness-Bug)
+- [MAYBE LATER] **KillClient Lock-Reacquire** - Kandidaten pro Worker gruppieren (aktuell funktional korrekt, Optimierung fuer hohe Kill-Last)
+- [MAYBE LATER] **GetNamespace API** - cross-thread-safe Snapshot/Kopie (in aktuellem Modell meist unkritisch, aber weiter sinnvoll als Hardening gegen spaetere Cross-Thread-Nutzung)
 - [x] **OnRead Yield/Quota** - Long Pipelines blockieren Worker: pro Tick max N Commands oder Zeitbudget, dann via event reschedulen; Re-Entry-Guard (`is_running_`), Backpressure (EV_READ off/on), kein Yield innerhalb EXEC
 
 ### Later

@@ -247,6 +247,24 @@ void Connection::Reply(const std::string &msg) {
     owner_->IncrOutboundBytesForNamespace(ns, msg.size());
   }
   if (in_exec_) {
+    if (exec_reply_overflow_) {
+      queued_replies_.push_back("");
+      return;
+    }
+
+    auto config = srv_->GetConfig()->GetSnapshot();
+    const uint64_t reply_limit = config->batching_max_reply_bytes > 0
+                                     ? static_cast<uint64_t>(config->batching_max_reply_bytes)
+                                     : 0;
+    if (reply_limit > 0 && msg.size() > reply_limit) {
+      exec_reply_overflow_ = true;
+      for (auto &queued_reply : queued_replies_) {
+        queued_reply.clear();
+        queued_reply.shrink_to_fit();
+      }
+      queued_replies_.push_back("");
+      return;
+    }
     queued_replies_.push_back(msg);
   } else if (owner_->IsBatchReplyDeferralActive()) {
     owner_->EnqueueBatchReply(GetFD(), GetID(), msg);
@@ -1013,6 +1031,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
 
 void Connection::ResetMultiExec() {
   in_exec_ = false;
+  exec_reply_overflow_ = false;
   deferred_exec_watch_update_.Reset();
   deferred_exec_publishes_.clear();
   multi_error_ = false;

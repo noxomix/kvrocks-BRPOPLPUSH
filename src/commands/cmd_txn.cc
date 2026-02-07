@@ -88,10 +88,15 @@ class CommandExec : public Commander {
       // all the other commands will be executed even if some command fails during
       // the transaction.
       // So, if conn->IsMultiError(), the transaction should still be committed.
-      s = storage->CommitTxn(ns);
-      if (s.IsOK()) {
-        conn->ApplyDeferredExecWatchUpdates();
-        conn->ApplyDeferredExecPublishes();
+      if (conn->IsExecReplyOverflow()) {
+        s = {Status::NotOK, "exec reply too large"};
+        storage->DiscardTxn(ns);
+      } else {
+        s = storage->CommitTxn(ns);
+        if (s.IsOK()) {
+          conn->ApplyDeferredExecWatchUpdates();
+          conn->ApplyDeferredExecPublishes();
+        }
       }
     }
 

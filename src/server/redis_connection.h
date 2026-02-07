@@ -220,10 +220,12 @@ class Connection : public EvbufCallbackBase<Connection> {
   // Multi exec
   void SetInExec() {
     in_exec_ = true;
+    exec_reply_overflow_ = false;
     deferred_exec_watch_update_.Reset();
     deferred_exec_publishes_.clear();
   }
   bool IsInExec() const { return in_exec_; }
+  bool IsExecReplyOverflow() const { return exec_reply_overflow_; }
   bool IsInScript() const { return in_script_; }
   bool IsMultiError() const { return multi_error_; }
   void ResetMultiExec();
@@ -281,6 +283,7 @@ class Connection : public EvbufCallbackBase<Connection> {
 
   Server *srv_;
   bool in_exec_ = false;
+  bool exec_reply_overflow_ = false;
   bool multi_error_ = false;
   std::atomic<bool> is_running_ = false;
   std::atomic<bool> has_pending_cmds_ = false;

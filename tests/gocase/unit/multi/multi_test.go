@@ -213,6 +213,64 @@ func TestMulti(t *testing.T) {
 	})
 
 	func() {
+		overflowSrv := util.StartServer(t, map[string]string{
+			"workers":                  "1",
+			"batching-max-reply-bytes": "4",
+		})
+		defer overflowSrv.Close()
+
+		t.Run("EXEC reply overflow discards txn", func(t *testing.T) {
+			overflowCtx := context.Background()
+			reader := overflowSrv.NewClient()
+			defer func() { require.NoError(t, reader.Close()) }()
+			writer := overflowSrv.NewClient()
+			defer func() { require.NoError(t, writer.Close()) }()
+
+			require.NoError(t, writer.Do(overflowCtx, "MULTI").Err())
+			require.NoError(t, writer.Do(overflowCtx, "SET", "exec_overflow_k", "v1").Err())
+			execReply := writer.Do(overflowCtx, "EXEC")
+			require.NoError(t, execReply.Err())
+			execResult, ok := execReply.Val().([]interface{})
+			require.True(t, ok)
+			require.Len(t, execResult, 1)
+			require.Contains(t, fmt.Sprintf("%v", execResult[0]), "exec reply too large")
+
+			_, err := reader.Get(overflowCtx, "exec_overflow_k").Result()
+			require.ErrorIs(t, err, redis.Nil)
+		})
+	}()
+
+	func() {
+		overflowSrv := util.StartServer(t, map[string]string{
+			"workers":                  "1",
+			"batching-max-reply-bytes": "6",
+		})
+		defer overflowSrv.Close()
+
+		t.Run("EXEC reply limit is per reply, not cumulative", func(t *testing.T) {
+			overflowCtx := context.Background()
+			reader := overflowSrv.NewClient()
+			defer func() { require.NoError(t, reader.Close()) }()
+			writer := overflowSrv.NewClient()
+			defer func() { require.NoError(t, writer.Close()) }()
+
+			require.NoError(t, writer.Do(overflowCtx, "MULTI").Err())
+			require.NoError(t, writer.Do(overflowCtx, "SET", "exec_per_reply_k1", "v1").Err())
+			require.NoError(t, writer.Do(overflowCtx, "SET", "exec_per_reply_k2", "v2").Err())
+			execReply := writer.Do(overflowCtx, "EXEC")
+			require.NoError(t, execReply.Err())
+			execResult, ok := execReply.Val().([]interface{})
+			require.True(t, ok)
+			require.Len(t, execResult, 2)
+			require.Equal(t, "OK", fmt.Sprintf("%v", execResult[0]))
+			require.Equal(t, "OK", fmt.Sprintf("%v", execResult[1]))
+
+			require.Equal(t, "v1", reader.Get(overflowCtx, "exec_per_reply_k1").Val())
+			require.Equal(t, "v2", reader.Get(overflowCtx, "exec_per_reply_k2").Val())
+		})
+	}()
+
+	func() {
 		newSrv := util.StartServer(t, map[string]string{})
 		defer newSrv.Close()
 

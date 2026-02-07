@@ -173,6 +173,7 @@ Config::Config() {
       {"batching-max-ops", true, new IntField(&batching_max_ops, 128, 0, INT_MAX)},
       {"batching-max-bytes", true, new IntField(&batching_max_bytes, 1024 * 1024, 0, INT_MAX)},
       {"batching-max-delay-us", true, new IntField(&batching_max_delay_us, 3000, 0, INT_MAX)},
+      {"batching-max-reply-bytes", true, new IntField(&batching_max_reply_bytes, 10 * 1024 * 1024, 0, INT_MAX)},
       {"timeout", false, new IntField(&timeout, 0, 0, INT_MAX)},
       {"tcp-backlog", true, new IntField(&backlog, 511, 0, INT_MAX)},
       {"maxclients", false, new IntField(&maxclients, 10240, 0, INT_MAX)},
@@ -1059,6 +1060,7 @@ std::shared_ptr<Config::RuntimeConfigSnapshot> Config::BuildRuntimeSnapshot() co
   snapshot->batching_max_ops = batching_max_ops;
   snapshot->batching_max_bytes = batching_max_bytes;
   snapshot->batching_max_delay_us = batching_max_delay_us;
+  snapshot->batching_max_reply_bytes = batching_max_reply_bytes;
   snapshot->sni_max_workers_percent = sni_max_workers_percent;
   snapshot->sni_overdraft_percent = sni_overdraft_percent;
   snapshot->timeout = timeout;

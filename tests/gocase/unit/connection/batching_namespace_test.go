@@ -387,3 +387,86 @@ func TestBatchingPublishDeferredUntilCommit(t *testing.T) {
 	require.Equal(t, "batch_publish_ch", pubsubMsg.Channel)
 	require.Equal(t, "m1", pubsubMsg.Payload)
 }
+
+func TestBatchingReplyOverflowDiscardsTxn(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"workers":                  "1",
+		"batching-enabled":         "yes",
+		"batching-max-ops":         "10000",
+		"batching-max-bytes":       "1048576",
+		"batching-max-delay-us":    "700000",
+		"batching-max-reply-bytes": "4",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	reader := srv.NewClient()
+	defer func() { require.NoError(t, reader.Close()) }()
+
+	c := srv.NewTCPClient()
+	defer func() { require.NoError(t, c.Close()) }()
+
+	require.NoError(t, c.WriteArgs("SET", "overflow_batch_k", "v1"))
+	require.NoError(t, c.WriteArgs("APPLYBATCH", "malformed"))
+
+	c.MustMatch(t, "^-ERR batch reply too large$")
+	c.MustMatch(t, "^-ERR .*")
+
+	_, err := reader.Get(ctx, "overflow_batch_k").Result()
+	require.ErrorIs(t, err, redis.Nil)
+}
+
+func TestBatchingReplyOverflowUnlimited(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"workers":                  "1",
+		"batching-enabled":         "yes",
+		"batching-max-ops":         "10000",
+		"batching-max-bytes":       "1048576",
+		"batching-max-delay-us":    "700000",
+		"batching-max-reply-bytes": "0",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	reader := srv.NewClient()
+	defer func() { require.NoError(t, reader.Close()) }()
+
+	c := srv.NewTCPClient()
+	defer func() { require.NoError(t, c.Close()) }()
+
+	require.NoError(t, c.WriteArgs("SET", "unlimited_batch_k", "v1"))
+	require.NoError(t, c.WriteArgs("APPLYBATCH", "malformed"))
+
+	c.MustRead(t, "+OK")
+	c.MustMatch(t, "^-ERR .*")
+	require.Equal(t, "v1", reader.Get(ctx, "unlimited_batch_k").Val())
+}
+
+func TestBatchingReplyPerMessageLimitNoCumulativeOverflow(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"workers":                  "1",
+		"batching-enabled":         "yes",
+		"batching-max-ops":         "10000",
+		"batching-max-bytes":       "1048576",
+		"batching-max-delay-us":    "700000",
+		"batching-max-reply-bytes": "6",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	reader := srv.NewClient()
+	defer func() { require.NoError(t, reader.Close()) }()
+
+	c := srv.NewTCPClient()
+	defer func() { require.NoError(t, c.Close()) }()
+
+	require.NoError(t, c.WriteArgs("SET", "per_reply_k1", "v1"))
+	require.NoError(t, c.WriteArgs("SET", "per_reply_k2", "v2"))
+	require.NoError(t, c.WriteArgs("APPLYBATCH", "malformed"))
+
+	c.MustRead(t, "+OK")
+	c.MustRead(t, "+OK")
+	c.MustMatch(t, "^-ERR .*")
+	require.Equal(t, "v1", reader.Get(ctx, "per_reply_k1").Val())
+	require.Equal(t, "v2", reader.Get(ctx, "per_reply_k2").Val())
+}

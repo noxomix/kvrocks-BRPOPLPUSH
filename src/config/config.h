@@ -118,6 +118,7 @@ struct Config {
   int batching_max_ops = 128;
   int batching_max_bytes = 1024 * 1024;
   int batching_max_delay_us = 3000;
+  int batching_max_reply_bytes = 10 * 1024 * 1024;
   int timeout = 0;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;
@@ -306,6 +307,7 @@ struct Config {
     int batching_max_ops = 0;
     int batching_max_bytes = 0;
     int batching_max_delay_us = 0;
+    int batching_max_reply_bytes = 0;
     int sni_max_workers_percent = 0;
     int sni_overdraft_percent = 0;
     int timeout = 0;
