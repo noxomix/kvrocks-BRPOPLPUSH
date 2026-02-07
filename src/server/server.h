@@ -49,6 +49,7 @@
 #include "namespace.h"
 #include "search/index_manager.h"
 #include "search/indexer.h"
+#include "server/publish_intent.h"
 #include "server/redis_connection.h"
 #include "stats/log_collector.h"
 #include "stats/stats.h"
@@ -271,6 +272,9 @@ class Server {
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
   int GetFetchFileThreadNum() const { return fetch_file_threads_num_; }
 
+  redis::CollectedPublishTargets CollectPublishTargets(const std::string &ns, const std::string &channel);
+  int DeliverCollectedPublish(const redis::CollectedPublishTargets &targets, const std::string &channel,
+                              const std::string &msg);
   int PublishMessage(const std::string &ns, const std::string &channel, const std::string &msg);
   void SubscribeChannel(const std::string &channel, redis::Connection *conn);
   void UnsubscribeChannel(const std::string &channel, redis::Connection *conn);

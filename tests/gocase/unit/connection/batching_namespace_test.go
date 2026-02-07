@@ -345,3 +345,45 @@ func TestBatchingNamespaceSwitchFlushesPreviousBatch(t *testing.T) {
 	// Namespace A watcher must observe committed write (EXEC abort).
 	require.Nil(t, watcherA.Do(ctx, "EXEC").Val())
 }
+
+func TestBatchingPublishDeferredUntilCommit(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"workers":               "1",
+		"batching-enabled":      "yes",
+		"batching-max-ops":      "10000",
+		"batching-max-bytes":    "1048576",
+		"batching-max-delay-us": "700000",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	subscriber := srv.NewClient()
+	defer func() { require.NoError(t, subscriber.Close()) }()
+
+	sub := subscriber.Subscribe(ctx, "batch_publish_ch")
+	defer func() { require.NoError(t, sub.Close()) }()
+	first, err := sub.Receive(ctx)
+	require.NoError(t, err)
+	require.IsType(t, &redis.Subscription{}, first)
+
+	conn := srv.NewTCPClient()
+	defer func() { require.NoError(t, conn.Close()) }()
+
+	require.NoError(t, conn.WriteArgs("SET", "batch_publish_k", "v1"))
+	require.NoError(t, conn.WriteArgs("PUBLISH", "batch_publish_ch", "m1"))
+
+	_, err = sub.ReceiveTimeout(ctx, 100*time.Millisecond)
+	require.Error(t, err)
+
+	require.NoError(t, conn.WriteArgs("APPLYBATCH", "malformed"))
+	conn.MustRead(t, "+OK")
+	conn.MustRead(t, ":1")
+	conn.MustMatch(t, "^-ERR .*")
+
+	received, err := sub.ReceiveTimeout(ctx, time.Second)
+	require.NoError(t, err)
+	pubsubMsg, ok := received.(*redis.Message)
+	require.True(t, ok)
+	require.Equal(t, "batch_publish_ch", pubsubMsg.Channel)
+	require.Equal(t, "m1", pubsubMsg.Payload)
+}

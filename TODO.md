@@ -85,6 +85,8 @@
 - `EVAL_TX` / `FCALL_TX`: DB-Writes sind atomar (BeginTxn/CommitTxn, Rollback bei Runtime-Fehler)
 - Konstitutions-Regel: In atomic scripts nur Commands erlauben, deren Side-Effects im NS-Txn liegen; alles andere explizit sperren
 - Hard-Block-Kandidaten in Script-Context (fuer Atomik/Kontext-Sicherheit): `PUBLISH/MPUBLISH`, `APPLYBATCH`, `AUTH`, `HELLO AUTH`
+- Semantik-Regel fuer PubSub: `EVAL/FCALL` (Redis-kompatible Pfade) duerfen `PUBLISH` sofort ausfuehren; `EVAL_TX/FCALL_TX` behalten `PUBLISH/MPUBLISH` gesperrt, solange kein explizites "publish-after-commit" mit dokumentierter Rueckgabesemantik umgesetzt ist
+- Batch/EXEC-Regel fuer PubSub: `PUBLISH/MPUBLISH` Side-Effects werden bis nach erfolgreichem Commit aufgestaut (defer-until-commit), damit keine Zustellung vor DB-Commit sichtbar wird
 
 ### Transaktionen & Atomizität
 
@@ -229,9 +231,10 @@
 - [x] **Batching: Barriers** (MULTI/EXEC/WATCH, EVAL/FCALL, Blocking, CONFIG/DEBUG/CLUSTER)
 - [x] **Batching: Hardening-Barriers** (`APPLYBATCH`, `AUTH`, `HELLO AUTH`, `RESET`)
 - [x] **Batching: WATCH dirty erst nach erfolgreichem Commit** (batched write-path defered, apply nur bei erfolgreichem Commit)
-- [LATER] **[LATER] Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
+- [LATER] **Batching: Reply-Deferral auf Batch-Teilnehmer scopen** (aktuell nicht kritisch bei Betriebsannahme `1 Worker = 1 Namespace/Tenant`; relevant als Hardening fuer Multi-NS pro Worker)
 - [LATER] **Batching: Commit-Fehler semantisch präzisieren** (nicht nur generisches `ERR batch commit failed` für alle deferred Replies)
 - [LATER] **Batching: Tests erweitern** (mehr Barrier/Fehlerfälle)
+- [x] **Batching/EXEC + PUBLISH Side-Effects semantisch klarziehen** (`PUBLISH/MPUBLISH` werden in Batch/EXEC bis Commit aufgestaut; `EVAL_TX/FCALL_TX` behalten `PUBLISH/MPUBLISH` gesperrt)
 - [x] **Batching: Annahme dokumentieren** (kein 1NS=1Worker nötig; aktiver Batch hält `WorkExclusivityGuard(ns)`)
 - [x] **WATCH dirty in EXEC/MULTI commit-sensitiv machen** (EXEC deferred WATCH-Updates, apply nur nach erfolgreichem Commit; inkl. manueller WATCH-Updates aus List-Pfaden)
 
@@ -253,10 +256,8 @@ Config `max_elements_in_response` (0 = unlimited) mit Pattern `if (limit > 0 && 
 
 ### Later
 - [ ] **CONFIG RELOAD** - Config-Datei Hot-Reload ohne Restart (`Config::Load()` über neuen Subcommand; Validierung für nicht-änderbare Felder wie `bind`, `port`, `dir`)
-- [ ] **WATCH Mutex** - Per-NS Sharding (nur falls intensiv genutzt)
-- [ ] **Go-Tests für Fair Scheduling**
-- [ ] **Per-NS Heavy-Command Budget** - `kCmdHeavy` Flag + `max-heavy-per-namespace` Config
-- [ ] **Lua Key-Level Locking** - Nur deklarierte Keys locken (wie DragonflyDB)
+- [MAYBE LATER] **WATCH Mutex** - Per-NS Sharding (nur bei gemessener WATCH-Contention)
+- [MAYBE LATER] **Lua Key-Level Locking** - Nur deklarierte Keys locken (wie DragonflyDB)
 - [x] **EVAL_TX / FCALL_TX** - Transaktionale Lua Scripts mit Auto-Rollback
 - [x] **EVAL_TX/FCALL_TX Hardening:** `APPLYBATCH` aus Script-Context sperren (umgeht DB-Txn, kann Rollback aushebeln)
 

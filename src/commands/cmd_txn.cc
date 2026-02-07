@@ -91,6 +91,7 @@ class CommandExec : public Commander {
       s = storage->CommitTxn(ns);
       if (s.IsOK()) {
         conn->ApplyDeferredExecWatchUpdates();
+        conn->ApplyDeferredExecPublishes();
       }
     }
 

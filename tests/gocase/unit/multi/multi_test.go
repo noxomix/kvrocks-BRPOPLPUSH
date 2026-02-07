@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/redis/go-redis/v9"
@@ -145,6 +146,70 @@ func TestMulti(t *testing.T) {
 		require.ErrorContains(t, rdb.Do(ctx, "EVAL_TX", "return 1", "0").Err(), "inside MULTI is not allowed")
 		require.ErrorContains(t, rdb.Do(ctx, "FCALL_TX", "unknown", "0").Err(), "inside MULTI is not allowed")
 		require.EqualError(t, rdb.Do(ctx, "EXEC").Err(), "EXECABORT Transaction discarded")
+	})
+
+	t.Run("PUBLISH in EXEC is delivered after commit", func(t *testing.T) {
+		subscriber := srv.NewClient()
+		defer func() { require.NoError(t, subscriber.Close()) }()
+		sub := subscriber.Subscribe(ctx, "exec_publish_ch")
+		defer func() { require.NoError(t, sub.Close()) }()
+
+		first, err := sub.Receive(ctx)
+		require.NoError(t, err)
+		require.IsType(t, &redis.Subscription{}, first)
+
+		require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+		require.NoError(t, rdb.Do(ctx, "SET", "exec_publish_k", "v1").Err())
+		require.NoError(t, rdb.Do(ctx, "PUBLISH", "exec_publish_ch", "m1").Err())
+
+		_, err = sub.ReceiveTimeout(ctx, 100*time.Millisecond)
+		require.Error(t, err)
+
+		execReply := rdb.Do(ctx, "EXEC")
+		require.NoError(t, execReply.Err())
+		execArray, ok := execReply.Val().([]interface{})
+		require.True(t, ok)
+		require.Len(t, execArray, 2)
+		require.Equal(t, int64(1), execArray[1])
+
+		received, err := sub.ReceiveTimeout(ctx, time.Second)
+		require.NoError(t, err)
+		pubsubMsg, ok := received.(*redis.Message)
+		require.True(t, ok)
+		require.Equal(t, "exec_publish_ch", pubsubMsg.Channel)
+		require.Equal(t, "m1", pubsubMsg.Payload)
+	})
+
+	t.Run("EVAL publish in EXEC is delivered after commit", func(t *testing.T) {
+		subscriber := srv.NewClient()
+		defer func() { require.NoError(t, subscriber.Close()) }()
+		sub := subscriber.Subscribe(ctx, "exec_eval_publish_ch")
+		defer func() { require.NoError(t, sub.Close()) }()
+
+		first, err := sub.Receive(ctx)
+		require.NoError(t, err)
+		require.IsType(t, &redis.Subscription{}, first)
+
+		require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+		require.NoError(t, rdb.Do(ctx, "EVAL", "return redis.call('publish', ARGV[1], ARGV[2])", "0",
+			"exec_eval_publish_ch", "m2").Err())
+
+		_, err = sub.ReceiveTimeout(ctx, 100*time.Millisecond)
+		require.Error(t, err)
+
+		execReply := rdb.Do(ctx, "EXEC")
+		require.NoError(t, execReply.Err())
+		execArray, ok := execReply.Val().([]interface{})
+		require.True(t, ok)
+		require.Len(t, execArray, 1)
+		require.Equal(t, int64(1), execArray[0])
+
+		received, err := sub.ReceiveTimeout(ctx, time.Second)
+		require.NoError(t, err)
+		pubsubMsg, ok := received.(*redis.Message)
+		require.True(t, ok)
+		require.Equal(t, "exec_eval_publish_ch", pubsubMsg.Channel)
+		require.Equal(t, "m2", pubsubMsg.Payload)
 	})
 
 	func() {

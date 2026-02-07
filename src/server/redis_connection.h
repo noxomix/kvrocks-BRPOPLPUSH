@@ -35,6 +35,7 @@
 #include "commands/commander.h"
 #include "event_util.h"
 #include "redis_request.h"
+#include "server/publish_intent.h"
 #include "server/redis_reply.h"
 #include "server/watched_keys_update.h"
 
@@ -220,12 +221,15 @@ class Connection : public EvbufCallbackBase<Connection> {
   void SetInExec() {
     in_exec_ = true;
     deferred_exec_watch_update_.Reset();
+    deferred_exec_publishes_.clear();
   }
   bool IsInExec() const { return in_exec_; }
   bool IsInScript() const { return in_script_; }
   bool IsMultiError() const { return multi_error_; }
   void ResetMultiExec();
   void ApplyDeferredExecWatchUpdates();
+  void EnqueueDeferredExecPublish(redis::DeferredPublishIntent intent);
+  void ApplyDeferredExecPublishes();
   void UpdateWatchedKeysManually(const std::vector<std::string> &keys);
   std::deque<redis::CommandTokens> *GetMultiExecCommands() { return &multi_cmds_; }
 
@@ -283,6 +287,7 @@ class Connection : public EvbufCallbackBase<Connection> {
   std::deque<redis::CommandTokens> multi_cmds_;
   bool in_script_ = false;
   DeferredWatchKeysUpdate deferred_exec_watch_update_;
+  std::vector<DeferredPublishIntent> deferred_exec_publishes_;
 
   bool importing_ = false;
   RESP protocol_version_ = RESP::v2;

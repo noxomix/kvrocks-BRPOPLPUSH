@@ -41,10 +41,11 @@
 #include <vector>
 
 #include "config/config.h"
-#include "stats/stats.h"
 #include "event_util.h"
 #include "redis_connection.h"
+#include "server/publish_intent.h"
 #include "server/watched_keys_update.h"
+#include "stats/stats.h"
 
 class Server;
 namespace rocksdb {
@@ -122,6 +123,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void CloseIdleBatchContext();
   bool OnBatchWrite(size_t estimated_bytes);
   void EnqueueBatchWatchUpdate(bool mark_all_keys, std::vector<std::string> keys);
+  void EnqueueBatchPublish(redis::DeferredPublishIntent intent);
   void EnqueueBatchReply(int fd, uint64_t conn_id, std::string reply);
   void FlushBatchReplies();
 
@@ -223,6 +225,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
     uint64_t bytes = 0;
     uint64_t deadline_us = 0;
     redis::DeferredWatchKeysUpdate pending_watch_update;
+    std::vector<redis::DeferredPublishIntent> pending_publishes;
     std::vector<DeferredReply> deferred_replies;
   };
   BatchState batch_state_;

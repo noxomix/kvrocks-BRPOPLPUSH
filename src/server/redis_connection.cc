@@ -267,6 +267,21 @@ void Connection::ApplyDeferredExecWatchUpdates() {
   deferred_exec_watch_update_.Reset();
 }
 
+void Connection::EnqueueDeferredExecPublish(redis::DeferredPublishIntent intent) {
+  if (!in_exec_) {
+    std::ignore = srv_->DeliverCollectedPublish(intent.targets, intent.channel, intent.message);
+    return;
+  }
+  deferred_exec_publishes_.push_back(std::move(intent));
+}
+
+void Connection::ApplyDeferredExecPublishes() {
+  for (const auto &pending_publish : deferred_exec_publishes_) {
+    std::ignore = srv_->DeliverCollectedPublish(pending_publish.targets, pending_publish.channel, pending_publish.message);
+  }
+  deferred_exec_publishes_.clear();
+}
+
 void Connection::UpdateWatchedKeysManually(const std::vector<std::string> &keys) {
   if (keys.empty() || !srv_->HasWatchedKeys()) return;
   if (in_exec_) {
@@ -999,6 +1014,7 @@ Connection::ExecuteResult Connection::ExecuteCommandsWithBudget(std::deque<Comma
 void Connection::ResetMultiExec() {
   in_exec_ = false;
   deferred_exec_watch_update_.Reset();
+  deferred_exec_publishes_.clear();
   multi_error_ = false;
   multi_cmds_.clear();
   DisableFlag(Connection::kMultiExec);

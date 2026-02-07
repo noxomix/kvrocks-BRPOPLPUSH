@@ -29,6 +29,7 @@ class CommandPublish : public Commander {
  public:
   Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
                  std::string *output) override {
+    auto collected_targets = srv->CollectPublishTargets(conn->GetNamespace(), args_[1]);
     if (!srv->IsSlave()) {
       // Compromise: can't replicate a message to sub-replicas in a cascading-like structure.
       // Replication relies on WAL seq; increasing the seq on a replica will break the replication process,
@@ -41,10 +42,20 @@ class CommandPublish : public Commander {
       }
     }
 
-    // Publish only to subscribers in the same namespace (tenant isolation)
-    int receivers = srv->PublishMessage(conn->GetNamespace(), args_[1], args_[2]);
+    auto intent = redis::DeferredPublishIntent{std::move(collected_targets), args_[1], args_[2]};
+    int receivers = intent.targets.receiver_count;
+    if (conn->IsInExec()) {
+      conn->EnqueueDeferredExecPublish(std::move(intent));
+      *output = redis::Integer(receivers);
+      return Status::OK();
+    }
+    if (conn->Owner()->HasBatchContextForNamespace(conn->GetNamespace())) {
+      conn->Owner()->EnqueueBatchPublish(std::move(intent));
+      *output = redis::Integer(receivers);
+      return Status::OK();
+    }
 
-    *output = redis::Integer(receivers);
+    *output = redis::Integer(srv->DeliverCollectedPublish(intent.targets, intent.channel, intent.message));
 
     return Status::OK();
   }
@@ -56,6 +67,7 @@ class CommandMPublish : public Commander {
     int total_receivers = 0;
 
     for (size_t i = 2; i < args_.size(); i++) {
+      auto collected_targets = srv->CollectPublishTargets(conn->GetNamespace(), args_[1]);
       if (!srv->IsSlave()) {
         redis::PubSub pubsub_db(srv->storage);
 
@@ -65,9 +77,16 @@ class CommandMPublish : public Commander {
         }
       }
 
-      // Publish only to subscribers in the same namespace (tenant isolation)
-      int receivers = srv->PublishMessage(conn->GetNamespace(), args_[1], args_[i]);
-      total_receivers += receivers;
+      auto intent = redis::DeferredPublishIntent{std::move(collected_targets), args_[1], args_[i]};
+      if (conn->IsInExec()) {
+        total_receivers += intent.targets.receiver_count;
+        conn->EnqueueDeferredExecPublish(std::move(intent));
+      } else if (conn->Owner()->HasBatchContextForNamespace(conn->GetNamespace())) {
+        total_receivers += intent.targets.receiver_count;
+        conn->Owner()->EnqueueBatchPublish(std::move(intent));
+      } else {
+        total_receivers += srv->DeliverCollectedPublish(intent.targets, intent.channel, intent.message);
+      }
     }
 
     *output = redis::Integer(total_receivers);

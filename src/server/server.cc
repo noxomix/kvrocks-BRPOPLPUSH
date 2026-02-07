@@ -528,70 +528,70 @@ size_t Server::GetPubSubPatternSize(const std::string &ns) const {
   return it->second->patterns.size();
 }
 
-int Server::PublishMessage(const std::string &ns, const std::string &channel, const std::string &msg) {
-  int cnt = 0;
-  int index = 0;
-
-  // Collect subscribers under lock, reply outside lock
-  std::vector<std::tuple<Worker *, int, uint64_t>> to_publish_conn_ctxs;
-  std::vector<std::string> patterns;
-  std::vector<std::tuple<Worker *, int, uint64_t>> to_publish_patterns_conn_ctxs;
-
+redis::CollectedPublishTargets Server::CollectPublishTargets(const std::string &ns, const std::string &channel) {
+  redis::CollectedPublishTargets collected;
   {
     std::shared_lock<std::shared_mutex> ns_map_lock(pubsub_namespaces_mu_);
 
     // Only publish to subscribers in the same namespace (tenant isolation)
     auto it = pubsub_namespaces_.find(ns);
-    if (it != pubsub_namespaces_.end()) {
-      std::lock_guard<std::mutex> ns_lock(it->second->mu);
+    if (it == pubsub_namespaces_.end()) {
+      return collected;
+    }
+    std::lock_guard<std::mutex> ns_lock(it->second->mu);
 
-      // Collect channel subscribers
-      if (auto iter = it->second->channels.find(channel); iter != it->second->channels.end()) {
-        for (const auto &conn_ctx : iter->second) {
-          to_publish_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id);
-        }
+    if (auto iter = it->second->channels.find(channel); iter != it->second->channels.end()) {
+      for (const auto &conn_ctx : iter->second) {
+        collected.direct_targets.push_back({conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id, ""});
       }
+    }
 
-      // Collect pattern subscribers
-      for (const auto &iter : it->second->patterns) {
-        if (util::StringMatch(iter.first, channel, false)) {
-          for (const auto &conn_ctx : iter.second) {
-            to_publish_patterns_conn_ctxs.emplace_back(conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id);
-            patterns.emplace_back(iter.first);
-          }
-        }
+    for (const auto &iter : it->second->patterns) {
+      if (!util::StringMatch(iter.first, channel, false)) continue;
+      for (const auto &conn_ctx : iter.second) {
+        collected.pattern_targets.push_back({conn_ctx.owner, conn_ctx.fd, conn_ctx.conn_id, iter.first});
       }
     }
   }
+  collected.receiver_count =
+      static_cast<int>(collected.direct_targets.size() + collected.pattern_targets.size());
+  return collected;
+}
 
-  // Reply outside lock (avoids holding lock during I/O)
+int Server::DeliverCollectedPublish(const redis::CollectedPublishTargets &targets, const std::string &channel,
+                                    const std::string &msg) {
+  int cnt = 0;
   std::string channel_reply;
   channel_reply.append(redis::MultiLen(3));
   channel_reply.append(redis::BulkString("message"));
   channel_reply.append(redis::BulkString(channel));
   channel_reply.append(redis::BulkString(msg));
-  for (const auto &[owner, fd, conn_id] : to_publish_conn_ctxs) {
-    auto s = owner->ReplyByID(fd, conn_id, channel_reply);
+  for (const auto &target : targets.direct_targets) {
+    auto s = target.owner->ReplyByID(target.fd, target.conn_id, channel_reply);
     if (s.IsOK()) {
       cnt++;
     }
   }
 
-  // We should publish corresponding pattern and message for connections
-  for (const auto &[owner, fd, conn_id] : to_publish_patterns_conn_ctxs) {
+  for (const auto &target : targets.pattern_targets) {
     std::string pattern_reply;
     pattern_reply.append(redis::MultiLen(4));
     pattern_reply.append(redis::BulkString("pmessage"));
-    pattern_reply.append(redis::BulkString(patterns[index++]));
+    pattern_reply.append(redis::BulkString(target.pattern));
     pattern_reply.append(redis::BulkString(channel));
     pattern_reply.append(redis::BulkString(msg));
-    auto s = owner->ReplyByID(fd, conn_id, pattern_reply);
+    auto s = target.owner->ReplyByID(target.fd, target.conn_id, pattern_reply);
     if (s.IsOK()) {
       cnt++;
     }
   }
 
   return cnt;
+}
+
+int Server::PublishMessage(const std::string &ns, const std::string &channel, const std::string &msg) {
+  auto collected = CollectPublishTargets(ns, channel);
+  return DeliverCollectedPublish(collected, channel, msg);
 }
 
 void Server::SubscribeChannel(const std::string &channel, redis::Connection *conn) {
